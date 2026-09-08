@@ -1,0 +1,49 @@
+extend type Query {
+  verCampamento(id: ID!): Campamento
+  allCampamentos: [Campamento!]!
+}
+
+extend type Mutation {
+  registrarCampamento(nombre: String!, ubicacion: String!, capacidad: Int!): Campamento!
+}
+
+type Campamento @key(fields: "id") {
+  id: ID!
+  nombre: String!
+  ubicacion: String!
+  capacidad: Int!
+}
+
+type Suministro {
+  id: ID!
+  nombre: String!
+  cantidad: Int!
+  categoria: String! # Ej. "ARMAMENTO", "VIVERES", "MEDICINA"
+}
+
+# 2. Extender el tipo Campamento para que devuelva su lista de suministros incrustados
+extend type Campamento {
+  suministros: [Suministro!]!
+}
+
+# 3. Extender las mutaciones para permitir el registro de un suministro en un campamento
+extend type Mutation {
+  registrarSuministro(
+    campamentoId: ID!
+    nombre: String!
+    cantidad: Int!
+    categoria: String!
+  ): Suministro!
+}
+
+type ReporteArsenal {
+  categoria: String!        # Ej. "ARMAMENTO", "VIVERES"
+  totalSuministros: Int!    # Suma total de unidades de esta categoría
+  campamentosAsociados: [String!]! # Lista de nombres únicos de campamentos que poseen esta categoría
+}
+
+# 2. Extender las consultas raíz para exponer el reporte analítico
+extend type Query {
+  # Ejecuta el pipeline analítico sobre los campamentos de la resistencia
+  reporteGlobalArsenal: [ReporteArsenal!]!
+}

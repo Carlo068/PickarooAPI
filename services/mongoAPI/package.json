@@ -1,0 +1,17 @@
+{
+  "name": "mongoapi",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@apollo/server": "^5.5.1",
+    "@apollo/subgraph": "^2.3.6",
+    "amqplib": "^0.10.3",
+    "cassandra-driver": "4.2.0",
+    "dotenv": "^16.4.5",
+    "graphql": "^16.8.1",
+    "mongoose": "^8.2.0"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@apollo/gateway": "^2.7.2",
+    "@apollo/server": "^5.5.1",
+    "dotenv": "^16.4.5",
+    "graphql": "^16.8.1"
+  }
+}

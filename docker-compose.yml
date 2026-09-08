@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+
+  mongodb:
+    image: mongo:8.0
+    container_name: pickaroo-mongodb
+    ports:
+      - "27017:27017" # Puerto estándar de conexión de MongoDB
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: CR7lover
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - pickaroo-network
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: pickaroo-rabbitmq
+    ports:
+      - "5672:5672"   # Protocolo estándar AMQP para el driver amqplib desde Node.js
+      - "15672:15672" # Interfaz web de administración de colas (Management Console)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - pickaroo-network
+
+networks:
+  pickaroo-network:
+    driver: bridge
+
+# Volúmenes declarados para garantizar la persistencia de datos localmente tras reinicios
+volumes:
+  mongodb_data:
+  rabbitmq_data:

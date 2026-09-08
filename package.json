@@ -1,0 +1,32 @@
+{
+  "name": "pickarooapi",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "gateway",
+    "services/*"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "dev:gateway": "npm run dev --workspace=gateway",
+    "dev:mongoAPI": "npm run dev --workspace=services/mongoAPI",
+    "dev": "npx concurrently \"npm run dev:mongoAPI\" \"npm run dev:gateway\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "allowScripts": {
+    "@apollo/protobufjs@1.2.8": true,
+    "protobufjs@7.6.5": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Carlo068/PickarooAPI.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Carlo068/PickarooAPI/issues"
+  },
+  "homepage": "https://github.com/Carlo068/PickarooAPI#readme"
+}
