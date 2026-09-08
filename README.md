@@ -4,7 +4,6 @@ Backend GraphQL de Pickaroo para administrar un catálogo comercial, paquetes de
 
 El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, mientras que **RabbitMQ** recibe eventos de pedidos para una futura integración de auditoría u otros consumidores.
 
-Este documento describe el código presente en **PickarooAPI**. La carpeta externa **HITO1** es otra implementación; sus nombres de campos, reglas de descuentos, unidades monetarias y manejo de inventario no deben asumirse equivalentes.
 
 ## 1. Arquitectura y componentes
 
