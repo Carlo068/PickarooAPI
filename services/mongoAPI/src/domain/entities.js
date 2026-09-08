@@ -15,7 +15,7 @@
 //   - partidas (items) dentro de la orden, con copia del precio al comprar
 //   - items dentro de la lista de compra
 //
-// Producto estrella de Carnyfruit: los PAQUETES para carne asada / parrillada,
+// Producto estrella de CARNYFRUT: los PAQUETES para carne asada / parrillada,
 // que agrupan varios productos del catálogo (arrachera, chorizo, carbón...).
 // ============================================================
 
@@ -25,7 +25,7 @@ export const UNITS = ['UNIDAD', 'KG', 'GRAMO', 'LITRO', 'PAQUETE'];
 export const USER_ROLES = ['CUSTOMER', 'ADMIN'];
 
 // SIMPLE  = un producto suelto (1 kg de arrachera, un six de refresco...)
-// PAQUETE = combo que agrupa varios productos; el principal de Carnyfruit
+// PAQUETE = combo que agrupa varios productos; el principal de CARNYFRUT
 //           (paquetes para carne asada / parrillada). Su contenido se
 //           incrusta como subdocumentos (components[]).
 export const PRODUCT_KINDS = ['SIMPLE', 'PAQUETE'];

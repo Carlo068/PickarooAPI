@@ -8,7 +8,7 @@ enum UserRole { CUSTOMER ADMIN }
 enum OrderMode { PICKUP DELIVERY }
 enum OrderStatus { PENDING CONFIRMED PREPARING READY IN_DELIVERY DELIVERED CANCELLED }
 
-"SIMPLE = producto suelto. PAQUETE = combo que agrupa varios productos (los paquetes para carne asada / parrillada de Carnyfruit)."
+"SIMPLE = producto suelto. PAQUETE = combo que agrupa varios productos (los paquetes para carne asada / parrillada de CARNYFRUT)."
 enum ProductKind { SIMPLE PAQUETE }
 
 # ------------------------------------------------------------

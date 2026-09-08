@@ -1,7 +1,8 @@
-// Semilla de datos demo para Carnyfruit (carnicería + frutería).
-// Puramente ADITIVA e idempotente: si un registro ya existe (match por
-// slug / email / name) no se toca, así re-ejecutar nunca pisa stock, precios
-// ni órdenes reales. Se ejecuta al arrancar con SEED=true.
+// Semilla de datos demo para CARNYFRUT (carnicería + frutería).
+// Aditiva e idempotente: si un registro ya existe (match por slug / email /
+// name) no se toca. Las dos búsquedas con alias heredado solo corrigen el
+// nombre CARNYFRUT y el correo carnyfrut, sin alterar stock, precios ni órdenes.
+// Se ejecuta al arrancar con SEED=true.
 
 async function ensure(Model, filter, doc) {
   const existing = await Model.findOne(filter);
@@ -10,9 +11,14 @@ async function ensure(Model, filter, doc) {
 }
 
 export async function seed({ User, Category, Product, Store }) {
-  console.log('🌱 SEED=true — verificando datos demo de Carnyfruit...');
+  console.log('🌱 SEED=true — verificando datos demo de CARNYFRUT...');
 
-  const store = await ensure(Store, { name: 'Carnyfruit Centro' }, {
+  const legacyStore = await Store.findOneAndUpdate(
+    { name: 'Carnyfruit Centro' },
+    { $set: { name: 'CARNYFRUT Centro' } },
+    { new: true },
+  );
+  const store = legacyStore || await ensure(Store, { name: 'CARNYFRUT Centro' }, {
     address: 'Av. Universidad 1200, Col. Centro',
     city: 'Chihuahua',
     phone: '614-000-0000',
@@ -22,7 +28,12 @@ export async function seed({ User, Category, Product, Store }) {
     freeDeliveryThreshold: 400,
   });
 
-  const admin = await ensure(User, { email: 'admin@carnyfruit.mx' }, { name: 'Admin Carnyfruit', role: 'ADMIN', isActive: true });
+  const legacyAdmin = await User.findOneAndUpdate(
+    { email: 'admin@carnyfruit.mx' },
+    { $set: { email: 'admin@carnyfrut.mx', name: 'Admin CARNYFRUT' } },
+    { new: true, runValidators: true },
+  );
+  const admin = legacyAdmin || await ensure(User, { email: 'admin@carnyfrut.mx' }, { name: 'Admin CARNYFRUT', role: 'ADMIN', isActive: true });
 
   const cliente = await ensure(User, { email: 'cliente@demo.mx' }, {
     name: 'Cliente Demo', role: 'CUSTOMER', isActive: true,
@@ -59,7 +70,7 @@ export async function seed({ User, Category, Product, Store }) {
     prod[p.name] = await ensure(Product, { name: p.name }, { ...rest, categoryId: cats[cat]._id, isActive: true });
   }
 
-  // El producto estrella de Carnyfruit: paquetes para carne asada (kind: PAQUETE).
+  // El producto estrella de CARNYFRUT: paquetes para carne asada (kind: PAQUETE).
   await ensure(Product, { name: 'Paquete Carne Asada Familiar (6 personas)' }, {
     categoryId: cats['paquetes']._id,
     description: 'Todo para tu carne asada: arrachera, chorizo, costilla, cebollitas, nopales, tortillas, limones y carbón.',
