@@ -1,22 +1,5 @@
 // ============================================================
 // DOMINIO PICKAROO (modelo de negocio puro — sin Mongoose ni GraphQL)
-//
-// Pickaroo: pedidos de recogida (PICKUP) y entrega a domicilio (DELIVERY)
-// para restaurantes. El objetivo del producto es reducir/eliminar el costo
-// de envío, por eso la política de reparto vive aquí, en el dominio, y es
-// configurable por sucursal.
-//
-// El catálogo viene de la BD MySQL original (users, categories, products,
-// product_discounts, stores, user_addresses, orders, order_items,
-// shopping_lists). En Mongo aprovechamos la flexibilidad para incrustar:
-//   - descuentos dentro del producto
-//   - direcciones dentro del usuario
-//   - contenido de un PAQUETE (combo) dentro del producto
-//   - partidas (items) dentro de la orden, con copia del precio al comprar
-//   - items dentro de la lista de compra
-//
-// Producto estrella de CARNYFRUT: los PAQUETES para carne asada / parrillada,
-// que agrupan varios productos del catálogo (arrachera, chorizo, carbón...).
 // ============================================================
 
 export const ORDER_MODES = ['PICKUP', 'DELIVERY'];

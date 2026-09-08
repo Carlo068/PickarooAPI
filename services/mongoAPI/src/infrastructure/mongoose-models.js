@@ -1,25 +1,5 @@
 // ============================================================
 // PERSISTENCIA PICKAROO (Mongoose) — Capa de Infraestructura
-//
-// Traducción de la BD MySQL a documentos Mongo. Criterio de diseño:
-//
-//  INCRUSTACIÓN (subdocumentos de lectura frecuente, tamaño acotado, sin
-//  vida propia fuera de su padre):
-//   users.addresses[]        <- user_addresses
-//   products.discounts[]     <- product_discounts
-//   products.components[]    <- contenido de un PAQUETE (combo carne asada)
-//   orders.items[]           <- order_items, con SNAPSHOT de precio y de la
-//                               composición del paquete al momento de comprar
-//   orders.deliveryAddress   <- copia de la dirección elegida
-//   shopping_lists.items[]   <- shopping_list_items
-//
-//  REFERENCIACIÓN (entidades compartidas o de crecimiento ilimitado):
-//   orders.userId / storeId  -> el historial de pedidos de un cliente crece
-//                               sin límite: es su propia colección que
-//                               referencia a User/Store, nunca un array dentro
-//                               del usuario.
-//   products.categoryId      -> catálogo compartido.
-//   *.items[].productId      -> apunta al catálogo vivo.
 // ============================================================
 
 import mongoose from 'mongoose';
