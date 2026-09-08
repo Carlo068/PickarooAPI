@@ -1,49 +1,93 @@
-extend type Query {
-  verCampamento(id: ID!): Campamento
-  allCampamentos: [Campamento!]!
-}
+scalar SafeInt
+scalar DateTime
 
-extend type Mutation {
-  registrarCampamento(nombre: String!, ubicacion: String!, capacidad: Int!): Campamento!
-}
+enum ProductKind { SIMPLE PORTAFOLIO }
+enum Unit { PIEZA PAQUETE GRAMO }
+enum OrderMode { PICKUP DELIVERY }
+enum OrderStatus { PENDING CONFIRMED PREPARING READY OUT_FOR_DELIVERY DELIVERED CANCELLED }
 
-type Campamento @key(fields: "id") {
+type Category { id: ID!, name: String!, slug: String! }
+type Address { id: ID, recipient: String!, phone: String!, street: String!, city: String!, state: String!, postalCode: String!, country: String!, instructions: String }
+type User { id: ID!, name: String!, email: String!, active: Boolean!, addresses: [Address!]! }
+type Store { id: ID!, name: String!, address: Address!, active: Boolean! }
+type Component { productId: ID!, product: Product!, quantity: SafeInt! }
+type Product {
   id: ID!
-  nombre: String!
-  ubicacion: String!
-  capacidad: Int!
+  sku: String!
+  slug: String!
+  name: String!
+  description: String
+  kind: ProductKind!
+  unit: Unit!
+  priceMinor: SafeInt!
+  priceBasisQuantity: SafeInt!
+  "Múltiplo de venta en la unidad base; cebolla: 6 piezas por manojo."
+  quantityStep: SafeInt!
+  currency: String!
+  active: Boolean!
+  category: Category!
+  components: [Component!]!
+  compositionVersion: Int!
+}
+type Inventory { productId: ID!, product: Product!, storeId: ID!, onHand: SafeInt!, reserved: SafeInt!, available: SafeInt! }
+type SnapshotComponent { productId: ID!, sku: String!, name: String!, unit: Unit!, quantity: SafeInt! }
+type OrderItem {
+  lineId: String!
+  parentLineId: String
+  productId: ID!
+  sku: String!
+  name: String!
+  kind: ProductKind!
+  unit: Unit!
+  quantity: SafeInt!
+  priceMinor: SafeInt!
+  priceBasisQuantity: SafeInt!
+  discountId: ID
+  discountPercentBps: Int
+  grossMinor: SafeInt!
+  discountMinor: SafeInt!
+  totalMinor: SafeInt!
+  components: [SnapshotComponent!]!
+}
+type Demand { productId: ID!, quantity: SafeInt!, available: SafeInt! }
+type Quote { items: [OrderItem!]!, demand: [Demand!]!, available: Boolean!, subtotalMinor: SafeInt!, discountMinor: SafeInt!, deliveryFeeMinor: SafeInt!, totalMinor: SafeInt!, currency: String! }
+type Order { id: ID!, number: String!, userId: ID!, storeId: ID!, mode: OrderMode!, status: OrderStatus!, deliveryAddress: Address, items: [OrderItem!]!, subtotalMinor: SafeInt!, discountMinor: SafeInt!, deliveryFeeMinor: SafeInt!, totalMinor: SafeInt!, currency: String!, createdAt: DateTime! }
+type SalesRow { productId: ID!, sku: String!, name: String!, kind: ProductKind!, unit: Unit!, quantity: SafeInt!, revenueMinor: SafeInt!, orderCount: Int! }
+
+input ComponentInput { productId: ID!, quantity: SafeInt! }
+input ProductInput { sku: String!, slug: String!, name: String!, description: String, categoryId: ID!, unit: Unit!, priceMinor: SafeInt!, priceBasisQuantity: SafeInt! = 1, quantityStep: SafeInt! = 1 }
+input PortfolioInput { sku: String!, slug: String!, name: String!, description: String, categoryId: ID!, components: [ComponentInput!]! }
+"Cada cantidad de extra es por cada portafolio comprado; no sustituye productos de su composición."
+input ExtraInput { productId: ID!, quantity: SafeInt! }
+input PurchaseItemInput { productId: ID!, quantity: SafeInt!, extras: [ExtraInput!]! = [] }
+input QuoteInput { storeId: ID!, items: [PurchaseItemInput!]! }
+input OrderInput { userId: ID!, storeId: ID!, mode: OrderMode!, addressId: ID, idempotencyKey: String!, items: [PurchaseItemInput!]! }
+
+type Query {
+  products(kind: ProductKind, categoryId: ID, limit: Int = 20, offset: Int = 0): [Product!]!
+  product(id: ID!): Product
+  categories: [Category!]!
+  stores: [Store!]!
+  users(limit: Int = 20, offset: Int = 0): [User!]!
+  inventory(storeId: ID!, limit: Int = 20, offset: Int = 0): [Inventory!]!
+  quote(input: QuoteInput!): Quote!
+  order(id: ID!): Order
+  orders(userId: ID!, limit: Int = 20, offset: Int = 0): [Order!]!
+  salesReport(from: DateTime!, to: DateTime!): [SalesRow!]!
+}
+type Mutation {
+  createProduct(input: ProductInput!): Product!
+  createPortfolio(input: PortfolioInput!): Product!
+  createOrder(input: OrderInput!): Order!
+  completeOrder(id: ID!): Order!
+  cancelOrder(id: ID!): Order!
 }
 
-type Suministro {
-  id: ID!
-  nombre: String!
-  cantidad: Int!
-  categoria: String! # Ej. "ARMAMENTO", "VIVERES", "MEDICINA"
-}
-
-# 2. Extender el tipo Campamento para que devuelva su lista de suministros incrustados
-extend type Campamento {
-  suministros: [Suministro!]!
-}
-
-# 3. Extender las mutaciones para permitir el registro de un suministro en un campamento
+"Promoción independiente; endsAt null indica sin fecha de fin. No se acumulan promociones del mismo producto."
+type ProductDiscount { id: ID!, productId: ID!, percentBps: Int!, startsAt: DateTime!, endsAt: DateTime, active: Boolean! }
+input DiscountInput { productId: ID!, percentBps: Int!, startsAt: DateTime!, endsAt: DateTime, active: Boolean = true }
+extend type Query { productDiscounts(productId: ID!, limit: Int = 20, offset: Int = 0): [ProductDiscount!]! }
 extend type Mutation {
-  registrarSuministro(
-    campamentoId: ID!
-    nombre: String!
-    cantidad: Int!
-    categoria: String!
-  ): Suministro!
-}
-
-type ReporteArsenal {
-  categoria: String!        # Ej. "ARMAMENTO", "VIVERES"
-  totalSuministros: Int!    # Suma total de unidades de esta categoría
-  campamentosAsociados: [String!]! # Lista de nombres únicos de campamentos que poseen esta categoría
-}
-
-# 2. Extender las consultas raíz para exponer el reporte analítico
-extend type Query {
-  # Ejecuta el pipeline analítico sobre los campamentos de la resistencia
-  reporteGlobalArsenal: [ReporteArsenal!]!
+  createDiscount(input: DiscountInput!): ProductDiscount!
+  setDiscountActive(id: ID!, active: Boolean!): ProductDiscount!
 }
