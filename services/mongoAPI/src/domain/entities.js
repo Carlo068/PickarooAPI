@@ -4,18 +4,14 @@
 
 export const ORDER_MODES = ['PICKUP', 'DELIVERY'];
 export const ORDER_STATUSES = ['PENDING', 'CONFIRMED', 'PREPARING', 'READY', 'IN_DELIVERY', 'DELIVERED', 'CANCELLED'];
-export const UNITS = ['UNIDAD', 'KG', 'GRAMO', 'LITRO', 'PAQUETE'];
+export const UNITS = ['UNIDAD', 'KG', 'LITRO'];
 export const USER_ROLES = ['CUSTOMER', 'ADMIN'];
 
-// SIMPLE  = un producto suelto (1 kg de arrachera, un six de refresco...)
-// PAQUETE = combo que agrupa varios productos; el principal de CARNYFRUT
-//           (paquetes para carne asada / parrillada). Su contenido se
-//           incrusta como subdocumentos (components[]).
-export const PRODUCT_KINDS = ['SIMPLE', 'PAQUETE'];
-
-// Reglas de composición de un paquete.
-export const PACKAGE_MIN_COMPONENTS = 2;
-export const PACKAGE_MAX_COMPONENTS = 40;
+// Un paquete (combo para carne asada, el producto principal de CARNYFRUT)
+// agrupa productos del catálogo. No tiene stock propio: su disponibilidad
+// se deriva del stock de sus productos.
+export const PACKAGE_MIN_ITEMS = 2;
+export const PACKAGE_MAX_ITEMS = 40;
 
 // ------------------------------------------------------------
 // Dinero: se trabaja en pesos (MXN) con 2 decimales. Se redondea
@@ -32,11 +28,24 @@ export class DomainError extends Error {
   }
 }
 
+const assertName = (name, what) => {
+  if (String(name ?? '').trim().length < 2) throw new DomainError(`${what} necesita un nombre de al menos 2 caracteres.`);
+};
+const assertPositivePrice = (price, what) => {
+  const n = Number(price);
+  if (!Number.isFinite(n) || n <= 0) throw new DomainError(`El precio ${what} debe ser un número positivo.`);
+};
+const assertPositiveInt = (n, what) => {
+  if (!Number.isInteger(n) || n <= 0) throw new DomainError(`${what} debe ser un entero positivo.`);
+};
+
 // ------------------------------------------------------------
-// Descuentos de producto (product_discounts)
+// Descuentos de producto
+// Vigente = dentro de su ventana [startsAt, endsAt]. Para detener una
+// promoción se elimina o se cierra su endsAt; no hay un interruptor aparte.
 // ------------------------------------------------------------
 export function isDiscountActive(discount, at = new Date()) {
-  if (!discount || discount.isActive === false) return false;
+  if (!discount) return false;
   const starts = discount.startsAt ? new Date(discount.startsAt) : null;
   const ends = discount.endsAt ? new Date(discount.endsAt) : null;
   if (starts && at < starts) return false;
@@ -46,61 +55,40 @@ export function isDiscountActive(discount, at = new Date()) {
 
 // Regla de negocio: no se acumulan promociones del mismo producto.
 // Se elige la de mayor porcentaje entre las vigentes.
-export function bestDiscountPercentage(discounts = [], at = new Date()) {
+export function bestDiscountPercent(discounts = [], at = new Date()) {
   const active = discounts.filter(d => isDiscountActive(d, at));
   if (!active.length) return 0;
-  return Math.max(...active.map(d => Number(d.discountPercentage) || 0));
+  return Math.max(...active.map(d => Number(d.percent) || 0));
 }
 
-export function applyDiscount(unitPrice, percentage) {
-  const pct = Math.min(Math.max(Number(percentage) || 0, 0), 100);
+export function applyDiscount(unitPrice, percent) {
+  const pct = Math.min(Math.max(Number(percent) || 0, 0), 100);
   return round2(Number(unitPrice) * (1 - pct / 100));
 }
 
 // ------------------------------------------------------------
-// Reglas de negocio del catálogo (DDD)
-//
-// `assertProductPersistable` es la guarda que se ejecuta ANTES de persistir
-// un producto (la usa el hook pre-validate de Mongoose y los resolvers):
-// precio estrictamente positivo, stock entero no negativo y, si es PAQUETE,
-// una composición coherente.
+// Reglas previas a persistir (las invocan los hooks de Mongoose y los resolvers)
 // ------------------------------------------------------------
 export function assertProductPersistable(data = {}) {
-  const name = String(data.name ?? '').trim();
-  if (name.length < 2) throw new DomainError('El producto necesita un nombre de al menos 2 caracteres.');
-
-  const price = Number(data.price);
-  if (!Number.isFinite(price) || price <= 0) throw new DomainError('El precio del producto debe ser un número positivo.');
-
+  assertName(data.name, 'El producto');
+  assertPositivePrice(data.price, 'del producto');
   const stock = data.stock ?? 0;
   if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero no negativo.');
+  return true;
+}
 
-  const kind = data.kind ?? 'SIMPLE';
-  if (!PRODUCT_KINDS.includes(kind)) throw new DomainError(`Tipo de producto inválido: ${kind}.`);
-
-  const components = data.components ?? [];
-  if (kind === 'SIMPLE' && components.length > 0) {
-    throw new DomainError('Un producto simple no puede tener componentes; usa kind: PAQUETE.');
+export function assertPackagePersistable(data = {}) {
+  assertName(data.name, 'El paquete');
+  assertPositivePrice(data.price, 'del paquete');
+  const items = data.items ?? [];
+  if (items.length < PACKAGE_MIN_ITEMS) throw new DomainError(`Un paquete debe incluir al menos ${PACKAGE_MIN_ITEMS} productos.`);
+  if (items.length > PACKAGE_MAX_ITEMS) throw new DomainError(`Un paquete no puede tener más de ${PACKAGE_MAX_ITEMS} productos.`);
+  for (const item of items) {
+    if (!item || item.productId == null) throw new DomainError('Cada producto del paquete necesita un productId.');
+    assertPositiveInt(item.quantity, 'La cantidad de cada producto del paquete');
   }
-  if (kind === 'PAQUETE') {
-    if (components.length < PACKAGE_MIN_COMPONENTS) {
-      throw new DomainError(`Un paquete debe incluir al menos ${PACKAGE_MIN_COMPONENTS} productos.`);
-    }
-    if (components.length > PACKAGE_MAX_COMPONENTS) {
-      throw new DomainError(`Un paquete no puede tener más de ${PACKAGE_MAX_COMPONENTS} productos.`);
-    }
-    for (const c of components) {
-      if (!c || c.productId == null) throw new DomainError('Cada componente del paquete necesita un productId.');
-      if (!Number.isInteger(c.quantity) || c.quantity <= 0) {
-        throw new DomainError('Cada componente del paquete necesita una cantidad entera positiva.');
-      }
-      if (data.id && String(c.productId) === String(data.id)) {
-        throw new DomainError('Un paquete no puede contenerse a sí mismo.');
-      }
-    }
-    const ids = components.map(c => String(c.productId));
-    if (new Set(ids).size !== ids.length) throw new DomainError('El paquete tiene componentes duplicados.');
-  }
+  const ids = items.map(i => String(i.productId));
+  if (new Set(ids).size !== ids.length) throw new DomainError('El paquete tiene productos duplicados.');
   return true;
 }
 
@@ -113,40 +101,67 @@ export class Product {
     this.name = doc.name;
     this.price = Number(doc.price);
     this.stock = Number(doc.stock ?? 0);
-    this.unit = doc.unit ?? null;
+    this.unit = doc.unit ?? 'UNIDAD';
     this.isActive = doc.isActive !== false;
     this.discounts = doc.discounts ?? [];
-    this.kind = doc.kind ?? 'SIMPLE';
-    this.components = (doc.components ?? []).map(c => ({ productId: String(c.productId ?? c.product?.id ?? c.product?._id), quantity: Number(c.quantity) }));
   }
 
-  get isPackage() {
-    return this.kind === 'PAQUETE';
-  }
-
-  // Regla de negocio previa a persistir (precio positivo, composición, etc.).
   assertValidForSale() {
     return assertProductPersistable(this);
   }
 
-  assertPurchasable(quantity, at = new Date()) {
+  assertAvailable() {
     if (!this.isActive) throw new DomainError(`El producto "${this.name}" no está disponible.`);
-    if (!Number.isInteger(quantity) || quantity <= 0) throw new DomainError('La cantidad debe ser un entero positivo.');
-    if (quantity > this.stock) throw new DomainError(`Sin stock suficiente de "${this.name}" (disponible: ${this.stock}).`);
-    return true;
   }
 
-  currentDiscountPercentage(at = new Date()) {
-    return bestDiscountPercentage(this.discounts, at);
+  currentDiscountPercent(at = new Date()) {
+    return bestDiscountPercent(this.discounts, at);
   }
 
-  effectiveUnitPrice(at = new Date()) {
-    return applyDiscount(this.price, this.currentDiscountPercentage(at));
+  effectivePrice(at = new Date()) {
+    return applyDiscount(this.price, this.currentDiscountPercent(at));
+  }
+}
+
+// ------------------------------------------------------------
+// Entidad Paquete
+// items: [{ product: Product, quantity }]
+// ------------------------------------------------------------
+export class Package {
+  constructor(doc, items) {
+    this.id = doc.id ?? doc._id?.toString();
+    this.name = doc.name;
+    this.price = Number(doc.price);
+    this.isActive = doc.isActive !== false;
+    this.items = items.map(({ product, quantity }) => ({
+      product: product instanceof Product ? product : new Product(product),
+      quantity: Number(quantity),
+    }));
   }
 
-  // Contenido del paquete como snapshot ligero para la orden.
-  componentSnapshot() {
-    return this.components.map(c => ({ productId: c.productId, quantity: c.quantity }));
+  // Cuántos paquetes completos se pueden armar con el stock actual.
+  availableStock() {
+    if (!this.isActive || this.items.some(i => !i.product.isActive)) return 0;
+    return Math.min(...this.items.map(i => Math.floor(i.product.stock / i.quantity)));
+  }
+
+  assertAvailable() {
+    if (!this.isActive) throw new DomainError(`El paquete "${this.name}" no está disponible.`);
+    const off = this.items.find(i => !i.product.isActive);
+    if (off) throw new DomainError(`El paquete "${this.name}" no está disponible: "${off.product.name}" está desactivado.`);
+  }
+
+  // Lo que costaría comprar su contenido por separado, con descuentos vigentes.
+  alaCarteTotal(at = new Date()) {
+    return sumMoney(this.items.map(i => i.product.effectivePrice(at) * i.quantity));
+  }
+
+  savings(at = new Date()) {
+    return round2(this.alaCarteTotal(at) - this.price);
+  }
+
+  contents() {
+    return this.items.map(i => ({ productId: i.product.id, quantity: i.quantity }));
   }
 }
 
@@ -176,48 +191,91 @@ export function assertModeConsistency({ mode, store, deliveryAddress, requireAdd
 }
 
 // ------------------------------------------------------------
+// Inventario
+//
+// Una partida (de cotización o ya guardada en una orden) consume stock de
+// productos: directamente si es un producto, o a través de su contenido si
+// es un paquete. Esta suma es la única fuente para validar, descontar y
+// reponer stock.
+// ------------------------------------------------------------
+export function stockDemand(items) {
+  const demand = new Map();
+  const add = (productId, qty) => demand.set(String(productId), (demand.get(String(productId)) ?? 0) + qty);
+  for (const item of items) {
+    if (item.packageId) for (const c of item.contents ?? []) add(c.productId, c.quantity * item.quantity);
+    else add(item.productId, item.quantity);
+  }
+  return [...demand].map(([productId, quantity]) => ({ productId, quantity }));
+}
+
+// ------------------------------------------------------------
 // Cotización / armado de la orden
 //
-// lines: [{ product: <Product|doc>, quantity: <int> }]
-// Devuelve las partidas con copia (snapshot) del precio y los totales.
+// lines: [{ product: Product|doc, quantity }] o [{ package: Package, quantity }]
+// Devuelve las partidas con copia (snapshot) del precio, los totales y la
+// demanda de stock ya consolidada (el mismo producto suelto y dentro de un
+// paquete suma contra un único inventario).
 // ------------------------------------------------------------
 export function priceOrder({ mode, store, deliveryAddress, lines, requireAddress = false, at = new Date() }) {
   assertModeConsistency({ mode, store, deliveryAddress, requireAddress });
   if (!Array.isArray(lines) || lines.length === 0) throw new DomainError('La orden no tiene productos.');
 
-  const items = lines.map(({ product, quantity }) => {
-    const p = product instanceof Product ? product : new Product(product);
-    p.assertPurchasable(quantity, at);
+  const products = new Map();
+  const items = lines.map(line => {
+    assertPositiveInt(line.quantity, 'La cantidad');
 
-    const discountPercentage = p.currentDiscountPercentage(at);
+    if (line.package) {
+      const pkg = line.package;
+      pkg.assertAvailable();
+      pkg.items.forEach(i => products.set(i.product.id, i.product));
+      const unitPrice = round2(pkg.price);
+      return {
+        packageId: pkg.id,
+        name: pkg.name,
+        unit: null,
+        quantity: line.quantity,
+        unitPrice,
+        discountPercent: 0,
+        lineTotal: round2(unitPrice * line.quantity),
+        contents: pkg.contents(),
+      };
+    }
+
+    const p = line.product instanceof Product ? line.product : new Product(line.product);
+    p.assertAvailable();
+    products.set(p.id, p);
+    const discountPercent = p.currentDiscountPercent(at);
     const unitPrice = round2(p.price);
-    const discountedUnitPrice = applyDiscount(unitPrice, discountPercentage);
-    const lineTotal = round2(discountedUnitPrice * quantity);
-    const lineDiscount = round2((unitPrice - discountedUnitPrice) * quantity);
-
     return {
       productId: p.id,
       name: p.name,
-      kind: p.kind,
       unit: p.unit,
-      quantity,
+      quantity: line.quantity,
       unitPrice,
-      discountApplied: discountPercentage,
-      lineDiscount,
-      lineTotal,
-      // Un paquete guarda su desglose al momento de la compra para poder
-      // explotarlo después en los reportes de agregación.
-      components: p.isPackage ? p.componentSnapshot() : [],
+      discountPercent,
+      lineTotal: round2(applyDiscount(unitPrice, discountPercent) * line.quantity),
+      contents: [],
     };
   });
 
-  const subtotal = sumMoney(items.map(i => round2(i.unitPrice * i.quantity)));
-  const discountTotal = sumMoney(items.map(i => i.lineDiscount));
+  const demand = stockDemand(items);
+  for (const { productId, quantity } of demand) {
+    const p = products.get(productId);
+    if (quantity > p.stock) throw new DomainError(`Sin stock suficiente de "${p.name}" (se necesitan ${quantity}, disponible: ${p.stock}).`);
+  }
+
+  const subtotal = orderSubtotal(items);
+  const discountTotal = orderDiscountTotal(items);
   const fee = deliveryFee({ mode, subtotal: round2(subtotal - discountTotal), store });
   const total = round2(subtotal - discountTotal + fee);
 
-  return { items, subtotal, discountTotal, deliveryFee: fee, total };
+  return { items, subtotal, discountTotal, deliveryFee: fee, total, stockDemand: demand };
 }
+
+// Importes que se derivan de las partidas en lugar de guardarse.
+export const lineDiscount = item => round2(item.unitPrice * item.quantity - item.lineTotal);
+export const orderSubtotal = items => sumMoney(items.map(i => i.unitPrice * i.quantity));
+export const orderDiscountTotal = items => sumMoney(items.map(lineDiscount));
 
 // ------------------------------------------------------------
 // Transiciones de estado de la orden
@@ -243,7 +301,7 @@ export function assertTransition(from, to) {
   return true;
 }
 
-// Número de orden legible: PK-<yyyymmdd>-<sufijo>
+// Número de orden legible para el mostrador: PK-<yyyymmdd>-<sufijo>
 export function buildOrderNumber(date = new Date(), suffix) {
   const ymd = date.toISOString().slice(0, 10).replace(/-/g, '');
   const tail = (suffix ?? Math.random().toString(36).slice(2, 8)).toUpperCase();

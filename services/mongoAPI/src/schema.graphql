@@ -3,17 +3,27 @@ extend schema
 
 scalar DateTime
 
-enum Unit { UNIDAD KG GRAMO LITRO PAQUETE }
+enum Unit { UNIDAD KG LITRO }
 enum UserRole { CUSTOMER ADMIN }
 enum OrderMode { PICKUP DELIVERY }
 enum OrderStatus { PENDING CONFIRMED PREPARING READY IN_DELIVERY DELIVERED CANCELLED }
-
-"SIMPLE = producto suelto. PAQUETE = combo que agrupa varios productos (los paquetes para carne asada / parrillada de CARNYFRUT)."
-enum ProductKind { SIMPLE PAQUETE }
+"Qué referencia una partida de orden, lista o reporte."
+enum ItemType { PRODUCT PACKAGE }
 
 # ------------------------------------------------------------
-# Usuarios y direcciones (users + user_addresses)
+# Ubicaciones
 # ------------------------------------------------------------
+"Dirección sin identidad propia: la de una sucursal o la copia de entrega de una orden."
+type Location {
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+}
+
+"Dirección guardada por un usuario."
 type Address {
   id: ID!
   label: String!
@@ -26,17 +36,9 @@ type Address {
   isDefault: Boolean!
 }
 
-"Copia de la dirección de entrega tomada al crear la orden (sin id propio)."
-type OrderAddress {
-  label: String
-  street: String!
-  city: String!
-  state: String
-  zipCode: String
-  lat: Float
-  lng: Float
-}
-
+# ------------------------------------------------------------
+# Usuarios
+# ------------------------------------------------------------
 type User @key(fields: "id") {
   id: ID!
   name: String!
@@ -50,32 +52,24 @@ type User @key(fields: "id") {
 }
 
 # ------------------------------------------------------------
-# Catálogo (categories + products + product_discounts)
+# Catálogo: categorías, productos y paquetes
 # ------------------------------------------------------------
 type Category @key(fields: "id") {
   id: ID!
   name: String!
-  slug: String!
   icon: String
   sortOrder: Int!
   products: [Product!]!
 }
 
-"Promoción independiente del producto. No se acumulan promociones del mismo producto: aplica la de mayor porcentaje vigente."
+"Promoción de un producto. Vigente dentro de [startsAt, endsAt]; no se acumulan: aplica la de mayor porcentaje."
 type ProductDiscount {
   id: ID!
-  discountPercentage: Float!
+  percent: Float!
   label: String
   startsAt: DateTime
   endsAt: DateTime
-  isActive: Boolean!
-}
-
-"Un producto de un PAQUETE: qué producto entra y cuánto."
-type PackageComponent {
-  productId: ID!
-  product: Product!
-  quantity: Int!
+  isCurrent: Boolean!
 }
 
 type Product @key(fields: "id") {
@@ -87,33 +81,50 @@ type Product @key(fields: "id") {
   unit: Unit!
   stock: Int!
   isActive: Boolean!
-  kind: ProductKind!
-  "Contenido del paquete (vacío para productos SIMPLE)."
-  components: [PackageComponent!]!
   category: Category!
   discounts: [ProductDiscount!]!
   "Porcentaje de descuento vigente ahora (0 si no hay)."
-  activeDiscountPercentage: Float!
-  "Precio unitario ya con el descuento vigente aplicado."
+  activeDiscountPercent: Float!
+  "Precio unitario con el descuento vigente aplicado."
   effectivePrice: Float!
-  "Suma del precio efectivo de los componentes comprados por separado (solo PAQUETE)."
-  alaCarteTotal: Float
-  "Cuánto ahorra el cliente comprando el paquete en vez de sus componentes sueltos (solo PAQUETE)."
-  packageSavings: Float
+  "Paquetes activos que incluyen este producto."
+  packages: [Package!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type PackageItem {
+  productId: ID!
+  product: Product!
+  quantity: Int!
+}
+
+"Combo de productos (p. ej. paquete para carne asada). Precio fijo; su stock se deriva del de sus productos."
+type Package @key(fields: "id") {
+  id: ID!
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  isActive: Boolean!
+  items: [PackageItem!]!
+  "Paquetes completos que se pueden armar con el stock actual (0 si algún producto está desactivado)."
+  availableStock: Int!
+  "Lo que costaría su contenido comprado por separado, con descuentos vigentes."
+  alaCarteTotal: Float!
+  "alaCarteTotal − price. Negativo si el paquete sale más caro que comprar suelto."
+  savings: Float!
   createdAt: DateTime!
   updatedAt: DateTime!
 }
 
 # ------------------------------------------------------------
-# Sucursales (stores)
+# Sucursales
 # ------------------------------------------------------------
 type Store @key(fields: "id") {
   id: ID!
   name: String!
-  address: String!
-  city: String!
-  lat: Float
-  lng: Float
+  address: Location!
   phone: String
   schedule: String
   isActive: Boolean!
@@ -124,28 +135,23 @@ type Store @key(fields: "id") {
 }
 
 # ------------------------------------------------------------
-# Órdenes (orders + order_items)
+# Órdenes
 # ------------------------------------------------------------
-"Snapshot de un componente de paquete tal como se vendió."
-type OrderItemComponent {
-  productId: ID!
-  product: Product
-  quantity: Int!
-}
-
+"Partida de una orden o cotización. Copia lo cobrado al momento de comprar."
 type OrderItem {
-  productId: ID!
+  type: ItemType!
   product: Product
+  package: Package
   name: String!
-  kind: ProductKind!
-  unit: Unit!
+  unit: Unit
   quantity: Int!
   unitPrice: Float!
-  discountApplied: Float!
+  discountPercent: Float!
+  "Derivado: unitPrice × quantity − lineTotal."
   lineDiscount: Float!
   lineTotal: Float!
-  "Desglose del paquete al momento de la compra (vacío si no es PAQUETE)."
-  components: [OrderItemComponent!]!
+  "Contenido del paquete al momento de la compra (vacío en productos)."
+  contents: [PackageItem!]!
 }
 
 type Order @key(fields: "id") {
@@ -153,13 +159,15 @@ type Order @key(fields: "id") {
   number: String!
   user: User!
   mode: OrderMode!
-  store: Store
-  deliveryAddress: OrderAddress
+  store: Store!
+  deliveryAddress: Location
   status: OrderStatus!
   items: [OrderItem!]!
+  "Derivado de las partidas."
   subtotal: Float!
-  deliveryFee: Float!
+  "Derivado de las partidas."
   discountTotal: Float!
+  deliveryFee: Float!
   total: Float!
   notes: String
   createdAt: DateTime!
@@ -177,13 +185,13 @@ type OrderQuote {
 }
 
 # ------------------------------------------------------------
-# Listas de compra guardadas (shopping_lists + shopping_list_items)
+# Listas guardadas (pedidos frecuentes para volver a comprar)
 # ------------------------------------------------------------
 type ShoppingListItem {
-  productId: ID!
+  type: ItemType!
   product: Product
+  package: Package
   quantity: Int!
-  addedAt: DateTime!
 }
 
 type ShoppingList {
@@ -199,29 +207,38 @@ type ShoppingList {
 # Reportes
 # ------------------------------------------------------------
 type SalesRow {
-  productId: ID!
+  type: ItemType!
+  itemId: ID!
   name: String!
-  kind: ProductKind!
   quantity: Int!
   revenue: Float!
   orderCount: Int!
 }
 
-"Cuánto producto base se necesita para surtir los paquetes vendidos en un periodo (para las compras del restaurante)."
+"Cuánto producto se necesita para surtir los paquetes vendidos en un periodo (para las compras del restaurante)."
 type ComponentDemandRow {
   productId: ID!
   name: String!
-  "Unidades totales del componente requeridas por los paquetes vendidos."
+  "Unidades del producto requeridas por los paquetes vendidos."
   quantityNeeded: Int!
-  "Cuántos paquetes (unidades) que lo contienen se vendieron."
+  "Paquetes vendidos que lo contienen."
   packagesSold: Int!
-  "En cuántos paquetes distintos del catálogo aparece este componente."
+  "En cuántos paquetes distintos aparece."
   inPackages: Int!
 }
 
 # ============================================================
 # Inputs
 # ============================================================
+input LocationInput {
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+}
+
 input AddressInput {
   label: String!
   street: String!
@@ -230,6 +247,7 @@ input AddressInput {
   zipCode: String
   lat: Float
   lng: Float
+  "Marcarla como predeterminada (la primera dirección siempre lo es)."
   isDefault: Boolean = false
 }
 
@@ -243,7 +261,6 @@ input CreateUserInput {
 
 input CategoryInput {
   name: String!
-  slug: String!
   icon: String
   sortOrder: Int = 0
 }
@@ -259,23 +276,6 @@ input ProductInput {
   isActive: Boolean = true
 }
 
-input PackageComponentInput {
-  productId: ID!
-  quantity: Int!
-}
-
-"Alta de un PAQUETE (combo). Debe incluir al menos 2 componentes del catálogo."
-input PackageInput {
-  categoryId: ID!
-  name: String!
-  description: String
-  price: Float!
-  imageUrl: String
-  stock: Int = 0
-  isActive: Boolean = true
-  components: [PackageComponentInput!]!
-}
-
 input ProductUpdateInput {
   categoryId: ID
   name: String
@@ -286,20 +286,40 @@ input ProductUpdateInput {
   isActive: Boolean
 }
 
+input PackageItemInput {
+  productId: ID!
+  quantity: Int!
+}
+
+"Alta de un paquete. Debe incluir al menos 2 productos distintos."
+input PackageInput {
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  isActive: Boolean = true
+  items: [PackageItemInput!]!
+}
+
+input PackageUpdateInput {
+  name: String
+  description: String
+  price: Float
+  imageUrl: String
+  isActive: Boolean
+  items: [PackageItemInput!]
+}
+
 input DiscountInput {
-  discountPercentage: Float!
+  percent: Float!
   label: String
   startsAt: DateTime
   endsAt: DateTime
-  isActive: Boolean = true
 }
 
 input StoreInput {
   name: String!
-  address: String!
-  city: String!
-  lat: Float
-  lng: Float
+  address: LocationInput!
   phone: String
   schedule: String
   deliveryFee: Float = 0
@@ -308,10 +328,7 @@ input StoreInput {
 
 input StoreUpdateInput {
   name: String
-  address: String
-  city: String
-  lat: Float
-  lng: Float
+  address: LocationInput
   phone: String
   schedule: String
   isActive: Boolean
@@ -319,15 +336,16 @@ input StoreUpdateInput {
   freeDeliveryThreshold: Float
 }
 
+"Partida de carrito: indicar productId O packageId."
 input CartItemInput {
-  productId: ID!
+  productId: ID
+  packageId: ID
   quantity: Int!
 }
 
 input QuoteInput {
   mode: OrderMode!
   storeId: ID
-  address: AddressInput
   items: [CartItemInput!]!
 }
 
@@ -335,8 +353,8 @@ input CreateOrderInput {
   userId: ID!
   mode: OrderMode!
   storeId: ID
-  "Dirección para DELIVERY. Si se omite se usa la predeterminada del usuario."
-  address: AddressInput
+  "Dirección para DELIVERY. Si se omite se usa addressId o la predeterminada del usuario."
+  address: LocationInput
   addressId: ID
   items: [CartItemInput!]!
   notes: String
@@ -356,10 +374,11 @@ type Query {
   categories: [Category!]!
   category(id: ID!): Category
 
-  products(categoryId: ID, kind: ProductKind, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
+  products(categoryId: ID, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
   product(id: ID!): Product
-  "Solo los paquetes (combos) del catálogo."
-  packages(activeOnly: Boolean = true): [Product!]!
+
+  packages(activeOnly: Boolean = true): [Package!]!
+  package(id: ID!): Package
 
   stores(activeOnly: Boolean = true): [Store!]!
   store(id: ID!): Store
@@ -377,10 +396,10 @@ type Query {
   "Cotiza un carrito (precios, descuentos y costo de envío) sin crear la orden."
   quoteOrder(input: QuoteInput!): OrderQuote!
 
-  "Pipeline de agregación: ventas consolidadas por producto en un periodo ($match → $unwind → $group → $sort)."
+  "Pipeline de agregación: ventas por producto y paquete en un periodo ($match → $unwind → $group → $sort)."
   salesReport(from: DateTime!, to: DateTime!): [SalesRow!]!
 
-  "Pipeline de agregación anidada: explota los paquetes vendidos en sus componentes para planear las compras del restaurante."
+  "Pipeline de agregación anidada: explota los paquetes vendidos en sus productos para planear compras."
   packageComponentDemand(from: DateTime!, to: DateTime!): [ComponentDemandRow!]!
 }
 
@@ -393,13 +412,15 @@ type Mutation {
   createCategory(input: CategoryInput!): Category!
 
   createProduct(input: ProductInput!): Product!
-  "Crea un PAQUETE (combo) con su composición incrustada."
-  createPackage(input: PackageInput!): Product!
   updateProduct(id: ID!, input: ProductUpdateInput!): Product!
   setProductActive(id: ID!, active: Boolean!): Product!
   setProductStock(id: ID!, stock: Int!): Product!
   addProductDiscount(productId: ID!, input: DiscountInput!): Product!
   removeProductDiscount(productId: ID!, discountId: ID!): Product!
+
+  createPackage(input: PackageInput!): Package!
+  updatePackage(id: ID!, input: PackageUpdateInput!): Package!
+  setPackageActive(id: ID!, active: Boolean!): Package!
 
   createStore(input: StoreInput!): Store!
   updateStore(id: ID!, input: StoreUpdateInput!): Store!
@@ -409,7 +430,8 @@ type Mutation {
   cancelOrder(id: ID!): Order!
 
   createShoppingList(input: ShoppingListInput!): ShoppingList!
-  addItemToShoppingList(listId: ID!, productId: ID!, quantity: Int = 1): ShoppingList!
-  removeItemFromShoppingList(listId: ID!, productId: ID!): ShoppingList!
+  "Agrega (o suma cantidad a) un producto O un paquete."
+  addItemToShoppingList(listId: ID!, productId: ID, packageId: ID, quantity: Int = 1): ShoppingList!
+  removeItemFromShoppingList(listId: ID!, productId: ID, packageId: ID): ShoppingList!
   deleteShoppingList(id: ID!): Boolean!
 }
