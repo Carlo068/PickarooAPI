@@ -2,7 +2,6 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { randomBytes, scryptSync } from 'crypto';
 import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
 import { buildSubgraphSchema } from '@apollo/subgraph';
@@ -28,6 +27,10 @@ import {
   buildOrderNumber,
   round2,
 } from './domain/entities.js';
+import { redisClient, initRedis } from './infrastructure/redis-om.js';
+import { getProduct, invalidateProducts, getUser, cacheUser, userView } from './infrastructure/entity-cache.js';
+import { hashPassword } from './infrastructure/passwords.js';
+import { createAuthContext, createAuthResolvers, requireAuth, requireAdmin, requireSelfOrAdmin } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const typeDefs = parse(fs.readFileSync(path.join(__dirname, 'schema.graphql'), 'utf8'));
@@ -39,6 +42,11 @@ const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/pickarood
 await mongoose.connect(mongoUri);
 console.log('✅ MongoDB (pickaroodb) conectado.');
 await Promise.all(models.map(m => m.syncIndexes().catch(err => console.warn(`Índices de ${m.modelName}:`, err.message))));
+
+// ------------------------------------------------------------
+// Infraestructura: Redis (caché de lectura + sesiones JWT)
+// ------------------------------------------------------------
+await initRedis();
 
 // ------------------------------------------------------------
 // Infraestructura: RabbitMQ (eventos de dominio para auditoría)
@@ -79,11 +87,6 @@ const oid = v => new mongoose.Types.ObjectId(String(v));
 const uniq = xs => [...new Set(xs.map(String))];
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 
-function hashPassword(password) {
-  const salt = randomBytes(16).toString('hex');
-  return `scrypt$${salt}$${scryptSync(password, salt, 64).toString('hex')}`;
-}
-
 // Una partida referencia un producto O un paquete.
 function itemRef({ productId, packageId }) {
   if (Boolean(productId) === Boolean(packageId)) throw new DomainError('Cada partida debe indicar productId o packageId (solo uno).');
@@ -103,6 +106,14 @@ function resolveDeliveryAddress(input, addressId, user) {
   const found = id ? user.addresses.id(id) : user.addresses[0];
   if (addressId && !found) throw notFound('Dirección', addressId);
   return found ? locationFrom(found) : null;
+}
+
+// Devuelve el documento solo si pertenece al usuario autenticado (o es administrador).
+function ownedOrNull(ctx, doc) {
+  requireAuth(ctx);
+  if (!doc) return null;
+  requireSelfOrAdmin(ctx, doc.userId);
+  return doc;
 }
 
 // Producto que ya no existe en el catálogo: cuenta como no disponible.
@@ -160,21 +171,26 @@ async function buildLines(items) {
 // producto no alcanza, devuelve lo ya descontado y rechaza la compra.
 async function takeStock(demand) {
   const taken = [];
-  for (const { productId, quantity } of demand) {
-    const res = await Product.updateOne({ _id: oid(productId), stock: { $gte: quantity } }, { $inc: { stock: -quantity } });
-    if (res.modifiedCount !== 1) {
-      await releaseStock(taken);
-      const p = await Product.findById(productId).select('name stock');
-      throw new DomainError(`Sin stock suficiente de "${p?.name ?? productId}" (disponible: ${p?.stock ?? 0}).`);
+  try {
+    for (const { productId, quantity } of demand) {
+      const res = await Product.updateOne({ _id: oid(productId), stock: { $gte: quantity } }, { $inc: { stock: -quantity } });
+      if (res.modifiedCount !== 1) {
+        await releaseStock(taken);
+        const p = await Product.findById(productId).select('name stock');
+        throw new DomainError(`Sin stock suficiente de "${p?.name ?? productId}" (disponible: ${p?.stock ?? 0}).`);
+      }
+      taken.push({ productId, quantity });
     }
-    taken.push({ productId, quantity });
+  } finally {
+    await invalidateProducts(taken.map(t => t.productId)); // el stock cambió: se descarta la copia en Redis
   }
   return taken;
 }
 
-function releaseStock(demand) {
-  return Promise.all(demand.map(({ productId, quantity }) =>
+async function releaseStock(demand) {
+  await Promise.all(demand.map(({ productId, quantity }) =>
     Product.updateOne({ _id: oid(productId) }, { $inc: { stock: quantity } })));
+  await invalidateProducts(demand.map(d => d.productId));
 }
 
 async function resolveStore(storeId) {
@@ -213,16 +229,27 @@ const DateTime = new GraphQLScalarType({
 // ------------------------------------------------------------
 // Resolvers
 // ------------------------------------------------------------
+const authResolvers = createAuthResolvers(redisClient); // me, login, logout
+
+// Cambia el estado de una orden (valida la transición y repone stock al cancelar).
+async function changeOrderStatus(order, status) {
+  assertTransition(order.status, status);
+  const previous = order.status;
+  order.status = status;
+  await order.save();
+
+  // Repone el stock consumido, incluido el contenido de los paquetes.
+  if (status === 'CANCELLED') await releaseStock(stockDemand(order.items));
+  publishEvent('ORDER_STATUS_CHANGED', { orderId: order._id, number: order.number, from: previous, to: status });
+  return order;
+}
+
 const resolvers = {
   DateTime,
 
+  // Los usuarios llegan a GraphQL como vistas planas (ver entity-cache.js): sin passwordHash.
   User: {
-    __resolveReference: ref => User.findById(ref.id).exec(),
-    addresses: u => u.addresses.map(a => ({ ...a.toObject(), id: a._id, isDefault: sameId(a._id, u.defaultAddressId) })),
-    defaultAddress: u => {
-      const a = u.defaultAddressId && u.addresses.id(u.defaultAddressId);
-      return a ? { ...a.toObject(), id: a._id, isDefault: true } : null;
-    },
+    __resolveReference: ref => getUser(ref.id),
   },
 
   Category: {
@@ -235,11 +262,11 @@ const resolvers = {
   },
 
   Product: {
-    __resolveReference: ref => Product.findById(ref.id).exec(),
+    __resolveReference: ref => getProduct(ref.id),
     category: p => Category.findById(p.categoryId).exec(),
     activeDiscountPercent: p => bestDiscountPercent(p.discounts),
     effectivePrice: p => applyDiscount(p.price, bestDiscountPercent(p.discounts)),
-    packages: p => Package.find({ 'items.productId': p._id, isActive: true }).sort({ name: 1 }).exec(),
+    packages: p => Package.find({ 'items.productId': p.id, isActive: true }).sort({ name: 1 }).exec(),
   },
 
   Package: {
@@ -250,7 +277,7 @@ const resolvers = {
   },
 
   PackageItem: {
-    product: i => Product.findById(i.productId).exec(),
+    product: i => getProduct(i.productId),
   },
 
   Store: {
@@ -259,7 +286,7 @@ const resolvers = {
 
   OrderItem: {
     type: itemType,
-    product: i => (i.productId ? Product.findById(i.productId).exec() : null),
+    product: i => getProduct(i.productId),
     package: i => (i.packageId ? Package.findById(i.packageId).exec() : null),
     lineDiscount: i => lineDiscount(i),
     contents: i => i.contents ?? [],
@@ -267,7 +294,7 @@ const resolvers = {
 
   Order: {
     __resolveReference: ref => Order.findById(ref.id).exec(),
-    user: o => User.findById(o.userId).exec(),
+    user: o => getUser(o.userId),
     store: o => Store.findById(o.storeId).exec(),
     subtotal: o => orderSubtotal(o.items),
     discountTotal: o => orderDiscountTotal(o.items),
@@ -275,15 +302,17 @@ const resolvers = {
 
   ShoppingListItem: {
     type: itemType,
-    product: i => (i.productId ? Product.findById(i.productId).exec() : null),
+    product: i => getProduct(i.productId),
     package: i => (i.packageId ? Package.findById(i.packageId).exec() : null),
   },
 
   ShoppingList: {
-    user: l => User.findById(l.userId).exec(),
+    user: l => getUser(l.userId),
   },
 
   Query: {
+    ...authResolvers.Query,
+
     categories: () => Category.find().sort({ sortOrder: 1, name: 1 }).exec(),
     category: (_, { id }) => Category.findById(id).exec(),
 
@@ -294,7 +323,7 @@ const resolvers = {
       if (search) q.$text = { $search: search };
       return Product.find(q).sort({ name: 1 }).skip(offset).limit(Math.min(limit, 100)).exec();
     },
-    product: (_, { id }) => Product.findById(id).exec(),
+    product: (_, { id }) => getProduct(id),
 
     packages: (_, { activeOnly }) => Package.find(activeOnly ? { isActive: true } : {}).sort({ name: 1 }).exec(),
     package: (_, { id }) => Package.findById(id).exec(),
@@ -302,20 +331,34 @@ const resolvers = {
     stores: (_, { activeOnly }) => Store.find(activeOnly ? { isActive: true } : {}).sort({ name: 1 }).exec(),
     store: (_, { id }) => Store.findById(id).exec(),
 
-    users: (_, { limit, offset }) => User.find().sort({ createdAt: -1 }).skip(offset).limit(Math.min(limit, 100)).exec(),
-    user: (_, { id }) => User.findById(id).exec(),
+    users: async (_, { limit, offset }, ctx) => {
+      requireAdmin(ctx);
+      const docs = await User.find().sort({ createdAt: -1 }).skip(offset).limit(Math.min(limit, 100)).exec();
+      return docs.map(userView);
+    },
+    user: (_, { id }, ctx) => {
+      requireSelfOrAdmin(ctx, id);
+      return getUser(id);
+    },
 
-    orders: (_, { userId, status, limit, offset }) => {
+    // Un cliente solo ve sus órdenes; un administrador puede ver las de cualquiera.
+    orders: (_, { userId, status, limit, offset }, ctx) => {
+      const me = requireAuth(ctx);
+      const owner = me.role === 'ADMIN' ? userId : (userId ?? me.id);
+      if (owner) requireSelfOrAdmin(ctx, owner);
       const q = {};
-      if (userId) q.userId = oid(userId);
+      if (owner) q.userId = oid(owner);
       if (status) q.status = status;
       return Order.find(q).sort({ createdAt: -1 }).skip(offset).limit(Math.min(limit, 100)).exec();
     },
-    order: (_, { id }) => Order.findById(id).exec(),
-    orderByNumber: (_, { number }) => Order.findOne({ number }).exec(),
+    order: async (_, { id }, ctx) => ownedOrNull(ctx, await Order.findById(id).exec()),
+    orderByNumber: async (_, { number }, ctx) => ownedOrNull(ctx, await Order.findOne({ number }).exec()),
 
-    shoppingLists: (_, { userId }) => ShoppingList.find({ userId: oid(userId) }).sort({ updatedAt: -1 }).exec(),
-    shoppingList: (_, { id }) => ShoppingList.findById(id).exec(),
+    shoppingLists: (_, { userId }, ctx) => {
+      requireSelfOrAdmin(ctx, userId);
+      return ShoppingList.find({ userId: oid(userId) }).sort({ updatedAt: -1 }).exec();
+    },
+    shoppingList: async (_, { id }, ctx) => ownedOrNull(ctx, await ShoppingList.findById(id).exec()),
 
     quoteOrder: async (_, { input }) => {
       const { mode, storeId, items } = input;
@@ -326,7 +369,8 @@ const resolvers = {
     },
 
     // Pipeline de agregación #1: ventas consolidadas por producto y por paquete.
-    salesReport: async (_, { from, to }) => {
+    salesReport: async (_, { from, to }, ctx) => {
+      requireAdmin(ctx);
       const rows = await Order.aggregate([
         { $match: { status: 'DELIVERED', createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
         { $unwind: '$items' },
@@ -353,7 +397,8 @@ const resolvers = {
     // ($match → $unwind items → $match paquetes → $unwind contents →
     //  $group por producto → $lookup nombre → $sort). Sirve para saber cuánta
     // arrachera / chorizo / carbón comprar para surtir los combos del periodo.
-    packageComponentDemand: async (_, { from, to }) => {
+    packageComponentDemand: async (_, { from, to }, ctx) => {
+      requireAdmin(ctx);
       const rows = await Order.aggregate([
         { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
         { $unwind: '$items' },
@@ -379,12 +424,19 @@ const resolvers = {
   },
 
   Mutation: {
+    ...authResolvers.Mutation, // login, logout
+
     // ---------- Usuarios ----------
-    createUser: (_, { input }) => {
-      const { password, ...rest } = input;
-      return User.create({ ...rest, passwordHash: password ? hashPassword(password) : undefined });
+    // Registro abierto: el rol siempre es CUSTOMER salvo que quien llama sea administrador.
+    createUser: async (_, { input }, ctx) => {
+      const { password, role, ...rest } = input;
+      if (role === 'ADMIN') requireAdmin(ctx);
+      if (password.length < 8) throw new DomainError('La contraseña debe tener al menos 8 caracteres.');
+      const user = await User.create({ ...rest, role: role === 'ADMIN' ? 'ADMIN' : 'CUSTOMER', passwordHash: hashPassword(password) });
+      return cacheUser(user);
     },
-    addUserAddress: async (_, { userId, address }) => {
+    addUserAddress: async (_, { userId, address }, ctx) => {
+      requireSelfOrAdmin(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       const { isDefault, ...data } = address;
@@ -392,17 +444,19 @@ const resolvers = {
       const added = user.addresses[user.addresses.length - 1];
       if (isDefault || !user.defaultAddressId) user.defaultAddressId = added._id;
       await user.save();
-      return user;
+      return cacheUser(user);
     },
-    setDefaultAddress: async (_, { userId, addressId }) => {
+    setDefaultAddress: async (_, { userId, addressId }, ctx) => {
+      requireSelfOrAdmin(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       if (!user.addresses.id(addressId)) throw notFound('Dirección', addressId);
       user.defaultAddressId = addressId;
       await user.save();
-      return user;
+      return cacheUser(user);
     },
-    removeUserAddress: async (_, { userId, addressId }) => {
+    removeUserAddress: async (_, { userId, addressId }, ctx) => {
+      requireSelfOrAdmin(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       const address = user.addresses.id(addressId);
@@ -410,61 +464,77 @@ const resolvers = {
       address.deleteOne();
       if (sameId(user.defaultAddressId, addressId)) user.defaultAddressId = user.addresses[0]?._id ?? null;
       await user.save();
-      return user;
+      return cacheUser(user);
     },
 
-    // ---------- Catálogo ----------
-    createCategory: (_, { input }) => Category.create(input),
+    // ---------- Catálogo (solo administrador) ----------
+    createCategory: (_, { input }, ctx) => {
+      requireAdmin(ctx);
+      return Category.create(input);
+    },
 
-    createProduct: async (_, { input }) => {
+    createProduct: async (_, { input }, ctx) => {
+      requireAdmin(ctx);
       if (!(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
       return Product.create(input);
     },
-    updateProduct: async (_, { id, input }) => {
+    updateProduct: async (_, { id, input }, ctx) => {
+      requireAdmin(ctx);
       const product = await Product.findById(id);
       if (!product) throw notFound('Producto', id);
       if (input.categoryId && !(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
       Object.assign(product, input);
       await product.save();
+      await invalidateProducts(id);
       return product;
     },
     // Desactivar un producto deja sin disponibilidad a los paquetes que lo
     // contienen automáticamente (su stock es derivado): no hay que tocarlos.
-    setProductActive: async (_, { id, active }) => {
+    setProductActive: async (_, { id, active }, ctx) => {
+      requireAdmin(ctx);
       const product = await Product.findByIdAndUpdate(id, { isActive: active }, { new: true });
       if (!product) throw notFound('Producto', id);
+      await invalidateProducts(id);
       return product;
     },
-    setProductStock: async (_, { id, stock }) => {
+    setProductStock: async (_, { id, stock }, ctx) => {
+      requireAdmin(ctx);
       if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero >= 0.');
       const product = await Product.findByIdAndUpdate(id, { stock }, { new: true });
       if (!product) throw notFound('Producto', id);
+      await invalidateProducts(id);
       return product;
     },
-    addProductDiscount: async (_, { productId, input }) => {
+    addProductDiscount: async (_, { productId, input }, ctx) => {
+      requireAdmin(ctx);
       const product = await Product.findById(productId);
       if (!product) throw notFound('Producto', productId);
       product.discounts.push(input);
       await product.save();
+      await invalidateProducts(productId);
       return product;
     },
-    removeProductDiscount: async (_, { productId, discountId }) => {
+    removeProductDiscount: async (_, { productId, discountId }, ctx) => {
+      requireAdmin(ctx);
       const product = await Product.findById(productId);
       if (!product) throw notFound('Producto', productId);
       const discount = product.discounts.id(discountId);
       if (!discount) throw notFound('Descuento', discountId);
       discount.deleteOne();
       await product.save();
+      await invalidateProducts(productId);
       return product;
     },
 
-    // ---------- Paquetes ----------
-    createPackage: async (_, { input }) => {
+    // ---------- Paquetes (solo administrador) ----------
+    createPackage: async (_, { input }, ctx) => {
+      requireAdmin(ctx);
       assertPackagePersistable(input); // valida la composición antes de tocar la BD
       await assertProductsExist(input.items.map(i => i.productId));
       return Package.create(input);
     },
-    updatePackage: async (_, { id, input }) => {
+    updatePackage: async (_, { id, input }, ctx) => {
+      requireAdmin(ctx);
       const pkg = await Package.findById(id);
       if (!pkg) throw notFound('Paquete', id);
       if (input.items) {
@@ -475,23 +545,29 @@ const resolvers = {
       await pkg.save();
       return pkg;
     },
-    setPackageActive: async (_, { id, active }) => {
+    setPackageActive: async (_, { id, active }, ctx) => {
+      requireAdmin(ctx);
       const pkg = await Package.findByIdAndUpdate(id, { isActive: active }, { new: true });
       if (!pkg) throw notFound('Paquete', id);
       return pkg;
     },
 
-    // ---------- Sucursales ----------
-    createStore: (_, { input }) => Store.create(input),
-    updateStore: async (_, { id, input }) => {
+    // ---------- Sucursales (solo administrador) ----------
+    createStore: (_, { input }, ctx) => {
+      requireAdmin(ctx);
+      return Store.create(input);
+    },
+    updateStore: async (_, { id, input }, ctx) => {
+      requireAdmin(ctx);
       const store = await Store.findByIdAndUpdate(id, input, { new: true, runValidators: true });
       if (!store) throw notFound('Sucursal', id);
       return store;
     },
 
     // ---------- Órdenes ----------
-    createOrder: async (_, { input }) => {
+    createOrder: async (_, { input }, ctx) => {
       const { userId, mode, storeId, address, addressId, items, notes, idempotencyKey } = input;
+      requireSelfOrAdmin(ctx, userId);
 
       if (idempotencyKey) {
         const existing = await Order.findOne({ userId: oid(userId), idempotencyKey });
@@ -538,31 +614,34 @@ const resolvers = {
       return order;
     },
 
-    updateOrderStatus: async (_, { id, status }) => {
+    // Cualquier cambio de estado es del personal de la tienda.
+    updateOrderStatus: async (_, { id, status }, ctx) => {
+      requireAdmin(ctx);
       const order = await Order.findById(id);
       if (!order) throw notFound('Orden', id);
-      assertTransition(order.status, status);
-      const previous = order.status;
-      order.status = status;
-      await order.save();
-
-      // Repone el stock consumido, incluido el contenido de los paquetes.
-      if (status === 'CANCELLED') await releaseStock(stockDemand(order.items));
-      publishEvent('ORDER_STATUS_CHANGED', { orderId: order._id, number: order.number, from: previous, to: status });
-      return order;
+      return changeOrderStatus(order, status);
     },
 
-    cancelOrder: async (_, { id }) => resolvers.Mutation.updateOrderStatus(_, { id, status: 'CANCELLED' }),
+    // El cliente puede cancelar su propia orden (si el estado lo permite).
+    cancelOrder: async (_, { id }, ctx) => {
+      requireAuth(ctx);
+      const order = await Order.findById(id);
+      if (!order) throw notFound('Orden', id);
+      requireSelfOrAdmin(ctx, order.userId);
+      return changeOrderStatus(order, 'CANCELLED');
+    },
 
     // ---------- Listas guardadas ----------
-    createShoppingList: async (_, { input }) => {
+    createShoppingList: async (_, { input }, ctx) => {
+      requireSelfOrAdmin(ctx, input.userId);
       if (!(await User.exists({ _id: oid(input.userId) }))) throw notFound('Usuario', input.userId);
       return ShoppingList.create(input);
     },
-    addItemToShoppingList: async (_, { listId, productId, packageId, quantity }) => {
+    addItemToShoppingList: async (_, { listId, productId, packageId, quantity }, ctx) => {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
       if (!list) throw notFound('Lista', listId);
+      requireSelfOrAdmin(ctx, list.userId);
       const exists = ref.productId
         ? await Product.exists({ _id: oid(ref.productId) })
         : await Package.exists({ _id: oid(ref.packageId) });
@@ -573,17 +652,22 @@ const resolvers = {
       await list.save();
       return list;
     },
-    removeItemFromShoppingList: async (_, { listId, productId, packageId }) => {
+    removeItemFromShoppingList: async (_, { listId, productId, packageId }, ctx) => {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
       if (!list) throw notFound('Lista', listId);
+      requireSelfOrAdmin(ctx, list.userId);
       list.items = list.items.filter(i => !(sameId(i.productId, ref.productId) || sameId(i.packageId, ref.packageId)));
       await list.save();
       return list;
     },
-    deleteShoppingList: async (_, { id }) => {
-      const res = await ShoppingList.findByIdAndDelete(id);
-      return Boolean(res);
+    deleteShoppingList: async (_, { id }, ctx) => {
+      requireAuth(ctx);
+      const list = await ShoppingList.findById(id);
+      if (!list) return false;
+      requireSelfOrAdmin(ctx, list.userId);
+      await list.deleteOne();
+      return true;
     },
   },
 };
@@ -608,7 +692,11 @@ const server = new ApolloServer({
 });
 
 const port = parseInt(process.env.PORT_CAMPAMENTOS) || 4001;
-const { url } = await startStandaloneServer(server, { listen: { port } });
+const { url } = await startStandaloneServer(server, {
+  listen: { port },
+  // Se ejecuta en CADA petición: valida el JWT y que su sesión siga activa en Redis.
+  context: createAuthContext(redisClient),
+});
 console.log(`🛒 Subgrafo Pickaroo (catálogo + órdenes) listo en: ${url}`);
 
 if (process.env.SEED === 'true') {
