@@ -1,10 +1,17 @@
 import 'dotenv/config';
 import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
-import { ApolloGateway, IntrospectAndCompose } from '@apollo/gateway';
+import { ApolloGateway, IntrospectAndCompose, RemoteGraphQLDataSource } from '@apollo/gateway';
 
 const port = parseInt(process.env.PORT_GATEWAY) || 4000;
 const subgraphUrl = `http://localhost:${process.env.PORT_CAMPAMENTOS || 4001}/graphql`;
+
+// Propaga el header Authorization (JWT) del cliente hacia el subgrafo.
+class AuthenticatedDataSource extends RemoteGraphQLDataSource {
+  willSendRequest({ request, context }) {
+    if (context.authorization) request.http.headers.set('authorization', context.authorization);
+  }
+}
 
 // El Gateway agrega los microservicios locales (subgraphs) en un supergrafo.
 function buildServer() {
@@ -15,6 +22,7 @@ function buildServer() {
           { name: 'pickaroo', url: subgraphUrl },
         ],
       }),
+      buildService: ({ url }) => new AuthenticatedDataSource({ url }),
     }),
   });
 }
@@ -24,7 +32,10 @@ function buildServer() {
 const RETRIES = 15;
 for (let attempt = 1; ; attempt++) {
   try {
-    const { url } = await startStandaloneServer(buildServer(), { listen: { port } });
+    const { url } = await startStandaloneServer(buildServer(), {
+      listen: { port },
+      context: async ({ req }) => ({ authorization: req.headers.authorization }),
+    });
     console.log(`🚀 API Gateway (Supergraph) unificada y lista en: ${url}`);
     break;
   } catch (err) {

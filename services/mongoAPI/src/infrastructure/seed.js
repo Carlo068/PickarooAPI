@@ -3,6 +3,8 @@
 // no se toca, así re-ejecutarla nunca pisa stock, precios ni órdenes.
 // Se ejecuta al arrancar con SEED=true.
 
+import { hashPassword } from './passwords.js';
+
 async function ensure(Model, filter, doc) {
   const existing = await Model.findOne(filter);
   if (existing) return existing;
@@ -20,7 +22,18 @@ export async function seed({ User, Category, Product, Package, Store }) {
     freeDeliveryThreshold: 400,
   });
 
+  // Contraseñas de la demo (solo desarrollo). Se asignan únicamente si el usuario no tiene una.
+  const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'Admin1234';
+  const clientePassword = process.env.SEED_CUSTOMER_PASSWORD || 'Cliente1234';
+  const ensurePassword = async (user, password) => {
+    const withHash = await User.findById(user._id).select('+passwordHash');
+    if (withHash.passwordHash) return;
+    withHash.passwordHash = hashPassword(password);
+    await withHash.save();
+  };
+
   const admin = await ensure(User, { email: 'admin@carnyfrut.mx' }, { name: 'Admin CARNYFRUT', role: 'ADMIN' });
+  await ensurePassword(admin, adminPassword);
 
   let cliente = await User.findOne({ email: 'cliente@demo.mx' });
   if (!cliente) {
@@ -31,6 +44,7 @@ export async function seed({ User, Category, Product, Package, Store }) {
     cliente.defaultAddressId = cliente.addresses[0]._id;
     await cliente.save();
   }
+  await ensurePassword(cliente, clientePassword);
 
   const cats = {};
   for (const [i, c] of [

@@ -254,9 +254,24 @@ input AddressInput {
 input CreateUserInput {
   name: String!
   email: String!
-  password: String
+  "Mínimo 8 caracteres."
+  password: String!
   avatarUrl: String
+  "Solo un administrador puede crear usuarios ADMIN; en el registro abierto siempre es CUSTOMER."
   role: UserRole = CUSTOMER
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+"Resultado de iniciar sesión. Enviar el token en el header `Authorization: Bearer <token>`."
+type AuthPayload {
+  token: String!
+  "Segundos de vida del token (y de su sesión en Redis)."
+  expiresIn: Int!
+  user: User!
 }
 
 input CategoryInput {
@@ -371,6 +386,8 @@ input ShoppingListInput {
 # Query / Mutation
 # ============================================================
 type Query {
+  "Usuario autenticado (requiere token)."
+  me: User
   categories: [Category!]!
   category(id: ID!): Category
 
@@ -404,6 +421,10 @@ type Query {
 }
 
 type Mutation {
+  login(input: LoginInput!): AuthPayload!
+  "Revoca la sesión del token actual: deja de servir aunque no haya expirado."
+  logout: Boolean!
+
   createUser(input: CreateUserInput!): User!
   addUserAddress(userId: ID!, address: AddressInput!): User!
   setDefaultAddress(userId: ID!, addressId: ID!): User!

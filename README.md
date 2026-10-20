@@ -2,7 +2,7 @@
 
 Backend GraphQL de Pickaroo para administrar un catálogo comercial, paquetes de productos, sucursales, usuarios, listas de compra y pedidos con recogida o entrega a domicilio. La implementación incluye datos de demostración de CARNYFRUT, orientados a productos para carne asada y parrilladas.
 
-El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, mientras que **RabbitMQ** recibe eventos de pedidos para una futura integración de auditoría u otros consumidores.
+El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, mientras que **RabbitMQ** recibe eventos de pedidos para una futura integración de auditoría u otros consumidores. **Redis Stack** guarda las sesiones de inicio de sesión (JWT) y una copia de lectura de productos y usuarios.
 
 
 ## 1. Arquitectura y componentes
@@ -15,6 +15,7 @@ flowchart LR
   API --> Mongoose[Modelos Mongoose]
   Mongoose --> Mongo[(MongoDB\nDocker:27017)]
   API --> Rabbit[RabbitMQ\nDocker:5672]
+  API --> Redis[(Redis Stack\nDocker:6379)]
 ```
 
 | Componente | Responsabilidad |
@@ -25,8 +26,9 @@ flowchart LR
 | Mongoose | Definir tipos, restricciones, subdocumentos, referencias e índices de MongoDB. |
 | MongoDB | Almacenar las colecciones del negocio y ejecutar los pipelines analíticos. |
 | RabbitMQ | Recibir los eventos `ORDER_CREATED` y `ORDER_STATUS_CHANGED`. No hay consumidor implementado en este repositorio. |
+| Redis Stack | Registrar las sesiones activas del JWT y servir como caché de lectura (Redis OM) de productos y usuarios. |
 
-El Gateway y mongoAPI son procesos Node.js ejecutados en el equipo anfitrión. El archivo Compose levanta únicamente MongoDB y RabbitMQ, no los procesos Node.js.
+El Gateway y mongoAPI son procesos Node.js ejecutados en el equipo anfitrión. El archivo Compose levanta únicamente MongoDB, RabbitMQ y Redis Stack, no los procesos Node.js.
 
 ### Estructura del repositorio
 
@@ -43,10 +45,14 @@ PickarooAPI/
         ├── package.json
         └── src/
             ├── index.js
+            ├── auth.js
             ├── schema.graphql
             ├── domain/
             │   └── entities.js
             └── infrastructure/
+                ├── redis-om.js
+                ├── entity-cache.js
+                ├── passwords.js
                 ├── seed.js
                 └── models/
                     ├── index.js
@@ -115,11 +121,53 @@ El proceso del servicio realiza estas acciones:
 1. Carga las variables de entorno y lee el SDL desde disco.
 2. Espera la conexión con MongoDB antes de iniciar la API.
 3. Ejecuta `syncIndexes()` para cada modelo. Los errores de índices se registran como advertencias y no detienen por sí mismos el arranque.
-4. Intenta conectar con RabbitMQ y declarar la cola de eventos.
-5. Construye y publica el subgrafo con Apollo Server.
-6. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar.
+4. Conecta con Redis (espera hasta 3 segundos; si no responde, sigue reintentando en segundo plano).
+5. Intenta conectar con RabbitMQ y declarar la cola de eventos.
+6. Construye y publica el subgrafo con Apollo Server; el contexto de cada petición valida el JWT.
+7. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar.
 
 `syncIndexes()` puede crear o eliminar índices para alinearlos con los esquemas. El inicio del servicio no es, por tanto, una operación estrictamente de solo lectura sobre la base.
+
+### Redis: caché de lectura y sesiones
+
+MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) se usa de dos formas:
+
+| Uso | Claves | TTL | Archivo |
+|---|---|---|---|
+| Sesiones del JWT | `session:<jti>` → id del usuario | `JWT_TTL_SECONDS` (3600) | `auth.js` |
+| Caché de productos (Redis OM, JSON) | `Product:<id>` | 120 s (`CACHE_TTL_PRODUCT`) | `entity-cache.js` |
+| Caché de usuarios (Redis OM, JSON) | `User:<id>` | 3600 s (`CACHE_TTL_USER`) | `entity-cache.js` |
+
+- **Lectura (cache-aside):** `product(id)`, `User`, `Order.user`, `ShoppingList.user`, `me` y los campos `product` de partidas y paquetes consultan primero Redis; si no está la copia, leen de MongoDB y la guardan con TTL. Los listados (`products`, `users`, `packages`…) van directo a MongoDB.
+- **Escritura de productos:** cualquier cambio (`updateProduct`, `setProductStock`, descuentos…) y cada compra o cancelación que mueve el stock **borra** la copia. La siguiente lectura trae el dato nuevo.
+- **Escritura de usuarios:** *write-through*. Tras guardar en MongoDB se escribe la copia ya actualizada.
+- **Lo que decide un cobro nunca sale del caché.** `createOrder` y `quoteOrder` calculan precios, descuentos y stock contra MongoDB, así que un cambio de precio aplica de inmediato a las compras aunque alguna copia tardara en expirar.
+- **Seguridad:** el `passwordHash` no se cachea (el campo es `select: false` y la vista que se guarda no lo incluye).
+- **Redis caído:** las lecturas siguen funcionando desde MongoDB; `login` responde `SERVICE_UNAVAILABLE` y los tokens existentes dejan de aceptarse hasta que Redis vuelva (las sesiones no se pueden verificar). Al conectar (o reconectar) se vacían `Product:*` y `User:*` para no servir copias de cambios hechos mientras Redis o la app estaban caídos.
+- `CACHE_DEBUG=true` imprime cada `HIT`, `MISS`, `SAVE` y `DEL`.
+
+La interfaz **RedisInsight** (`http://localhost:8001`) permite inspeccionar estas claves.
+
+### Autenticación y autorización: `src/auth.js`
+
+Autenticación híbrida **JWT + sesión activa en Redis**:
+
+1. `login(input: {email, password})` verifica la contraseña (scrypt, comparación en tiempo constante), firma un JWT HS256 con `sub`, `name`, `email`, `role` y un `jti` único, y guarda `session:<jti>` en Redis con el mismo TTL.
+2. Cada petición envía `Authorization: Bearer <token>`. El Gateway reenvía el encabezado al subgrafo, que valida la firma y la expiración **y** que `session:<jti>` siga existiendo.
+3. `logout` borra `session:<jti>`: el token deja de servir al instante, aunque no haya expirado.
+
+Correo inexistente, contraseña incorrecta y cuenta desactivada devuelven el mismo mensaje (`Credenciales inválidas.`).
+
+Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin permiso):
+
+| Acceso | Operaciones |
+|---|---|
+| Público | `login`, `createUser` (registro; siempre crea `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
+| Sesión iniciada | `me`, `logout` |
+| Dueño o `ADMIN` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `cancelOrder`, `order`, `orderByNumber`, `orders` (un cliente solo ve las suyas), `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
+| Solo `ADMIN` | `users`, `createUser` con `role: ADMIN`, `createCategory`, `createProduct`, `updateProduct`, `setProductActive`, `setProductStock`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive`, `createStore`, `updateStore`, `updateOrderStatus`, `salesReport`, `packageComponentDemand` |
+
+El rol viaja dentro del token y vale hasta que expira o se hace `logout`; cambiar el rol de un usuario en la base no afecta a sus sesiones abiertas.
 
 ## 3. Modelo documental
 
@@ -267,6 +315,7 @@ El SDL es la referencia completa de argumentos y tipos. Las operaciones se organ
 
 | Área | Queries | Mutations |
 |---|---|---|
+| Sesión | `me` | `login`, `logout` |
 | Usuarios | `users`, `user` | `createUser`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress` |
 | Categorías | `categories`, `category` | `createCategory` |
 | Productos | `products`, `product` | `createProduct`, `updateProduct`, `setProductActive`, `setProductStock` |
@@ -340,7 +389,7 @@ Si RabbitMQ no está disponible, la API registra el problema y continúa; los ev
 - Node.js compatible con las versiones de Apollo Server declaradas en los paquetes.
 - npm con soporte para workspaces.
 - Docker Desktop o un motor Docker con Docker Compose activo.
-- Puertos `27017`, `5672`, `15672`, `4000` y `4001` disponibles.
+- Puertos `27017`, `5672`, `15672`, `6379`, `8001`, `4000` y `4001` disponibles.
 
 ### Instalar dependencias
 
@@ -361,8 +410,19 @@ MONGODB_URI=mongodb://admin:CONTRASENA_DEL_COMPOSE@localhost:27017/pickaroodb?au
 PORT_CAMPAMENTOS=4001
 RABBITMQ_URL=amqp://guest:guest@localhost:5672
 RABBITMQ_QUEUE=pickaroo.events
+REDIS_URL=redis://default:pickaroo123@localhost:6379
+JWT_SECRET=CAMBIAR_POR_UN_SECRETO_LARGO_Y_ALEATORIO
+JWT_TTL_SECONDS=3600
 SEED=false
 ```
+
+`REDIS_URL` coincide con la contraseña (`--requirepass`) del servicio `redis` del Compose y es también el valor de respaldo del código. `JWT_SECRET` debe definirse: si falta, el servicio genera uno aleatorio al arrancar y todos los tokens dejan de ser válidos en cada reinicio. Para generar uno:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+```
+
+Opcionales: `CACHE_TTL_PRODUCT` (120), `CACHE_TTL_USER` (3600) y `CACHE_DEBUG=true`.
 
 Sustituir `CONTRASENA_DEL_COMPOSE` por el valor de `MONGO_INITDB_ROOT_PASSWORD` del YAML. Si contiene caracteres reservados de una URI, deben codificarse. El usuario y contraseña deben coincidir con los que inicializaron el volumen de MongoDB; editar el YAML no cambia automáticamente las credenciales de un volumen existente.
 
@@ -409,23 +469,26 @@ El comando `dev:campamentos` apunta a `services/mongoAPI`; no se debe sustituir 
 | MongoDB | `localhost:27017`, base recomendada `pickaroodb` |
 | RabbitMQ AMQP | `localhost:5672` |
 | Panel RabbitMQ | `http://localhost:15672/` |
+| Redis Stack | `localhost:6379` |
+| RedisInsight | `http://localhost:8001/` |
 
 El Gateway intenta componer el subgrafo hasta 15 veces, con una espera de dos segundos entre fallos. Es necesario que mongoAPI llegue a estar disponible dentro de ese periodo.
 
 ### Persistencia y apagado
 
-Compose utiliza `mongo:8.0` y `rabbitmq:3.13-management`, con la red `pickaroo-network` y los volúmenes:
+Compose utiliza `mongo:8.0`, `rabbitmq:3.13-management` y `redis/redis-stack:latest`, con la red `pickaroo-network` y los volúmenes:
 
 - `mongodb_data`, montado en `/data/db`.
 - `rabbitmq_data`, montado en `/var/lib/rabbitmq`.
+- `redis_data`, montado en `/data` (Redis con `--appendonly yes`, así las sesiones sobreviven a un reinicio del contenedor).
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 mongodb rabbitmq
+docker compose logs --tail=100 mongodb rabbitmq redis
 docker compose down
 ```
 
-`down` conserva los volúmenes; `down -v` los elimina. MongoDB está configurado como standalone, sin replica set. Si el MongoDB de HITO1 sigue publicando el puerto `27017`, ambos Compose no podrán utilizarlo simultáneamente.
+`down` conserva los volúmenes; `down -v` los elimina (y con ellos las sesiones y el caché). MongoDB está configurado como standalone, sin replica set. Si el MongoDB, RabbitMQ o Redis de HITO1 (o de otro proyecto) sigue publicando los puertos `27017`, `5672`, `6379` o `8001`, ambos Compose no podrán utilizarlos simultáneamente.
 
 ## 11. Datos de demostración
 
@@ -434,7 +497,7 @@ Para habilitar el seed, establecer `SEED=true` en el `.env` de mongoAPI y reinic
 En una base vacía crea:
 
 - Una sucursal `CARNYFRUT Centro`, con tarifa de reparto de $35 y envío gratuito desde $400 después de descuentos.
-- Dos usuarios de demostración; el cliente tiene una dirección predeterminada.
+- Dos usuarios de demostración; el cliente tiene una dirección predeterminada. Sus contraseñas (solo desarrollo) son `Admin1234` para `admin@carnyfrut.mx` y `Cliente1234` para `cliente@demo.mx`; se pueden cambiar con `SEED_ADMIN_PASSWORD` y `SEED_CUSTOMER_PASSWORD`. El seed las asigna también a usuarios de demostración ya existentes que no tengan contraseña.
 - Cuatro categorías: Carnes, Frutas, Verduras y Abarrotes.
 - Once productos y, en la colección `packages`, un paquete familiar para carne asada con ocho productos.
 - Una promoción del 15% incrustada en el producto Plátano.
@@ -448,6 +511,26 @@ Los datos, precios y cantidades del seed son demostrativos. No equivalen a los 1
 ## 12. Ejemplos de uso
 
 Ejecutar las operaciones en el Gateway. Los identificadores de los ejemplos deben sustituirse por los obtenidos de la base actual.
+
+### Iniciar sesión
+
+La mayoría de las operaciones requieren sesión (ver la tabla de permisos en la sección 2). Para el seed:
+
+```graphql
+mutation Login($input: LoginInput!) {
+  login(input: $input) {
+    token
+    expiresIn
+    user { id name role }
+  }
+}
+```
+
+Variables: `{ "input": { "email": "admin@carnyfrut.mx", "password": "Admin1234" } }`.
+
+Copiar `token` y enviarlo en cada petición como encabezado `Authorization: Bearer <token>` (en Apollo Sandbox, pestaña *Headers*). `query { me { id name role } }` confirma la sesión y `mutation { logout }` la revoca.
+
+Las demás consultas de este apartado se ejecutan con ese encabezado; el catálogo (`products`, `packages`, `stores`) y `quoteOrder` también funcionan sin él. Para `users`, los reportes y las mutaciones de catálogo se necesita el token del administrador; para `createOrder` y las listas, el del cliente (o el del administrador).
 
 ### Explorar catálogo y paquetes
 
@@ -477,7 +560,7 @@ query Catalogo {
     }
   }
   stores { id name address { street city } deliveryFee freeDeliveryThreshold }
-  users(limit: 10) { id name addresses { id label street isDefault } }
+  users(limit: 10) { id name addresses { id label street isDefault } } # solo ADMIN
 }
 ```
 
@@ -590,8 +673,10 @@ Esta versión contiene los elementos de Docker, dominio, Mongoose, GraphQL y agr
 
 Aspectos relevantes al continuar el desarrollo:
 
-- No hay autenticación ni autorización de operaciones implementadas. El rol almacenado no protege por sí mismo las mutaciones.
-- `createUser` guarda la contraseña con `scrypt` y sal aleatoria (`scrypt$sal$hash`); todavía no existe una operación de inicio de sesión que la verifique.
+- La autenticación es JWT + sesión en Redis. No hay limitación de intentos de `login`, recuperación de contraseña ni cambio de contraseña, y tampoco una operación para desactivar usuarios o cambiar su rol; el rol del token vale hasta que expira o se hace `logout`.
+- Las contraseñas se guardan con `scrypt` y sal aleatoria (`scrypt$sal$hash`). Con el registro abierto (`createUser` sin sesión) cualquiera puede crear cuentas `CUSTOMER`.
+- Sin Redis nadie puede iniciar sesión ni usar un token existente (falla cerrado); el catálogo público sigue disponible.
+- El caché es de lectura. Las copias de producto pueden mostrar datos de hasta `CACHE_TTL_PRODUCT` segundos de antigüedad si MongoDB se modifica por fuera de la API; las compras siempre usan MongoDB. El caché y las sesiones asumen un solo proceso de mongoAPI.
 - El stock es global por producto (no por sucursal). El descuento de stock al comprar es atómico por producto pero no es una transacción multidocumento junto con la orden.
 - La idempotencia no compara el contenido de solicitudes repetidas.
 - Las cantidades son enteras: no se puede pedir medio kilo de un producto vendido por `KG`.
