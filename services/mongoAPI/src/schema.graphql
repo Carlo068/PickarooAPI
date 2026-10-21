@@ -182,6 +182,47 @@ type OrderQuote {
   discountTotal: Float!
   deliveryFee: Float!
   total: Float!
+  "Se manda en createOrder/checkoutCart para confirmar este total. Null si Redis no está disponible."
+  quoteId: ID
+  "La cotización vale 15 minutos."
+  expiresAt: DateTime
+}
+
+# ------------------------------------------------------------
+# Carrito (vive en Redis: solo referencias y cantidades)
+# ------------------------------------------------------------
+"Por qué una partida del carrito no se puede comprar ahora."
+enum UnavailableReason { DELETED INACTIVE OUT_OF_STOCK INSUFFICIENT_STOCK }
+
+type CartLine {
+  type: ItemType!
+  product: Product
+  package: Package
+  quantity: Int!
+  "False si la partida aparece en `unavailable`."
+  available: Boolean!
+}
+
+type UnavailableCartLine {
+  type: ItemType!
+  productId: ID
+  packageId: ID
+  name: String!
+  quantity: Int!
+  reason: UnavailableReason!
+  "Cuántas unidades se pueden comprar ahora."
+  availableQuantity: Int!
+}
+
+"El precio no se guarda en el carrito: se calcula al leerlo contra el catálogo actual."
+type Cart {
+  items: [CartLine!]!
+  unavailable: [UnavailableCartLine!]!
+  itemCount: Int!
+  "Cotización de las partidas disponibles (null si no hay ninguna). Su quoteId se manda a checkoutCart."
+  quote: OrderQuote
+  "Motivo por el que no se pudo cotizar (p. ej. stock insuficiente al sumar producto suelto y paquete)."
+  quoteError: String
 }
 
 # ------------------------------------------------------------
@@ -375,6 +416,19 @@ input CreateOrderInput {
   notes: String
   "Evita órdenes duplicadas por doble envío del cliente."
   idempotencyKey: String
+  "Cotización que el cliente aceptó. Si los precios cambiaron, la compra se rechaza con PRICE_CHANGED y extensions.newQuote."
+  quoteId: ID
+}
+
+"Compra el carrito del usuario autenticado (las partidas salen de Redis)."
+input CheckoutCartInput {
+  mode: OrderMode!
+  storeId: ID
+  address: LocationInput
+  addressId: ID
+  notes: String
+  idempotencyKey: String
+  quoteId: ID
 }
 
 input ShoppingListInput {
@@ -413,6 +467,11 @@ type Query {
   "Cotiza un carrito (precios, descuentos y costo de envío) sin crear la orden."
   quoteOrder(input: QuoteInput!): OrderQuote!
 
+  "Carrito del usuario autenticado, contrastado con el catálogo actual y cotizado."
+  cart(mode: OrderMode = PICKUP, storeId: ID): Cart!
+  "Últimas 20 órdenes del usuario autenticado (ids en Redis, datos desde Mongo)."
+  recentOrders: [Order!]!
+
   "Pipeline de agregación: ventas por producto y paquete en un periodo ($match → $unwind → $group → $sort)."
   salesReport(from: DateTime!, to: DateTime!): [SalesRow!]!
 
@@ -447,6 +506,14 @@ type Mutation {
   updateStore(id: ID!, input: StoreUpdateInput!): Store!
 
   createOrder(input: CreateOrderInput!): Order!
+
+  "Agrega (o suma cantidad a) un producto O un paquete al carrito del usuario autenticado."
+  addToCart(productId: ID, packageId: ID, quantity: Int = 1): Cart!
+  "Fija la cantidad exacta; 0 quita la partida."
+  setCartItemQuantity(productId: ID, packageId: ID, quantity: Int!): Cart!
+  removeFromCart(productId: ID, packageId: ID): Cart!
+  clearCart: Boolean!
+  checkoutCart(input: CheckoutCartInput!): Order!
   updateOrderStatus(id: ID!, status: OrderStatus!): Order!
   cancelOrder(id: ID!): Order!
 

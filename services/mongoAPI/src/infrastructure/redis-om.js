@@ -33,8 +33,9 @@ redisClient.on('error', err => {
 
 // Los cachés son desechables: al (re)conectar se vacían para no servir copias
 // de cambios hechos en Mongo mientras la app o Redis estaban caídos.
+// Carritos, cotizaciones y sesiones NO se tocan: son estado, no copias.
 async function purgeEntityCaches() {
-  for (const pattern of ['Product:*', 'User:*']) {
+  for (const pattern of ['Product:*', 'User:*', 'user:*:orders:recent']) {
     for await (const keys of redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
       const batch = [keys].flat();
       if (batch.length) await redisClient.del(batch);
