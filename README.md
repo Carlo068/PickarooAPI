@@ -52,6 +52,9 @@ PickarooAPI/
             └── infrastructure/
                 ├── redis-om.js
                 ├── entity-cache.js
+                ├── cart-store.js
+                ├── quote-store.js
+                ├── recent-orders.js
                 ├── passwords.js
                 ├── seed.js
                 └── models/
@@ -137,6 +140,22 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 | Sesiones del JWT | `session:<jti>` → id del usuario | `JWT_TTL_SECONDS` (3600) | `auth.js` |
 | Caché de productos (Redis OM, JSON) | `Product:<id>` | 120 s (`CACHE_TTL_PRODUCT`) | `entity-cache.js` |
 | Caché de usuarios (Redis OM, JSON) | `User:<id>` | 3600 s (`CACHE_TTL_USER`) | `entity-cache.js` |
+| Carrito | `cart:<userId>` (HASH `p:<productId>` / `k:<packageId>` → cantidad) | 7 días, se renueva con cada cambio | `cart-store.js` |
+| Cotizaciones | `quote:<uuid>` (JSON con partidas, envío y total) | 15 min | `quote-store.js` |
+| Pedidos recientes | `user:<userId>:orders:recent` (LIST de ids, máx. 20) | 24 h | `recent-orders.js` |
+
+#### Carrito y cotizaciones: precios que cambian y productos que desaparecen
+
+- **El carrito no guarda precios**, solo ids y cantidades. Cada lectura (`cart`) lo contrasta con el catálogo actual de MongoDB (`reconcileCart` en el dominio). Un cambio de precio se ve al instante, y lo que ya no se puede comprar aparece en `unavailable` con su motivo (`DELETED`, `INACTIVE`, `OUT_OF_STOCK`, `INSUFFICIENT_STOCK`) en lugar de cobrarse. Desactivar o borrar un producto no exige recorrer los carritos.
+- **Una cotización no congela el precio**: es el total que el cliente vio. `quoteOrder` y `cart` devuelven `quoteId`. Si se manda en `createOrder` o `checkoutCart`, la compra se recalcula contra MongoDB y se compara (`assertQuoteStillValid`):
+  - precios, descuentos, envío o total distintos → `PRICE_CHANGED`;
+  - otros productos, cantidades, sucursal o modo → `QUOTE_MISMATCH`;
+  - cotización vencida o ya usada → `QUOTE_EXPIRED`.
+
+  En los tres casos el error trae `extensions.newQuote` (con su propio `quoteId`) para que el cliente confirme el total nuevo. Cada cotización se usa una sola vez. Sin `quoteId` la orden se cobra al precio actual, como antes.
+- **`checkoutCart`** compra el carrito del usuario autenticado. Si alguna partida no está disponible se rechaza con `CART_HAS_UNAVAILABLE_ITEMS` (y la lista en `extensions.unavailable`); el carrito se vacía solo cuando la orden se creó.
+- **Pedidos recientes** (`recentOrders`): Redis guarda solo los ids; estado e importes se leen de MongoDB. Si la lista no existe se reconstruye desde MongoDB, y una orden nueva entra al inicio solo si la lista ya existe (`LPUSHX`), así nunca queda incompleta.
+- Sin Redis: el carrito responde `SERVICE_UNAVAILABLE`; `quoteOrder` sigue cotizando pero sin `quoteId`; `recentOrders` lee de MongoDB. Al reconectar se vacían los cachés y las listas de pedidos recientes, pero **no** los carritos ni las cotizaciones (son estado, no copias).
 
 - **Lectura (cache-aside):** `product(id)`, `User`, `Order.user`, `ShoppingList.user`, `me` y los campos `product` de partidas y paquetes consultan primero Redis; si no está la copia, leen de MongoDB y la guardan con TTL. Los listados (`products`, `users`, `packages`…) van directo a MongoDB.
 - **Escritura de productos:** cualquier cambio (`updateProduct`, `setProductStock`, descuentos…) y cada compra o cancelación que mueve el stock **borra** la copia. La siguiente lectura trae el dato nuevo.
@@ -163,7 +182,7 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | Acceso | Operaciones |
 |---|---|
 | Público | `login`, `createUser` (registro; siempre crea `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
-| Sesión iniciada | `me`, `logout` |
+| Sesión iniciada | `me`, `logout`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` (siempre sobre el usuario del token) |
 | Dueño o `ADMIN` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `cancelOrder`, `order`, `orderByNumber`, `orders` (un cliente solo ve las suyas), `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Solo `ADMIN` | `users`, `createUser` con `role: ADMIN`, `createCategory`, `createProduct`, `updateProduct`, `setProductActive`, `setProductStock`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive`, `createStore`, `updateStore`, `updateOrderStatus`, `salesReport`, `packageComponentDemand` |
 
@@ -322,7 +341,8 @@ El SDL es la referencia completa de argumentos y tipos. Las operaciones se organ
 | Paquetes | `packages`, `package` | `createPackage`, `updatePackage`, `setPackageActive` |
 | Descuentos | Campos `discounts`, `activeDiscountPercent`, `effectivePrice` de `Product` | `addProductDiscount`, `removeProductDiscount` |
 | Sucursales | `stores`, `store` | `createStore`, `updateStore` |
-| Pedidos | `quoteOrder`, `orders`, `order`, `orderByNumber` | `createOrder`, `updateOrderStatus`, `cancelOrder` |
+| Carrito | `cart` | `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart` |
+| Pedidos | `quoteOrder`, `orders`, `order`, `orderByNumber`, `recentOrders` | `createOrder`, `updateOrderStatus`, `cancelOrder` |
 | Listas | `shoppingLists`, `shoppingList` | `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Analítica | `salesReport`, `packageComponentDemand` | — |
 
@@ -628,6 +648,35 @@ Variables:
   }
 }
 ```
+
+### Comprar con el carrito (Redis)
+
+Con el token del cliente:
+
+```graphql
+mutation { addToCart(packageId: "ID_PAQUETE", quantity: 1) { itemCount } }
+```
+
+```graphql
+query Carrito {
+  cart(mode: PICKUP) {
+    items { type quantity available product { name } package { name } }
+    unavailable { name reason availableQuantity }
+    quote { quoteId expiresAt subtotal discountTotal deliveryFee total }
+    quoteError
+  }
+}
+```
+
+```graphql
+mutation Pagar($input: CheckoutCartInput!) {
+  checkoutCart(input: $input) { id number total status }
+}
+```
+
+Variables: `{ "input": { "mode": "PICKUP", "quoteId": "QUOTE_ID_DEL_CARRITO", "idempotencyKey": "carrito-001" } }`.
+
+Si un administrador cambió un precio entre la consulta del carrito y el pago, la respuesta es un error `PRICE_CHANGED` con `extensions.newQuote`; se repite `checkoutCart` con `newQuote.quoteId` para aceptar el total nuevo.
 
 ### Asociar una imagen
 

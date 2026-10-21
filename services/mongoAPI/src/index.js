@@ -24,12 +24,17 @@ import {
   orderDiscountTotal,
   assertTransition,
   assertPackagePersistable,
+  assertQuoteStillValid,
+  reconcileCart,
   buildOrderNumber,
   round2,
 } from './domain/entities.js';
 import { redisClient, initRedis } from './infrastructure/redis-om.js';
 import { getProduct, invalidateProducts, getUser, cacheUser, userView } from './infrastructure/entity-cache.js';
 import { hashPassword } from './infrastructure/passwords.js';
+import * as cartStore from './infrastructure/cart-store.js';
+import { saveQuote, getQuote, deleteQuote } from './infrastructure/quote-store.js';
+import { RECENT_ORDERS, pushRecentOrder, getRecentOrderIds, setRecentOrders } from './infrastructure/recent-orders.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requireAdmin, requireSelfOrAdmin } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -145,26 +150,167 @@ async function assertProductsExist(ids) {
   if (found !== uniq(ids).length) throw new DomainError('Algún producto del paquete no existe en el catálogo.');
 }
 
-// Carga productos y paquetes de un carrito y arma las líneas para el dominio.
-async function buildLines(items) {
-  if (!items?.length) throw new DomainError('El carrito está vacío.');
-  const refs = items.map(i => ({ ...itemRef(i), quantity: i.quantity }));
+// Carga el catálogo actual (Mongo, nunca el caché) para unas partidas.
+// Lo que ya no existe queda en null en lugar de lanzar.
+async function loadLines(refs) {
   const packageIds = refs.filter(r => r.packageId).map(r => r.packageId);
   const pkgDocs = packageIds.length ? await Package.find({ _id: { $in: uniq(packageIds).map(oid) } }) : [];
   const [packages, products] = await Promise.all([
     toDomainPackages(pkgDocs),
     loadProducts(refs.filter(r => r.productId).map(r => r.productId)),
   ]);
-  return refs.map(r => {
-    if (r.packageId) {
-      const pkg = packages.get(r.packageId);
-      if (!pkg) throw notFound('Paquete', r.packageId);
-      return { package: pkg, quantity: r.quantity };
-    }
-    const product = products.get(r.productId);
-    if (!product) throw notFound('Producto', r.productId);
-    return { product, quantity: r.quantity };
+  return refs.map(r => (r.packageId
+    ? { ...r, package: packages.get(r.packageId) ?? null }
+    : { ...r, product: products.get(r.productId) ?? null }));
+}
+
+// Carga productos y paquetes de un carrito y arma las líneas para el dominio.
+async function buildLines(items) {
+  if (!items?.length) throw new DomainError('El carrito está vacío.', 'CART_EMPTY');
+  const lines = await loadLines(items.map(i => ({ ...itemRef(i), quantity: i.quantity })));
+  for (const l of lines) {
+    if (l.packageId && !l.package) throw notFound('Paquete', l.packageId);
+    if (l.productId && !l.product) throw notFound('Producto', l.productId);
+  }
+  return lines;
+}
+
+// ---------- Cotizaciones (Redis, 15 min) ----------
+// Lo que se guarda y se compara al comprar: partidas con precio, envío y total.
+function quoteRecord({ mode, store }, priced) {
+  return {
+    mode,
+    storeId: store ? String(store._id) : null,
+    items: priced.items.map(i => ({
+      productId: i.productId ?? null, packageId: i.packageId ?? null, quantity: i.quantity,
+      unitPrice: i.unitPrice, discountPercent: i.discountPercent, lineTotal: i.lineTotal,
+    })),
+    deliveryFee: priced.deliveryFee,
+    total: priced.total,
+  };
+}
+
+async function issueQuote({ mode, store }, priced) {
+  const { quoteId, expiresAt } = await saveQuote(quoteRecord({ mode, store }, priced));
+  const { stockDemand: _demand, ...amounts } = priced;
+  return { mode, ...amounts, quoteId, expiresAt };
+}
+
+// Resumen serializable que viaja en extensions.newQuote cuando hay que reconfirmar.
+const quoteSummary = q => ({
+  quoteId: q.quoteId, expiresAt: q.expiresAt, subtotal: q.subtotal, discountTotal: q.discountTotal,
+  deliveryFee: q.deliveryFee, total: q.total,
+  items: q.items.map(({ productId, packageId, name, quantity, unitPrice, discountPercent, lineTotal }) => ({
+    productId: productId ?? null, packageId: packageId ?? null, name, quantity, unitPrice, discountPercent, lineTotal,
+  })),
+});
+
+// Si el cliente confirmó una cotización, el cobro debe coincidir con ella.
+async function assertMatchesQuote(quoteId, { mode, store }, priced) {
+  const quoted = await getQuote(quoteId);
+  try {
+    if (!quoted) throw new DomainError('La cotización expiró o no existe. Revisa el total y confirma de nuevo.', 'QUOTE_EXPIRED');
+    assertQuoteStillValid(quoted, quoteRecord({ mode, store }, priced));
+  } catch (err) {
+    if (err instanceof DomainError) err.extensions.newQuote = quoteSummary(await issueQuote({ mode, store }, priced));
+    throw err;
+  }
+}
+
+// ---------- Crear una orden (createOrder y checkoutCart) ----------
+async function placeOrder({ userId, mode, storeId, address, addressId, items, notes, idempotencyKey, quoteId }) {
+  if (idempotencyKey) {
+    const existing = await Order.findOne({ userId: oid(userId), idempotencyKey });
+    if (existing) return existing;
+  }
+
+  const user = await User.findById(userId);
+  if (!user) throw notFound('Usuario', userId);
+  if (!user.isActive) throw new DomainError('El usuario está desactivado.');
+
+  const store = await resolveStore(storeId);
+  if (!store) throw new DomainError('No hay ninguna sucursal activa configurada.');
+
+  // Precios y stock salen siempre de Mongo, nunca del caché.
+  const deliveryAddress = mode === 'DELIVERY' ? resolveDeliveryAddress(address, addressId, user) : null;
+  const lines = await buildLines(items);
+  const priced = priceOrder({ mode, store, deliveryAddress, lines, requireAddress: true });
+  if (quoteId) await assertMatchesQuote(quoteId, { mode, store }, priced);
+
+  // Primero se aparta el stock (atómico por producto) y después se guarda la orden.
+  const taken = await takeStock(priced.stockDemand);
+  let order;
+  try {
+    order = await Order.create({
+      number: buildOrderNumber(),
+      idempotencyKey: idempotencyKey || null,
+      userId: user._id,
+      storeId: store._id,
+      mode,
+      deliveryAddress,
+      items: priced.items,
+      deliveryFee: priced.deliveryFee,
+      total: priced.total,
+      notes,
+    });
+  } catch (err) {
+    await releaseStock(taken);
+    if (err.code === 11000 && idempotencyKey) return Order.findOne({ userId: user._id, idempotencyKey });
+    throw err;
+  }
+
+  await Promise.all([deleteQuote(quoteId), pushRecentOrder(order.userId, order._id)]);
+  publishEvent('ORDER_CREATED', {
+    orderId: order._id, number: order.number, userId: order.userId,
+    mode: order.mode, total: order.total, itemCount: order.items.length,
   });
+  return order;
+}
+
+// ---------- Carrito (Redis) ----------
+// Lee el carrito, lo contrasta con el catálogo actual y cotiza lo disponible.
+async function buildCart(userId, { mode = 'PICKUP', storeId } = {}) {
+  const lines = await loadLines(await cartStore.getCart(userId));
+  const { available, unavailable } = reconcileCart(lines);
+  const unavailableKeys = new Set(unavailable.map(u => u.productId ?? u.packageId));
+
+  let quote = null;
+  let quoteError = null;
+  if (available.length) {
+    try {
+      const store = await resolveStore(storeId);
+      quote = await issueQuote({ mode, store }, priceOrder({ mode, store, lines: available }));
+    } catch (err) {
+      if (!(err instanceof DomainError)) throw err;
+      quoteError = err.message; // p. ej. el mismo producto suelto y en paquete supera el stock
+    }
+  }
+
+  return {
+    items: lines.map(l => ({
+      productId: l.productId ?? null, packageId: l.packageId ?? null, quantity: l.quantity,
+      available: !unavailableKeys.has(l.productId ?? l.packageId),
+    })),
+    unavailable: unavailable.map(u => ({
+      productId: u.productId ?? null, packageId: u.packageId ?? null, quantity: u.quantity,
+      name: (u.package ?? u.product)?.name ?? (u.packageId ? 'Paquete eliminado' : 'Producto eliminado'),
+      reason: u.reason, availableQuantity: u.available,
+    })),
+    itemCount: lines.reduce((n, l) => n + l.quantity, 0),
+    quote,
+    quoteError,
+  };
+}
+
+// Valida la referencia antes de guardarla en el carrito: debe existir y estar activa.
+async function assertPurchasableRef(ref) {
+  const id = ref.productId ?? ref.packageId;
+  const Model = ref.productId ? Product : Package;
+  const what = ref.productId ? 'Producto' : 'Paquete';
+  if (!mongoose.isValidObjectId(id)) throw notFound(what, id);
+  const doc = await Model.findById(id).select('name isActive');
+  if (!doc) throw notFound(what, id);
+  if (!doc.isActive) throw new DomainError(`"${doc.name}" no está disponible.`);
 }
 
 // Descuenta stock solo si alcanza (condición atómica por producto). Si algún
@@ -310,6 +456,16 @@ const resolvers = {
     user: l => getUser(l.userId),
   },
 
+  CartLine: {
+    type: itemType,
+    product: i => getProduct(i.productId),
+    package: i => (i.packageId ? Package.findById(i.packageId).exec() : null),
+  },
+
+  UnavailableCartLine: {
+    type: itemType,
+  },
+
   Query: {
     ...authResolvers.Query,
 
@@ -360,12 +516,28 @@ const resolvers = {
     },
     shoppingList: async (_, { id }, ctx) => ownedOrNull(ctx, await ShoppingList.findById(id).exec()),
 
+    // Cotiza y guarda la cotización 15 min; su quoteId se manda al comprar.
     quoteOrder: async (_, { input }) => {
       const { mode, storeId, items } = input;
       const store = await resolveStore(storeId);
       const lines = await buildLines(items);
-      const { stockDemand: _demand, ...priced } = priceOrder({ mode, store, lines });
-      return { mode, ...priced };
+      return issueQuote({ mode, store }, priceOrder({ mode, store, lines }));
+    },
+
+    cart: (_, { mode, storeId }, ctx) => buildCart(requireAuth(ctx).id, { mode, storeId }),
+
+    // Ids desde Redis (lista de 20); estado e importes siempre desde Mongo.
+    recentOrders: async (_, __, ctx) => {
+      const me = requireAuth(ctx);
+      const ids = await getRecentOrderIds(me.id);
+      if (ids) {
+        const docs = await Order.find({ _id: { $in: ids.map(oid) } }).exec();
+        const byId = new Map(docs.map(d => [String(d._id), d]));
+        return ids.map(id => byId.get(id)).filter(Boolean);
+      }
+      const docs = await Order.find({ userId: oid(me.id) }).sort({ createdAt: -1 }).limit(RECENT_ORDERS).exec();
+      await setRecentOrders(me.id, docs.map(d => d._id));
+      return docs;
     },
 
     // Pipeline de agregación #1: ventas consolidadas por producto y por paquete.
@@ -565,52 +737,58 @@ const resolvers = {
     },
 
     // ---------- Órdenes ----------
-    createOrder: async (_, { input }, ctx) => {
-      const { userId, mode, storeId, address, addressId, items, notes, idempotencyKey } = input;
-      requireSelfOrAdmin(ctx, userId);
+    createOrder: (_, { input }, ctx) => {
+      requireSelfOrAdmin(ctx, input.userId);
+      return placeOrder(input);
+    },
 
-      if (idempotencyKey) {
-        const existing = await Order.findOne({ userId: oid(userId), idempotencyKey });
+    // ---------- Carrito (Redis: solo ids y cantidades) ----------
+    addToCart: async (_, { productId, packageId, quantity }, ctx) => {
+      const me = requireAuth(ctx);
+      const ref = itemRef({ productId, packageId });
+      await assertPurchasableRef(ref);
+      await cartStore.addToCart(me.id, ref, quantity);
+      return buildCart(me.id);
+    },
+    setCartItemQuantity: async (_, { productId, packageId, quantity }, ctx) => {
+      const me = requireAuth(ctx);
+      const ref = itemRef({ productId, packageId });
+      if (quantity > 0) await assertPurchasableRef(ref);
+      await cartStore.setCartQuantity(me.id, ref, quantity);
+      return buildCart(me.id);
+    },
+    removeFromCart: async (_, { productId, packageId }, ctx) => {
+      const me = requireAuth(ctx);
+      await cartStore.removeFromCart(me.id, itemRef({ productId, packageId }));
+      return buildCart(me.id);
+    },
+    clearCart: async (_, __, ctx) => {
+      await cartStore.clearCart(requireAuth(ctx).id);
+      return true;
+    },
+
+    // Compra el carrito del usuario autenticado. Si alguna partida ya no se
+    // puede comprar, se rechaza con la lista; el carrito se vacía solo si la
+    // orden se creó.
+    checkoutCart: async (_, { input }, ctx) => {
+      const me = requireAuth(ctx);
+      if (input.idempotencyKey) {
+        const existing = await Order.findOne({ userId: oid(me.id), idempotencyKey: input.idempotencyKey });
         if (existing) return existing;
       }
 
-      const user = await User.findById(userId);
-      if (!user) throw notFound('Usuario', userId);
-      if (!user.isActive) throw new DomainError('El usuario está desactivado.');
-
-      const store = await resolveStore(storeId);
-      if (!store) throw new DomainError('No hay ninguna sucursal activa configurada.');
-
-      const deliveryAddress = mode === 'DELIVERY' ? resolveDeliveryAddress(address, addressId, user) : null;
-      const lines = await buildLines(items);
-      const priced = priceOrder({ mode, store, deliveryAddress, lines, requireAddress: true });
-
-      // Primero se aparta el stock (atómico por producto) y después se guarda la orden.
-      const taken = await takeStock(priced.stockDemand);
-      let order;
-      try {
-        order = await Order.create({
-          number: buildOrderNumber(),
-          idempotencyKey: idempotencyKey || null,
-          userId: user._id,
-          storeId: store._id,
-          mode,
-          deliveryAddress,
-          items: priced.items,
-          deliveryFee: priced.deliveryFee,
-          total: priced.total,
-          notes,
+      const refs = await cartStore.getCart(me.id);
+      if (!refs.length) throw new DomainError('El carrito está vacío.', 'CART_EMPTY');
+      const { unavailable } = reconcileCart(await loadLines(refs));
+      if (unavailable.length) {
+        const names = unavailable.map(u => (u.package ?? u.product)?.name ?? 'producto eliminado').join(', ');
+        throw new DomainError(`Hay partidas no disponibles en el carrito: ${names}.`, 'CART_HAS_UNAVAILABLE_ITEMS', {
+          unavailable: unavailable.map(u => ({ productId: u.productId ?? null, packageId: u.packageId ?? null, reason: u.reason, availableQuantity: u.available })),
         });
-      } catch (err) {
-        await releaseStock(taken);
-        if (err.code === 11000 && idempotencyKey) return Order.findOne({ userId: user._id, idempotencyKey });
-        throw err;
       }
 
-      publishEvent('ORDER_CREATED', {
-        orderId: order._id, number: order.number, userId: order.userId,
-        mode: order.mode, total: order.total, itemCount: order.items.length,
-      });
+      const order = await placeOrder({ ...input, userId: me.id, items: refs });
+      await cartStore.clearCart(me.id);
       return order;
     },
 
@@ -681,7 +859,8 @@ const server = new ApolloServer({
   formatError: (formatted, error) => {
     const original = error?.originalError ?? error;
     if (original instanceof DomainError) {
-      return { message: original.message, path: formatted.path, extensions: { code: 'DOMAIN_RULE_VIOLATION' } };
+      // extensions lleva el código (PRICE_CHANGED, CART_EMPTY…) y sus detalles (newQuote, unavailable…).
+      return { message: original.message, path: formatted.path, extensions: original.extensions };
     }
     if (original?.name === 'ValidationError') {
       const detail = Object.values(original.errors ?? {}).map(e => e.message).join(' ') || original.message;

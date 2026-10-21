@@ -20,11 +20,13 @@ export const PACKAGE_MAX_ITEMS = 40;
 export const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 export const sumMoney = xs => round2(xs.reduce((a, b) => a + Number(b || 0), 0));
 
+// `code` viaja al cliente en extensions.code; `details` agrega datos útiles
+// para reaccionar al error (p. ej. la cotización nueva tras PRICE_CHANGED).
 export class DomainError extends Error {
-  constructor(message) {
+  constructor(message, code = 'DOMAIN_RULE_VIOLATION', details = {}) {
     super(message);
     this.name = 'DomainError';
-    this.extensions = { code: 'DOMAIN_RULE_VIOLATION' };
+    this.extensions = { ...details, code };
   }
 }
 
@@ -270,6 +272,65 @@ export function priceOrder({ mode, store, deliveryAddress, lines, requireAddress
   const total = round2(subtotal - discountTotal + fee);
 
   return { items, subtotal, discountTotal, deliveryFee: fee, total, stockDemand: demand };
+}
+
+// ------------------------------------------------------------
+// Carrito
+//
+// El carrito guarda solo referencias y cantidades, nunca precios. Cada vez
+// que se lee se contrasta con el catálogo actual: lo que ya no se puede
+// comprar se reporta con su motivo en lugar de cobrarse.
+//
+// lines: [{ productId, quantity, product: Product|null }]
+//     o  [{ packageId, quantity, package: Package|null }]   (null = ya no existe)
+// ------------------------------------------------------------
+export const UNAVAILABLE_REASONS = ['DELETED', 'INACTIVE', 'OUT_OF_STOCK', 'INSUFFICIENT_STOCK'];
+
+export function cartLineStatus(line) {
+  const pkg = line.package;
+  const item = pkg ?? line.product;
+  if (!item) return { reason: 'DELETED', available: 0 };
+  if (!item.isActive || (pkg && pkg.items.some(i => !i.product.isActive))) return { reason: 'INACTIVE', available: 0 };
+  const available = pkg ? pkg.availableStock() : item.stock;
+  if (available <= 0) return { reason: 'OUT_OF_STOCK', available: 0 };
+  if (available < line.quantity) return { reason: 'INSUFFICIENT_STOCK', available };
+  return { reason: null, available };
+}
+
+export function reconcileCart(lines) {
+  const available = [];
+  const unavailable = [];
+  for (const line of lines) {
+    const status = cartLineStatus(line);
+    if (status.reason) unavailable.push({ ...line, ...status });
+    else available.push(line);
+  }
+  return { available, unavailable };
+}
+
+// ------------------------------------------------------------
+// Cotización confirmada
+//
+// Una cotización no congela precios: es el total que el cliente vio. Al
+// comprar se recalcula contra el catálogo actual y, si algo cambió, la
+// compra se rechaza para que el cliente confirme el total nuevo.
+//
+// quote / fresh: { mode, storeId, items: [{ productId|packageId, quantity,
+//                  unitPrice, discountPercent, lineTotal }], deliveryFee, total }
+// ------------------------------------------------------------
+const lineKey = i => (i.packageId ? `k:${i.packageId}` : `p:${i.productId}`);
+const sortedLines = items => [...items].sort((a, b) => lineKey(a).localeCompare(lineKey(b)));
+
+export function assertQuoteStillValid(quote, fresh) {
+  const what = q => [q.mode, String(q.storeId ?? ''), ...sortedLines(q.items).map(i => `${lineKey(i)}x${i.quantity}`)].join('|');
+  if (what(quote) !== what(fresh)) {
+    throw new DomainError('La compra no coincide con la cotización (cambiaron productos, cantidades, sucursal o modo).', 'QUOTE_MISMATCH');
+  }
+  const amounts = q => [...sortedLines(q.items).map(i => `${lineKey(i)}:${i.unitPrice}:${i.discountPercent}:${i.lineTotal}`), q.deliveryFee, q.total].join('|');
+  if (amounts(quote) !== amounts(fresh)) {
+    throw new DomainError('Los precios cambiaron desde la cotización. Revisa el nuevo total y confirma de nuevo.', 'PRICE_CHANGED');
+  }
+  return true;
 }
 
 // Importes que se derivan de las partidas en lugar de guardarse.
