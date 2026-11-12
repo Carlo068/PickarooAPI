@@ -2,7 +2,7 @@
 
 Backend GraphQL de Pickaroo para administrar un catálogo comercial, paquetes de productos, sucursales, usuarios, listas de compra y pedidos con recogida o entrega a domicilio. La implementación incluye datos de demostración de CARNYFRUT, orientados a productos para carne asada y parrilladas.
 
-El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, mientras que **RabbitMQ** recibe eventos de pedidos para una futura integración de auditoría u otros consumidores. **Redis Stack** guarda las sesiones de inicio de sesión (JWT) y una copia de lectura de productos y usuarios.
+El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, **Redis Stack** guarda las sesiones de inicio de sesión (JWT), el carrito y una copia de lectura de productos y usuarios. **Neo4j** guarda el grafo de roles, permisos, sucursales del personal y menús (RBAC). Cada acción relevante se publica en **RabbitMQ** y **`services/auditAPI`** la persiste en **ScyllaDB** como bitácora de auditoría inmutable.
 
 
 ## 1. Arquitectura y componentes
@@ -14,21 +14,30 @@ flowchart LR
   API --> Dominio[Reglas de dominio\ndomain/entities.js]
   API --> Mongoose[Modelos Mongoose]
   Mongoose --> Mongo[(MongoDB\nDocker:27017)]
-  API --> Rabbit[RabbitMQ\nDocker:5672]
   API --> Redis[(Redis Stack\nDocker:6379)]
+  API --> Neo4j[(Neo4j\nDocker:7687)]
+  API -- eventos --> Rabbit[RabbitMQ\nDocker:5672]
+  Rabbit --> Audit[auditAPI\nlocalhost:4003]
+  Gateway --> Audit
+  Audit --> Scylla[(ScyllaDB\nDocker:9042)]
 ```
 
 | Componente | Responsabilidad |
 |---|---|
-| Apollo Gateway | Componer el subgrafo `pickaroo` y exponer su contrato GraphQL a los clientes. |
+| Apollo Gateway | Componer los subgrafos `pickaroo` y `auditoria`, y reenviarles el JWT, la IP y el User-Agent del cliente. |
 | mongoAPI | Ejecutar consultas y mutaciones, coordinar validaciones, persistir documentos y publicar eventos. |
 | Dominio | Encapsular reglas de productos, paquetes, inventario, precios, descuentos, entrega y estados de pedidos. |
 | Mongoose | Definir tipos, restricciones, subdocumentos, referencias e índices de MongoDB. |
 | MongoDB | Almacenar las colecciones del negocio y ejecutar los pipelines analíticos. |
-| RabbitMQ | Recibir los eventos `ORDER_CREATED` y `ORDER_STATUS_CHANGED`. No hay consumidor implementado en este repositorio. |
-| Redis Stack | Registrar las sesiones activas del JWT y servir como caché de lectura (Redis OM) de productos y usuarios. |
+| Redis Stack | Sesiones activas del JWT (con sus permisos), carrito, cotizaciones y caché de lectura (Redis OM) de productos y usuarios. |
+| Neo4j | Roles, herencia de roles, permisos, sucursales asignadas al personal y menú de navegación (RBAC). |
+| RabbitMQ | Cola durable `pickaroo.events` con los eventos de auditoría que publica mongoAPI. |
+| auditAPI | Consumir la cola, escribir la bitácora en ScyllaDB y exponer sus consultas (permiso `audit:view`). |
+| ScyllaDB | Bitácora inmutable de seguridad, administración, catálogo y órdenes. |
 
-El Gateway y mongoAPI son procesos Node.js ejecutados en el equipo anfitrión. El archivo Compose levanta únicamente MongoDB, RabbitMQ y Redis Stack, no los procesos Node.js.
+El Gateway, mongoAPI y auditAPI son procesos Node.js ejecutados en el equipo anfitrión. El archivo Compose levanta MongoDB, RabbitMQ, Redis Stack, Neo4j y ScyllaDB, no los procesos Node.js.
+
+El plan de diseño de roles y bitácora está en [docs/PLAN-neo4j-scylladb.md](docs/PLAN-neo4j-scylladb.md).
 
 ### Estructura del repositorio
 
@@ -37,10 +46,20 @@ PickarooAPI/
 ├── README.md
 ├── package.json
 ├── docker-compose.yml
+├── docs/
+│   └── PLAN-neo4j-scylladb.md
 ├── gateway/
 │   ├── package.json
 │   └── index.js
 └── services/
+    ├── auditAPI/                 bitácora: RabbitMQ → ScyllaDB + consultas GraphQL
+    │   ├── package.json
+    │   └── src/
+    │       ├── index.js
+    │       ├── schema.graphql
+    │       ├── auth.js           JWT + sesión de Redis (permiso audit:view)
+    │       ├── consumer.js       consumidor de RabbitMQ
+    │       └── scylla.js         keyspace, tablas y consultas CQL
     └── mongoAPI/
         ├── package.json
         └── src/
@@ -48,8 +67,12 @@ PickarooAPI/
             ├── auth.js
             ├── schema.graphql
             ├── domain/
-            │   └── entities.js
+            │   ├── entities.js
+            │   └── access.js     roles, permisos, menús y reglas de acceso
             └── infrastructure/
+                ├── neo4j.js
+                ├── rbac-graph.js consultas Cypher del RBAC
+                ├── events.js     productor de eventos de auditoría
                 ├── redis-om.js
                 ├── entity-cache.js
                 ├── cart-store.js
@@ -125,9 +148,10 @@ El proceso del servicio realiza estas acciones:
 2. Espera la conexión con MongoDB antes de iniciar la API.
 3. Ejecuta `syncIndexes()` para cada modelo. Los errores de índices se registran como advertencias y no detienen por sí mismos el arranque.
 4. Conecta con Redis (espera hasta 3 segundos; si no responde, sigue reintentando en segundo plano).
-5. Intenta conectar con RabbitMQ y declarar la cola de eventos.
-6. Construye y publica el subgrafo con Apollo Server; el contexto de cada petición valida el JWT.
-7. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar.
+5. Conecta con Neo4j y crea/actualiza el catálogo RBAC y las sucursales; si no responde, reintenta cada 10 segundos.
+6. Intenta conectar con RabbitMQ y declarar la cola de eventos.
+7. Construye y publica el subgrafo con Apollo Server; el contexto de cada petición valida el JWT.
+8. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar.
 
 `syncIndexes()` puede crear o eliminar índices para alinearlos con los esquemas. El inicio del servicio no es, por tanto, una operación estrictamente de solo lectura sobre la base.
 
@@ -137,7 +161,8 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 
 | Uso | Claves | TTL | Archivo |
 |---|---|---|---|
-| Sesiones del JWT | `session:<jti>` → id del usuario | `JWT_TTL_SECONDS` (3600) | `auth.js` |
+| Sesiones del JWT | `session:<jti>` (JSON: usuario, rol, permisos, sucursales) | `JWT_TTL_SECONDS` (3600) | `auth.js` |
+| Índice de sesiones | `user:<userId>:sessions` (SET de `jti`) | igual que la sesión | `auth.js` |
 | Caché de productos (Redis OM, JSON) | `Product:<id>` | 120 s (`CACHE_TTL_PRODUCT`) | `entity-cache.js` |
 | Caché de usuarios (Redis OM, JSON) | `User:<id>` | 3600 s (`CACHE_TTL_USER`) | `entity-cache.js` |
 | Carrito | `cart:<userId>` (HASH `p:<productId>` / `k:<packageId>` → cantidad) | 7 días, se renueva con cada cambio | `cart-store.js` |
@@ -167,26 +192,67 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 
 La interfaz **RedisInsight** (`http://localhost:8001`) permite inspeccionar estas claves.
 
-### Autenticación y autorización: `src/auth.js`
+### Autenticación: `src/auth.js`
 
 Autenticación híbrida **JWT + sesión activa en Redis**:
 
-1. `login(input: {email, password})` verifica la contraseña (scrypt, comparación en tiempo constante), firma un JWT HS256 con `sub`, `name`, `email`, `role` y un `jti` único, y guarda `session:<jti>` en Redis con el mismo TTL.
-2. Cada petición envía `Authorization: Bearer <token>`. El Gateway reenvía el encabezado al subgrafo, que valida la firma y la expiración **y** que `session:<jti>` siga existiendo.
+1. `login(input: {email, password})` verifica la contraseña (scrypt, comparación en tiempo constante) y lee de Neo4j el rol, los permisos efectivos y las sucursales del usuario. Firma un JWT HS256 con `sub`, `name`, `email`, `role` y un `jti` único, y guarda `session:<jti>` en Redis con esos permisos y el mismo TTL. Devuelve también `access` y `menu`.
+2. Cada petición envía `Authorization: Bearer <token>`. El Gateway reenvía el encabezado al subgrafo, que valida la firma y la expiración **y** que `session:<jti>` siga existiendo. Los permisos salen de la sesión: una petición no consulta Neo4j.
 3. `logout` borra `session:<jti>`: el token deja de servir al instante, aunque no haya expirado.
 
-Correo inexistente, contraseña incorrecta y cuenta desactivada devuelven el mismo mensaje (`Credenciales inválidas.`).
+Correo inexistente, contraseña incorrecta y cuenta desactivada devuelven el mismo mensaje (`Credenciales inválidas.`); el motivo real queda en la bitácora.
+
+### Autorización: roles en Neo4j (`domain/access.js`, `infrastructure/rbac-graph.js`)
+
+```
+(:User {id})-[:HAS_ROLE]->(:Role)-[:INHERITS]->(:Role)
+(:Role)-[:HAS_PERMISSION]->(:Permission)
+(:User)-[:WORKS_AT]->(:Store {id})
+(:Role)-[:CAN_VIEW_MENU]->(:MenuItem)-[:NAVIGATES_TO]->(:Route)
+```
+
+| Rol | Hereda de | Para quién | Permisos propios |
+|---|---|---|---|
+| `CUSTOMER` | — | Cliente | ninguno (lo suyo se controla por dueño) |
+| `STAFF` | CUSTOMER | Empleado de mostrador | `orders:prepare`, `stock:manage` |
+| `DELIVERY` | CUSTOMER | Repartidor | `orders:deliver` |
+| `MANAGER` | STAFF | Gerente de sucursal | `catalog:manage`, `reports:view` |
+| `ADMIN` | MANAGER | Dueño / sistemas | `orders:deliver`, `stores:manage`, `users:manage`, `audit:view`, `scope:all_stores` |
+
+Los permisos efectivos son los del rol más los de todos los roles que hereda (`[:INHERITS*0..]`). Los `id` de `User` y `Store` en Neo4j son los `_id` de MongoDB.
+
+- **Fuente de verdad:** Neo4j. `users.role` en MongoDB es un espejo: se actualiza con `assignRole` y se corrige solo en el login si difiere.
+- **Catálogo:** roles, permisos, herencia y menú se definen en `domain/access.js` y se crean/actualizan en Neo4j en cada arranque (y al reconectar).
+- **Auto-reparación:** un usuario que aún no está en el grafo se crea en su primer login con el rol espejo de MongoDB.
+- **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT`; `scope:all_stores` (ADMIN) ve todas.
+- **Cambios de acceso inmediatos:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan todas las sesiones del usuario (`user:<id>:sessions`); al volver a entrar recibe los permisos nuevos.
+- **Neo4j caído:** el login funciona con permisos vacíos (`access.degraded = true`) y se registra `RBAC_UNAVAILABLE`. Nadie gana privilegios sin el grafo; los clientes compran normalmente.
+
+Reglas de órdenes (`canChangeOrderStatus`):
+
+| Transición | Permiso | Además |
+|---|---|---|
+| → `CONFIRMED`, `PREPARING`, `READY` | `orders:prepare` | sucursal asignada |
+| `READY` → `DELIVERED` (PICKUP) | `orders:prepare` | sucursal asignada |
+| `READY` → `IN_DELIVERY` → `DELIVERED` (DELIVERY) | `orders:deliver` | sucursal asignada; una orden PICKUP nunca sale a reparto |
+| → `CANCELLED` | dueño de la orden, o `orders:prepare` | sucursal asignada |
 
 Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin permiso):
 
 | Acceso | Operaciones |
 |---|---|
-| Público | `login`, `createUser` (registro; siempre crea `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
-| Sesión iniciada | `me`, `logout`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` (siempre sobre el usuario del token) |
-| Dueño o `ADMIN` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `cancelOrder`, `order`, `orderByNumber`, `orders` (un cliente solo ve las suyas), `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
-| Solo `ADMIN` | `users`, `createUser` con `role: ADMIN`, `createCategory`, `createProduct`, `updateProduct`, `setProductActive`, `setProductStock`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive`, `createStore`, `updateStore`, `updateOrderStatus`, `salesReport`, `packageComponentDemand` |
+| Público | `login`, `createUser` (registro; siempre `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
+| Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
+| Dueño o `users:manage` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
+| Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal: las de sus sucursales; repartidor: solo DELIVERY), `cancelOrder`, `updateOrderStatus` (según la tabla anterior) |
+| `stock:manage` | `setProductStock` |
+| `catalog:manage` | `createCategory`, `createProduct`, `updateProduct`, `setProductActive`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive` |
+| `reports:view` | `salesReport`, `packageComponentDemand` |
+| `stores:manage` | `createStore`, `updateStore` |
+| `users:manage` | `users`, `roles`, `userAccess`, `assignRole`, `assignUserToStore`, `removeUserFromStore`, `createUser` con un rol distinto de `CUSTOMER` |
+| `audit:view` | `auditEvents`, `auditByActor`, `auditByTarget`, `auditSummary` (subgrafo auditoria) |
 
-El rol viaja dentro del token y vale hasta que expira o se hace `logout`; cambiar el rol de un usuario en la base no afecta a sus sesiones abiertas.
+La interfaz **Neo4j Browser** (`http://localhost:7474`, usuario `neo4j`) permite ver el grafo, por ejemplo con `MATCH (u:User)-[r]->(n) RETURN u, r, n`.
 
 ## 3. Modelo documental
 
@@ -384,23 +450,54 @@ Multiplica la cantidad de cada producto del contenido por el número de paquetes
 
 Es un reporte de demanda para planear compras; el stock ya se descuenta al vender. El nombre del producto se obtiene del catálogo actual. Las cantidades de diferentes unidades no deben sumarse como si fueran equivalentes.
 
-## 9. RabbitMQ y eventos
+## 9. Bitácora de auditoría: RabbitMQ → ScyllaDB
 
-La cola predeterminada es `pickaroo.events`, configurable con `RABBITMQ_QUEUE`. Se declara durable y los mensajes se envían con `persistent: true`.
+mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `pickaroo.events` (`RABBITMQ_QUEUE`, mensajes `persistent`) y sigue. `services/auditAPI` consume la cola y es el único servicio que escribe y lee ScyllaDB. Si RabbitMQ no está disponible el evento se descarta con un aviso: una caída del broker nunca interrumpe una compra o un login.
 
-La estructura publicada es:
+### Eventos
+
+| Categoría | Eventos |
+|---|---|
+| `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (con el motivo real), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE` |
+| `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED`, `STORE_CREATED`, `STORE_UPDATED` |
+| `CATALOG` | `CATEGORY_CREATED`, `PRODUCT_CREATED`, `PRODUCT_UPDATED` (cambios `{ from, to }`, p. ej. precio), `PRODUCT_ACTIVE_CHANGED`, `STOCK_SET`, `DISCOUNT_ADDED`, `DISCOUNT_REMOVED`, `PACKAGE_CREATED`, `PACKAGE_UPDATED`, `PACKAGE_ACTIVE_CHANGED` |
+| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, stock insuficiente) |
+
+`ACCESS_DENIED` y `ORDER_REJECTED` se registran en un solo lugar: un plugin de Apollo (`auditPlugin` en `infrastructure/events.js`) que revisa los errores de cada operación. Nunca se registran contraseñas ni tokens.
+
+Sobre de cada mensaje:
 
 ```javascript
 {
-  event: "ORDER_CREATED",
-  payload: { /* identificadores e información del pedido */ },
-  occurredAt: "2026-09-08T12:00:00.000Z"
+  eventId: "uuid",            // lo genera el productor: idempotencia
+  type: "PRODUCT_UPDATED",
+  category: "CATALOG",
+  actorId: "<userId>" | "ANONYMOUS",
+  actorRole: "MANAGER",
+  targetType: "Product", targetId: "<productId>",
+  success: true,
+  reason: "Precio $289 → $299",
+  ip: "…", userAgent: "…",    // reenviados por el gateway
+  metadata: { changes: { price: { from: 289, to: 299 } } },
+  occurredAt: "2026-11-12T18:00:00.000Z"
 }
 ```
 
-Si RabbitMQ no está disponible, la API registra el problema y continúa; los eventos pueden omitirse. No hay outbox, confirmaciones de publicación, reintento de eventos ni reconexión automática implementados. La publicación no forma una transacción con MongoDB.
+### Tablas en ScyllaDB (keyspace `pickaroo_audit`)
 
-`cassandra-driver` está declarado como dependencia, pero no hay conexión ni operaciones Cassandra/ScyllaDB en el servicio actual.
+Diseño por consulta: cada evento se escribe (batch con log) en las tablas que le corresponden, ordenadas por `occurred_at DESC`.
+
+| Tabla | Clave de partición | Responde | Consulta GraphQL |
+|---|---|---|---|
+| `events_by_day` | `(category, day)` | "eventos de seguridad de hoy" | `auditEvents(category, day, type, limit)`, `auditSummary(day)` |
+| `events_by_actor` | `(actor_id)` | "qué hizo este usuario" (no se escribe para `ANONYMOUS`) | `auditByActor(actorId, limit)` |
+| `events_by_target` | `(target_type, target_id)` | "historia de la orden X", "historial de precios del producto Y" | `auditByTarget(targetType, targetId, limit)` |
+
+- `day` es la fecha UTC del evento (`YYYY-MM-DD`).
+- `AuditEvent.actor` es la entidad `User` federada: el gateway la completa con el subgrafo `pickaroo` (nombre, correo…).
+- El consumidor hace `ack` solo después de escribir. Si la escritura falla, el mensaje vuelve a la cola tras 5 segundos. Si ScyllaDB no está listo al arrancar, auditAPI no consume y los eventos esperan en RabbitMQ.
+- El `eventId` lo pone el productor, así que un mensaje reentregado reescribe la misma fila. Los mensajes del formato anterior (`{ event, payload }`) también se aceptan.
+- auditAPI valida el mismo JWT y la misma sesión de Redis que mongoAPI, y exige el permiso `audit:view` (solo ADMIN).
 
 ## 10. Configuración y ejecución local
 
@@ -409,7 +506,7 @@ Si RabbitMQ no está disponible, la API registra el problema y continúa; los ev
 - Node.js compatible con las versiones de Apollo Server declaradas en los paquetes.
 - npm con soporte para workspaces.
 - Docker Desktop o un motor Docker con Docker Compose activo.
-- Puertos `27017`, `5672`, `15672`, `6379`, `8001`, `4000` y `4001` disponibles.
+- Puertos `27017`, `5672`, `15672`, `6379`, `8001`, `7474`, `7687`, `9042`, `4000`, `4001` y `4003` disponibles.
 
 ### Instalar dependencias
 
@@ -442,7 +539,27 @@ SEED=false
 node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
 ```
 
+Neo4j (los valores de respaldo coinciden con el Compose):
+
+```dotenv
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=pickaroo123
+```
+
 Opcionales: `CACHE_TTL_PRODUCT` (120), `CACHE_TTL_USER` (3600) y `CACHE_DEBUG=true`.
+
+### Variables de auditAPI
+
+auditAPI lee **`services/auditAPI/.env`** y, para lo que no defina, **`services/mongoAPI/.env`**: así comparte `JWT_SECRET` y `REDIS_URL` sin copiarlos. En producción ambos servicios deben recibir el mismo `JWT_SECRET`.
+
+```dotenv
+PORT_AUDITORIA=4003
+SCYLLADB_CONTACT_POINTS=127.0.0.1
+SCYLLADB_PORT=9042
+SCYLLADB_KEYSPACE=pickaroo_audit
+RABBITMQ_URL=amqp://guest:guest@localhost:5672
+```
 
 Sustituir `CONTRASENA_DEL_COMPOSE` por el valor de `MONGO_INITDB_ROOT_PASSWORD` del YAML. Si contiene caracteres reservados de una URI, deben codificarse. El usuario y contraseña deben coincidir con los que inicializaron el volumen de MongoDB; editar el YAML no cambia automáticamente las credenciales de un volumen existente.
 
@@ -455,6 +572,7 @@ Crear **`gateway/.env`**:
 ```dotenv
 PORT_GATEWAY=4000
 PORT_CAMPAMENTOS=4001
+PORT_AUDITORIA=4003
 ```
 
 `PORT_CAMPAMENTOS` conserva un nombre del boilerplate, pero configura el puerto de mongoAPI. Debe coincidir en ambos archivos. Al ejecutar los scripts mediante workspaces, cada proceso carga su `.env` desde su propio directorio; un `.env` en la raíz no sustituye automáticamente estos archivos.
@@ -468,17 +586,21 @@ docker compose up -d
 npm run dev
 ```
 
-Para arrancar los procesos por separado:
+`npm run dev` arranca mongoAPI, auditAPI y el Gateway. Para arrancarlos por separado, cada uno en su terminal:
 
 ```bash
 npm run dev:campamentos
 ```
 
-En otra terminal:
+```bash
+npm run dev:auditoria
+```
 
 ```bash
 npm run dev:gateway
 ```
+
+ScyllaDB tarda alrededor de un minuto en aceptar conexiones después de `docker compose up`; auditAPI reintenta solo y empieza a consumir cuando está listo.
 
 El comando `dev:campamentos` apunta a `services/mongoAPI`; no se debe sustituir por un nombre de script que no esté definido en `package.json`.
 
@@ -486,29 +608,35 @@ El comando `dev:campamentos` apunta a `services/mongoAPI`; no se debe sustituir 
 |---|---|
 | Gateway GraphQL | `http://localhost:4000/` |
 | Subgrafo mongoAPI | `http://localhost:4001/graphql` |
+| Subgrafo auditAPI | `http://localhost:4003/graphql` |
 | MongoDB | `localhost:27017`, base recomendada `pickaroodb` |
 | RabbitMQ AMQP | `localhost:5672` |
 | Panel RabbitMQ | `http://localhost:15672/` |
 | Redis Stack | `localhost:6379` |
 | RedisInsight | `http://localhost:8001/` |
+| Neo4j Browser | `http://localhost:7474/` (usuario `neo4j`) |
+| Neo4j Bolt | `localhost:7687` |
+| ScyllaDB (CQL) | `localhost:9042`, keyspace `pickaroo_audit` |
 
-El Gateway intenta componer el subgrafo hasta 15 veces, con una espera de dos segundos entre fallos. Es necesario que mongoAPI llegue a estar disponible dentro de ese periodo.
+El Gateway intenta componer los subgrafos hasta 15 veces, con una espera de dos segundos entre fallos. mongoAPI y auditAPI deben estar disponibles dentro de ese periodo (auditAPI responde aunque ScyllaDB aún no esté listo).
 
 ### Persistencia y apagado
 
-Compose utiliza `mongo:8.0`, `rabbitmq:3.13-management` y `redis/redis-stack:latest`, con la red `pickaroo-network` y los volúmenes:
+Compose utiliza `mongo:8.0`, `rabbitmq:3.13-management`, `redis/redis-stack:latest`, `neo4j:5.26` y `scylladb/scylla:5.4` (modo desarrollo, 1 CPU, 750 MB), con la red `pickaroo-network` y los volúmenes:
 
 - `mongodb_data`, montado en `/data/db`.
 - `rabbitmq_data`, montado en `/var/lib/rabbitmq`.
 - `redis_data`, montado en `/data` (Redis con `--appendonly yes`, así las sesiones sobreviven a un reinicio del contenedor).
+- `neo4j_data`, montado en `/data` del contenedor de Neo4j.
+- `scylla_data`, montado en `/var/lib/scylla`.
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 mongodb rabbitmq redis
+docker compose logs --tail=100 mongodb rabbitmq redis neo4j scylladb
 docker compose down
 ```
 
-`down` conserva los volúmenes; `down -v` los elimina (y con ellos las sesiones y el caché). MongoDB está configurado como standalone, sin replica set. Si el MongoDB, RabbitMQ o Redis de HITO1 (o de otro proyecto) sigue publicando los puertos `27017`, `5672`, `6379` o `8001`, ambos Compose no podrán utilizarlos simultáneamente.
+`down` conserva los volúmenes; `down -v` los elimina (y con ellos las sesiones y el caché). MongoDB está configurado como standalone, sin replica set. Si el MongoDB, RabbitMQ, Redis, Neo4j o ScyllaDB de HITO1 (o de otro proyecto) sigue publicando los puertos `27017`, `5672`, `6379`, `8001`, `7474`, `7687` o `9042`, ambos Compose no podrán utilizarlos simultáneamente.
 
 ## 11. Datos de demostración
 
@@ -517,7 +645,17 @@ Para habilitar el seed, establecer `SEED=true` en el `.env` de mongoAPI y reinic
 En una base vacía crea:
 
 - Una sucursal `CARNYFRUT Centro`, con tarifa de reparto de $35 y envío gratuito desde $400 después de descuentos.
-- Dos usuarios de demostración; el cliente tiene una dirección predeterminada. Sus contraseñas (solo desarrollo) son `Admin1234` para `admin@carnyfrut.mx` y `Cliente1234` para `cliente@demo.mx`; se pueden cambiar con `SEED_ADMIN_PASSWORD` y `SEED_CUSTOMER_PASSWORD`. El seed las asigna también a usuarios de demostración ya existentes que no tengan contraseña.
+- Cinco usuarios de demostración (contraseñas solo de desarrollo). El seed asigna la contraseña también a usuarios demo ya existentes que no tengan una.
+
+  | Correo | Rol | Contraseña | Variable para cambiarla |
+  |---|---|---|---|
+  | `admin@carnyfrut.mx` | ADMIN | `Admin1234` | `SEED_ADMIN_PASSWORD` |
+  | `gerente@carnyfrut.mx` | MANAGER | `Manager1234` | `SEED_MANAGER_PASSWORD` |
+  | `empleado@carnyfrut.mx` | STAFF | `Staff1234` | `SEED_STAFF_PASSWORD` |
+  | `repartidor@carnyfrut.mx` | DELIVERY | `Delivery1234` | `SEED_DELIVERY_PASSWORD` |
+  | `cliente@demo.mx` | CUSTOMER (con dirección predeterminada) | `Cliente1234` | `SEED_CUSTOMER_PASSWORD` |
+
+- En Neo4j, los cinco usuarios con su rol; gerente, empleado y repartidor asignados a `CARNYFRUT Centro` (`WORKS_AT`). Un rol ya existente en el grafo no se cambia. Si Neo4j no está arriba durante el seed, el personal queda sin sucursal hasta volver a ejecutarlo.
 - Cuatro categorías: Carnes, Frutas, Verduras y Abarrotes.
 - Once productos y, en la colección `packages`, un paquete familiar para carne asada con ocho productos.
 - Una promoción del 15% incrustada en el producto Plátano.
@@ -722,7 +860,10 @@ Esta versión contiene los elementos de Docker, dominio, Mongoose, GraphQL y agr
 
 Aspectos relevantes al continuar el desarrollo:
 
-- La autenticación es JWT + sesión en Redis. No hay limitación de intentos de `login`, recuperación de contraseña ni cambio de contraseña, y tampoco una operación para desactivar usuarios o cambiar su rol; el rol del token vale hasta que expira o se hace `logout`.
+- La autenticación es JWT + sesión en Redis. No hay limitación de intentos de `login`, recuperación ni cambio de contraseña, ni una operación para desactivar usuarios. Los intentos fallidos sí quedan en la bitácora (`LOGIN_FAILED`).
+- Los roles viven en Neo4j; MongoDB guarda un espejo. Si se edita el grafo a mano (sin `assignRole`), el cambio aplica en el siguiente login del usuario, no en sus sesiones abiertas.
+- Los reportes (`salesReport`, `packageComponentDemand`) y el catálogo no se filtran por sucursal: el stock es global.
+- La bitácora es de "al menos una vez": si RabbitMQ no está disponible cuando mongoAPI publica, ese evento se pierde (no hay outbox). auditAPI no expone borrado ni edición de eventos.
 - Las contraseñas se guardan con `scrypt` y sal aleatoria (`scrypt$sal$hash`). Con el registro abierto (`createUser` sin sesión) cualquiera puede crear cuentas `CUSTOMER`.
 - Sin Redis nadie puede iniciar sesión ni usar un token existente (falla cerrado); el catálogo público sigue disponible.
 - El caché es de lectura. Las copias de producto pueden mostrar datos de hasta `CACHE_TTL_PRODUCT` segundos de antigüedad si MongoDB se modifica por fuera de la API; las compras siempre usan MongoDB. El caché y las sesiones asumen un solo proceso de mongoAPI.

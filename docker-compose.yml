@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
 
   mongodb:
@@ -42,6 +40,30 @@ services:
     networks:
       - pickaroo-network
 
+  neo4j:
+    image: neo4j:5.26 # grafo de roles, permisos, sucursales y menús (RBAC)
+    container_name: pickaroo-neo4j
+    ports:
+      - "7474:7474" # Neo4j Browser: http://localhost:7474
+      - "7687:7687" # Bolt (neo4j-driver)
+    environment:
+      NEO4J_AUTH: neo4j/pickaroo123
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - pickaroo-network
+
+  scylladb:
+    image: scylladb/scylla:5.4 # bitácora de auditoría (escritura masiva, inmutable)
+    container_name: pickaroo-scylladb
+    command: --smp 1 --memory 750M --overprovisioned 1 --developer-mode 1
+    ports:
+      - "9042:9042" # CQL (cassandra-driver)
+    volumes:
+      - scylla_data:/var/lib/scylla
+    networks:
+      - pickaroo-network
+
 networks:
   pickaroo-network:
     driver: bridge
@@ -51,3 +73,5 @@ volumes:
   mongodb_data:
   rabbitmq_data:
   redis_data:
+  neo4j_data:
+  scylla_data:

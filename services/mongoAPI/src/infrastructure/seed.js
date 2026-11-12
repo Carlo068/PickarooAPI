@@ -2,8 +2,14 @@
 // Aditiva e idempotente: si un registro ya existe (match por nombre o correo)
 // no se toca, así re-ejecutarla nunca pisa stock, precios ni órdenes.
 // Se ejecuta al arrancar con SEED=true.
+//
+// En Neo4j crea los nodos de los usuarios demo con su rol y asigna el
+// personal a la sucursal (WORKS_AT). Un rol ya existente en el grafo no se
+// cambia: manda lo que haya asignado un administrador.
 
 import { hashPassword } from './passwords.js';
+import { isNeo4jReady } from './neo4j.js';
+import * as rbac from './rbac-graph.js';
 
 async function ensure(Model, filter, doc) {
   const existing = await Model.findOne(filter);
@@ -45,6 +51,19 @@ export async function seed({ User, Category, Product, Package, Store }) {
     await cliente.save();
   }
   await ensurePassword(cliente, clientePassword);
+
+  // Personal de la sucursal (contraseñas solo de desarrollo).
+  const staffPassword = role => process.env[`SEED_${role}_PASSWORD`] || `${role[0]}${role.slice(1).toLowerCase()}1234`;
+  const staff = [];
+  for (const { email, name, role } of [
+    { email: 'gerente@carnyfrut.mx', name: 'Gerente CARNYFRUT Centro', role: 'MANAGER' },
+    { email: 'empleado@carnyfrut.mx', name: 'Empleado de mostrador', role: 'STAFF' },
+    { email: 'repartidor@carnyfrut.mx', name: 'Repartidor Centro', role: 'DELIVERY' },
+  ]) {
+    const user = await ensure(User, { email }, { name, role });
+    await ensurePassword(user, staffPassword(role));
+    staff.push(user);
+  }
 
   const cats = {};
   for (const [i, c] of [
@@ -91,6 +110,16 @@ export async function seed({ User, Category, Product, Package, Store }) {
     ],
   });
 
+  // Roles y sucursal en el grafo.
+  if (isNeo4jReady()) {
+    await rbac.syncStores([store]);
+    for (const u of [admin, cliente, ...staff]) await rbac.ensureUser({ id: u._id, email: u.email, name: u.name }, u.role);
+    for (const u of staff) await rbac.assignStore(u._id, store._id);
+    console.log(`🌿 Seed Neo4j: ${2 + staff.length} usuarios con rol; ${staff.length} asignados a "${store.name}".`);
+  } else {
+    console.warn('⚠️  Seed sin Neo4j: los usuarios tomarán su rol al iniciar sesión, pero el personal quedará sin sucursal hasta volver a correr el seed con Neo4j arriba.');
+  }
+
   const [products, packages] = await Promise.all([Product.countDocuments(), Package.countDocuments()]);
-  console.log(`🌱 Seed OK: ${products} productos, ${packages} paquete/s, sucursal "${store.name}", usuarios ${admin.email} / ${cliente.email}.`);
+  console.log(`🌱 Seed OK: ${products} productos, ${packages} paquete/s, sucursal "${store.name}", usuarios ${[admin, cliente, ...staff].map(u => u.email).join(', ')}.`);
 }

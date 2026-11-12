@@ -9,11 +9,11 @@
     "@apollo/server": "^5.5.1",
     "@apollo/subgraph": "^2.3.6",
     "amqplib": "^0.10.3",
-    "cassandra-driver": "4.2.0",
     "dotenv": "^16.4.5",
     "graphql": "^16.8.1",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.2.0",
+    "neo4j-driver": "^5.28.3",
     "redis": "^6.3.0",
     "redis-om": "^0.4.7"
   }

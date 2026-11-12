@@ -7,7 +7,6 @@ import { startStandaloneServer } from '@apollo/server/standalone';
 import { buildSubgraphSchema } from '@apollo/subgraph';
 import { GraphQLScalarType, Kind, parse } from 'graphql';
 import mongoose from 'mongoose';
-import amqp from 'amqplib';
 
 import { User, Category, Product, Package, Store, Order, ShoppingList, models } from './infrastructure/models/index.js';
 import {
@@ -35,7 +34,11 @@ import { hashPassword } from './infrastructure/passwords.js';
 import * as cartStore from './infrastructure/cart-store.js';
 import { saveQuote, getQuote, deleteQuote } from './infrastructure/quote-store.js';
 import { RECENT_ORDERS, pushRecentOrder, getRecentOrderIds, setRecentOrders } from './infrastructure/recent-orders.js';
-import { createAuthContext, createAuthResolvers, requireAuth, requireAdmin, requireSelfOrAdmin } from './auth.js';
+import { initNeo4j, isNeo4jReady } from './infrastructure/neo4j.js';
+import * as rbac from './infrastructure/rbac-graph.js';
+import { initEvents, emitEvent, diff, auditPlugin, CATEGORIES } from './infrastructure/events.js';
+import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
+import { PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus } from './domain/access.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const typeDefs = parse(fs.readFileSync(path.join(__dirname, 'schema.graphql'), 'utf8'));
@@ -54,35 +57,11 @@ await Promise.all(models.map(m => m.syncIndexes().catch(err => console.warn(`Ín
 await initRedis();
 
 // ------------------------------------------------------------
-// Infraestructura: RabbitMQ (eventos de dominio para auditoría)
+// Infraestructura: Neo4j (roles y permisos) y RabbitMQ (eventos de auditoría)
 // ------------------------------------------------------------
-const EVENTS_QUEUE = process.env.RABBITMQ_QUEUE || 'pickaroo.events';
-let rabbitChannel = null;
-
-async function initRabbit() {
-  try {
-    const conn = await amqp.connect(process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672');
-    conn.on('error', err => console.error('RabbitMQ (conexión):', err.message));
-    conn.on('close', () => { rabbitChannel = null; });
-    rabbitChannel = await conn.createChannel();
-    await rabbitChannel.assertQueue(EVENTS_QUEUE, { durable: true });
-    console.log(`✅ RabbitMQ conectado. Cola "${EVENTS_QUEUE}" lista.`);
-  } catch (err) {
-    console.error('⚠️  No se pudo conectar a RabbitMQ:', err.message);
-  }
-}
-await initRabbit();
-
-function publishEvent(event, payload) {
-  if (!rabbitChannel) return;
-  const message = { event, payload, occurredAt: new Date().toISOString() };
-  try {
-    rabbitChannel.sendToQueue(EVENTS_QUEUE, Buffer.from(JSON.stringify(message)), { persistent: true });
-    console.log(`📤 Evento "${event}" publicado.`);
-  } catch (err) {
-    console.error(`No se pudo publicar el evento "${event}":`, err.message);
-  }
-}
+// Al conectar (y al reconectar) se crea/actualiza el catálogo RBAC y las sucursales.
+await initNeo4j(async () => rbac.bootstrapRbac(await Store.find().select('name isActive')));
+await initEvents();
 
 // ------------------------------------------------------------
 // Helpers
@@ -113,12 +92,55 @@ function resolveDeliveryAddress(input, addressId, user) {
   return found ? locationFrom(found) : null;
 }
 
-// Devuelve el documento solo si pertenece al usuario autenticado (o es administrador).
+// Lista guardada: solo su dueño (o quien administra usuarios).
 function ownedOrNull(ctx, doc) {
   requireAuth(ctx);
   if (!doc) return null;
-  requireSelfOrAdmin(ctx, doc.userId);
+  requireSelfOrPermission(ctx, doc.userId);
   return doc;
+}
+
+// Orden: su dueño o el personal de esa sucursal (según su permiso).
+function viewableOrder(ctx, order) {
+  const me = requireAuth(ctx);
+  if (!order) return null;
+  if (!canViewOrder(me, order)) throw forbidden('No tienes permiso para ver esta orden.');
+  return order;
+}
+
+// Qué órdenes ve quien consulta: un cliente las suyas; el personal las de sus
+// sucursales (el repartidor solo las de reparto); scope:all_stores todas.
+function ordersFilter(me, { userId, storeId }) {
+  if (userId && String(userId) === String(me.id)) return { userId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) };
+
+  if (hasPermission(me, PERMISSIONS.ALL_STORES)) {
+    return { ...(userId ? { userId: oid(userId) } : {}), ...(storeId ? { storeId: oid(storeId) } : {}) };
+  }
+
+  const prepares = hasPermission(me, PERMISSIONS.ORDERS_PREPARE);
+  const delivers = hasPermission(me, PERMISSIONS.ORDERS_DELIVER);
+  if (prepares || delivers) {
+    if (storeId && !inStoreScope(me, storeId)) throw forbidden('Esa sucursal no está asignada a tu usuario.');
+    return {
+      storeId: storeId ? oid(storeId) : { $in: me.storeIds.map(oid) },
+      ...(userId ? { userId: oid(userId) } : {}),
+      ...(prepares ? {} : { mode: 'DELIVERY' }),
+    };
+  }
+
+  if (userId) throw forbidden('Solo puedes ver tus propias órdenes.');
+  return { userId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) };
+}
+
+// Evento de catálogo con el documento afectado como objetivo.
+function catalogEvent(ctx, type, targetType, doc, reason, metadata = {}) {
+  emitEvent({ type, category: CATEGORIES.CATALOG, targetType, targetId: doc._id, reason, metadata }, ctx);
+}
+
+// Refleja la sucursal en Neo4j (el alcance del personal se define con WORKS_AT).
+async function syncStoreNode(store) {
+  if (!isNeo4jReady()) return;
+  await rbac.syncStores([store]).catch(err => console.warn('⚠️  Sucursal sin sincronizar en Neo4j:', err.message));
 }
 
 // Producto que ya no existe en el catálogo: cuenta como no disponible.
@@ -218,7 +240,7 @@ async function assertMatchesQuote(quoteId, { mode, store }, priced) {
 }
 
 // ---------- Crear una orden (createOrder y checkoutCart) ----------
-async function placeOrder({ userId, mode, storeId, address, addressId, items, notes, idempotencyKey, quoteId }) {
+async function placeOrder({ userId, mode, storeId, address, addressId, items, notes, idempotencyKey, quoteId }, ctx) {
   if (idempotencyKey) {
     const existing = await Order.findOne({ userId: oid(userId), idempotencyKey });
     if (existing) return existing;
@@ -260,10 +282,14 @@ async function placeOrder({ userId, mode, storeId, address, addressId, items, no
   }
 
   await Promise.all([deleteQuote(quoteId), pushRecentOrder(order.userId, order._id)]);
-  publishEvent('ORDER_CREATED', {
-    orderId: order._id, number: order.number, userId: order.userId,
-    mode: order.mode, total: order.total, itemCount: order.items.length,
-  });
+  emitEvent({
+    type: 'ORDER_CREATED', category: CATEGORIES.ORDER, targetType: 'Order', targetId: order._id,
+    reason: `Orden ${order.number}`,
+    metadata: {
+      number: order.number, customerId: String(order.userId), storeId: String(order.storeId), mode: order.mode,
+      total: order.total, deliveryFee: order.deliveryFee, itemCount: order.items.length, quoteId: quoteId ?? null,
+    },
+  }, ctx);
   return order;
 }
 
@@ -375,23 +401,29 @@ const DateTime = new GraphQLScalarType({
 // ------------------------------------------------------------
 // Resolvers
 // ------------------------------------------------------------
-const authResolvers = createAuthResolvers(redisClient); // me, login, logout
+const authResolvers = createAuthResolvers(redisClient); // sesión, acceso (Neo4j) y administración de roles
 
 // Cambia el estado de una orden (valida la transición y repone stock al cancelar).
-async function changeOrderStatus(order, status) {
-  assertTransition(order.status, status);
+async function changeOrderStatus(order, status, ctx) {
+  assertTransition(order.status, status, order.mode);
   const previous = order.status;
   order.status = status;
   await order.save();
 
   // Repone el stock consumido, incluido el contenido de los paquetes.
   if (status === 'CANCELLED') await releaseStock(stockDemand(order.items));
-  publishEvent('ORDER_STATUS_CHANGED', { orderId: order._id, number: order.number, from: previous, to: status });
+  emitEvent({
+    type: 'ORDER_STATUS_CHANGED', category: CATEGORIES.ORDER, targetType: 'Order', targetId: order._id,
+    reason: `${previous} → ${status}`,
+    metadata: { number: order.number, from: previous, to: status, storeId: String(order.storeId), mode: order.mode },
+  }, ctx);
   return order;
 }
 
 const resolvers = {
   DateTime,
+
+  Access: authResolvers.Access,
 
   // Los usuarios llegan a GraphQL como vistas planas (ver entity-cache.js): sin passwordHash.
   User: {
@@ -488,30 +520,26 @@ const resolvers = {
     store: (_, { id }) => Store.findById(id).exec(),
 
     users: async (_, { limit, offset }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.USERS_MANAGE);
       const docs = await User.find().sort({ createdAt: -1 }).skip(offset).limit(Math.min(limit, 100)).exec();
       return docs.map(userView);
     },
     user: (_, { id }, ctx) => {
-      requireSelfOrAdmin(ctx, id);
+      requireSelfOrPermission(ctx, id);
       return getUser(id);
     },
 
-    // Un cliente solo ve sus órdenes; un administrador puede ver las de cualquiera.
-    orders: (_, { userId, status, limit, offset }, ctx) => {
-      const me = requireAuth(ctx);
-      const owner = me.role === 'ADMIN' ? userId : (userId ?? me.id);
-      if (owner) requireSelfOrAdmin(ctx, owner);
-      const q = {};
-      if (owner) q.userId = oid(owner);
+    // Cliente: las suyas. Personal: las de sus sucursales. ADMIN: todas (ver ordersFilter).
+    orders: (_, { userId, storeId, status, limit, offset }, ctx) => {
+      const q = ordersFilter(requireAuth(ctx), { userId, storeId });
       if (status) q.status = status;
       return Order.find(q).sort({ createdAt: -1 }).skip(offset).limit(Math.min(limit, 100)).exec();
     },
-    order: async (_, { id }, ctx) => ownedOrNull(ctx, await Order.findById(id).exec()),
-    orderByNumber: async (_, { number }, ctx) => ownedOrNull(ctx, await Order.findOne({ number }).exec()),
+    order: async (_, { id }, ctx) => viewableOrder(ctx, await Order.findById(id).exec()),
+    orderByNumber: async (_, { number }, ctx) => viewableOrder(ctx, await Order.findOne({ number }).exec()),
 
     shoppingLists: (_, { userId }, ctx) => {
-      requireSelfOrAdmin(ctx, userId);
+      requireSelfOrPermission(ctx, userId);
       return ShoppingList.find({ userId: oid(userId) }).sort({ updatedAt: -1 }).exec();
     },
     shoppingList: async (_, { id }, ctx) => ownedOrNull(ctx, await ShoppingList.findById(id).exec()),
@@ -542,7 +570,7 @@ const resolvers = {
 
     // Pipeline de agregación #1: ventas consolidadas por producto y por paquete.
     salesReport: async (_, { from, to }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.REPORTS_VIEW);
       const rows = await Order.aggregate([
         { $match: { status: 'DELIVERED', createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
         { $unwind: '$items' },
@@ -570,7 +598,7 @@ const resolvers = {
     //  $group por producto → $lookup nombre → $sort). Sirve para saber cuánta
     // arrachera / chorizo / carbón comprar para surtir los combos del periodo.
     packageComponentDemand: async (_, { from, to }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.REPORTS_VIEW);
       const rows = await Order.aggregate([
         { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
         { $unwind: '$items' },
@@ -599,16 +627,28 @@ const resolvers = {
     ...authResolvers.Mutation, // login, logout
 
     // ---------- Usuarios ----------
-    // Registro abierto: el rol siempre es CUSTOMER salvo que quien llama sea administrador.
+    // Registro abierto: siempre CUSTOMER. Otro rol solo con users:manage.
     createUser: async (_, { input }, ctx) => {
-      const { password, role, ...rest } = input;
-      if (role === 'ADMIN') requireAdmin(ctx);
+      const { password, role = DEFAULT_ROLE, ...rest } = input;
+      if (role !== DEFAULT_ROLE) requirePermission(ctx, PERMISSIONS.USERS_MANAGE);
       if (password.length < 8) throw new DomainError('La contraseña debe tener al menos 8 caracteres.');
-      const user = await User.create({ ...rest, role: role === 'ADMIN' ? 'ADMIN' : 'CUSTOMER', passwordHash: hashPassword(password) });
+      const user = await User.create({ ...rest, role, passwordHash: hashPassword(password) });
+      // El nodo en Neo4j se crea ya; si el grafo no responde, se crea en su primer login.
+      if (isNeo4jReady()) {
+        await rbac.ensureUser({ id: user._id, email: user.email, name: user.name }, role)
+          .catch(err => console.warn('⚠️  Usuario sin nodo en Neo4j (se creará al iniciar sesión):', err.message));
+      }
+      emitEvent({
+        type: 'USER_REGISTERED', category: CATEGORIES.ADMIN,
+        actorId: ctx.currentUser?.id ?? user._id, actorRole: ctx.currentUser?.role ?? role,
+        targetType: 'User', targetId: user._id,
+        reason: ctx.currentUser ? 'Alta hecha por un administrador' : 'Registro abierto',
+        metadata: { email: user.email, role },
+      }, ctx);
       return cacheUser(user);
     },
     addUserAddress: async (_, { userId, address }, ctx) => {
-      requireSelfOrAdmin(ctx, userId);
+      requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       const { isDefault, ...data } = address;
@@ -619,7 +659,7 @@ const resolvers = {
       return cacheUser(user);
     },
     setDefaultAddress: async (_, { userId, addressId }, ctx) => {
-      requireSelfOrAdmin(ctx, userId);
+      requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       if (!user.addresses.id(addressId)) throw notFound('Dirección', addressId);
@@ -628,7 +668,7 @@ const resolvers = {
       return cacheUser(user);
     },
     removeUserAddress: async (_, { userId, addressId }, ctx) => {
-      requireSelfOrAdmin(ctx, userId);
+      requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
       if (!user) throw notFound('Usuario', userId);
       const address = user.addresses.id(addressId);
@@ -639,107 +679,142 @@ const resolvers = {
       return cacheUser(user);
     },
 
-    // ---------- Catálogo (solo administrador) ----------
-    createCategory: (_, { input }, ctx) => {
-      requireAdmin(ctx);
-      return Category.create(input);
+    // ---------- Catálogo (catalog:manage; inventario: stock:manage) ----------
+    createCategory: async (_, { input }, ctx) => {
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      const category = await Category.create(input);
+      catalogEvent(ctx, 'CATEGORY_CREATED', 'Category', category, category.name);
+      return category;
     },
 
     createProduct: async (_, { input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       if (!(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
-      return Product.create(input);
+      const product = await Product.create(input);
+      catalogEvent(ctx, 'PRODUCT_CREATED', 'Product', product, product.name, { price: product.price, stock: product.stock, unit: product.unit });
+      return product;
     },
     updateProduct: async (_, { id, input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(id);
       if (!product) throw notFound('Producto', id);
       if (input.categoryId && !(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
+      const changes = diff(product.toObject(), input);
       Object.assign(product, input);
       await product.save();
       await invalidateProducts(id);
+      if (Object.keys(changes).length) {
+        const reason = changes.price ? `Precio $${changes.price.from} → $${changes.price.to}` : `Cambios: ${Object.keys(changes).join(', ')}`;
+        catalogEvent(ctx, 'PRODUCT_UPDATED', 'Product', product, reason, { name: product.name, changes });
+      }
       return product;
     },
     // Desactivar un producto deja sin disponibilidad a los paquetes que lo
     // contienen automáticamente (su stock es derivado): no hay que tocarlos.
     setProductActive: async (_, { id, active }, ctx) => {
-      requireAdmin(ctx);
-      const product = await Product.findByIdAndUpdate(id, { isActive: active }, { new: true });
-      if (!product) throw notFound('Producto', id);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      const before = await Product.findByIdAndUpdate(id, { isActive: active }, { new: false });
+      if (!before) throw notFound('Producto', id);
       await invalidateProducts(id);
-      return product;
+      if (before.isActive !== active) {
+        catalogEvent(ctx, 'PRODUCT_ACTIVE_CHANGED', 'Product', before, active ? 'Activado' : 'Desactivado', { name: before.name, from: before.isActive, to: active });
+      }
+      return Product.findById(id).exec();
     },
     setProductStock: async (_, { id, stock }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.STOCK_MANAGE);
       if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero >= 0.');
-      const product = await Product.findByIdAndUpdate(id, { stock }, { new: true });
-      if (!product) throw notFound('Producto', id);
+      const before = await Product.findByIdAndUpdate(id, { stock }, { new: false });
+      if (!before) throw notFound('Producto', id);
       await invalidateProducts(id);
-      return product;
+      catalogEvent(ctx, 'STOCK_SET', 'Product', before, `Stock ${before.stock} → ${stock}`, { name: before.name, from: before.stock, to: stock });
+      return Product.findById(id).exec();
     },
     addProductDiscount: async (_, { productId, input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(productId);
       if (!product) throw notFound('Producto', productId);
       product.discounts.push(input);
       await product.save();
       await invalidateProducts(productId);
+      const added = product.discounts[product.discounts.length - 1];
+      catalogEvent(ctx, 'DISCOUNT_ADDED', 'Product', product, `${added.percent}% ${added.label ?? ''}`.trim(), {
+        name: product.name, discountId: String(added._id), percent: added.percent, label: added.label, startsAt: added.startsAt, endsAt: added.endsAt,
+      });
       return product;
     },
     removeProductDiscount: async (_, { productId, discountId }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(productId);
       if (!product) throw notFound('Producto', productId);
       const discount = product.discounts.id(discountId);
       if (!discount) throw notFound('Descuento', discountId);
+      const { percent, label } = discount;
       discount.deleteOne();
       await product.save();
       await invalidateProducts(productId);
+      catalogEvent(ctx, 'DISCOUNT_REMOVED', 'Product', product, `${percent}% ${label ?? ''}`.trim(), { name: product.name, discountId: String(discountId), percent, label });
       return product;
     },
 
-    // ---------- Paquetes (solo administrador) ----------
+    // ---------- Paquetes (catalog:manage) ----------
     createPackage: async (_, { input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       assertPackagePersistable(input); // valida la composición antes de tocar la BD
       await assertProductsExist(input.items.map(i => i.productId));
-      return Package.create(input);
+      const pkg = await Package.create(input);
+      catalogEvent(ctx, 'PACKAGE_CREATED', 'Package', pkg, pkg.name, { price: pkg.price, items: pkg.items.length });
+      return pkg;
     },
     updatePackage: async (_, { id, input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const pkg = await Package.findById(id);
       if (!pkg) throw notFound('Paquete', id);
       if (input.items) {
         assertPackagePersistable({ ...pkg.toObject(), ...input });
         await assertProductsExist(input.items.map(i => i.productId));
       }
+      const { items, ...fields } = input;
+      const changes = diff(pkg.toObject(), fields);
       Object.assign(pkg, input);
       await pkg.save();
+      const reason = changes.price ? `Precio $${changes.price.from} → $${changes.price.to}` : 'Paquete editado';
+      catalogEvent(ctx, 'PACKAGE_UPDATED', 'Package', pkg, reason, { name: pkg.name, changes, itemsChanged: Boolean(items), items: pkg.items.length });
       return pkg;
     },
     setPackageActive: async (_, { id, active }, ctx) => {
-      requireAdmin(ctx);
-      const pkg = await Package.findByIdAndUpdate(id, { isActive: active }, { new: true });
-      if (!pkg) throw notFound('Paquete', id);
-      return pkg;
+      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      const before = await Package.findByIdAndUpdate(id, { isActive: active }, { new: false });
+      if (!before) throw notFound('Paquete', id);
+      if (before.isActive !== active) {
+        catalogEvent(ctx, 'PACKAGE_ACTIVE_CHANGED', 'Package', before, active ? 'Activado' : 'Desactivado', { name: before.name, from: before.isActive, to: active });
+      }
+      return Package.findById(id).exec();
     },
 
-    // ---------- Sucursales (solo administrador) ----------
-    createStore: (_, { input }, ctx) => {
-      requireAdmin(ctx);
-      return Store.create(input);
+    // ---------- Sucursales (stores:manage) ----------
+    createStore: async (_, { input }, ctx) => {
+      requirePermission(ctx, PERMISSIONS.STORES_MANAGE);
+      const store = await Store.create(input);
+      await syncStoreNode(store);
+      emitEvent({ type: 'STORE_CREATED', category: CATEGORIES.ADMIN, targetType: 'Store', targetId: store._id, reason: store.name, metadata: { city: store.address?.city } }, ctx);
+      return store;
     },
     updateStore: async (_, { id, input }, ctx) => {
-      requireAdmin(ctx);
+      requirePermission(ctx, PERMISSIONS.STORES_MANAGE);
+      const before = await Store.findById(id);
+      if (!before) throw notFound('Sucursal', id);
+      const changes = diff(before.toObject(), input);
       const store = await Store.findByIdAndUpdate(id, input, { new: true, runValidators: true });
-      if (!store) throw notFound('Sucursal', id);
+      await syncStoreNode(store);
+      emitEvent({ type: 'STORE_UPDATED', category: CATEGORIES.ADMIN, targetType: 'Store', targetId: store._id, reason: store.name, metadata: { changes } }, ctx);
       return store;
     },
 
     // ---------- Órdenes ----------
     createOrder: (_, { input }, ctx) => {
-      requireSelfOrAdmin(ctx, input.userId);
-      return placeOrder(input);
+      requireSelfOrPermission(ctx, input.userId);
+      return placeOrder(input, ctx);
     },
 
     // ---------- Carrito (Redis: solo ids y cantidades) ----------
@@ -787,31 +862,33 @@ const resolvers = {
         });
       }
 
-      const order = await placeOrder({ ...input, userId: me.id, items: refs });
+      const order = await placeOrder({ ...input, userId: me.id, items: refs }, ctx);
       await cartStore.clearCart(me.id);
       return order;
     },
 
-    // Cualquier cambio de estado es del personal de la tienda.
+    // El personal mueve las órdenes de SUS sucursales: orders:prepare (confirmar,
+    // preparar, lista, entregar en mostrador, cancelar) u orders:deliver (reparto).
     updateOrderStatus: async (_, { id, status }, ctx) => {
-      requireAdmin(ctx);
+      const me = requireAuth(ctx);
       const order = await Order.findById(id);
       if (!order) throw notFound('Orden', id);
-      return changeOrderStatus(order, status);
+      if (!canChangeOrderStatus(me, order, status)) throw forbidden(`No tienes permiso para pasar esta orden a ${status}.`);
+      return changeOrderStatus(order, status, ctx);
     },
 
-    // El cliente puede cancelar su propia orden (si el estado lo permite).
+    // El cliente cancela la suya (si el estado lo permite); el personal, las de su sucursal.
     cancelOrder: async (_, { id }, ctx) => {
-      requireAuth(ctx);
+      const me = requireAuth(ctx);
       const order = await Order.findById(id);
       if (!order) throw notFound('Orden', id);
-      requireSelfOrAdmin(ctx, order.userId);
-      return changeOrderStatus(order, 'CANCELLED');
+      if (!canChangeOrderStatus(me, order, 'CANCELLED')) throw forbidden('No tienes permiso para cancelar esta orden.');
+      return changeOrderStatus(order, 'CANCELLED', ctx);
     },
 
     // ---------- Listas guardadas ----------
     createShoppingList: async (_, { input }, ctx) => {
-      requireSelfOrAdmin(ctx, input.userId);
+      requireSelfOrPermission(ctx, input.userId);
       if (!(await User.exists({ _id: oid(input.userId) }))) throw notFound('Usuario', input.userId);
       return ShoppingList.create(input);
     },
@@ -819,7 +896,7 @@ const resolvers = {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
       if (!list) throw notFound('Lista', listId);
-      requireSelfOrAdmin(ctx, list.userId);
+      requireSelfOrPermission(ctx, list.userId);
       const exists = ref.productId
         ? await Product.exists({ _id: oid(ref.productId) })
         : await Package.exists({ _id: oid(ref.packageId) });
@@ -834,7 +911,7 @@ const resolvers = {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
       if (!list) throw notFound('Lista', listId);
-      requireSelfOrAdmin(ctx, list.userId);
+      requireSelfOrPermission(ctx, list.userId);
       list.items = list.items.filter(i => !(sameId(i.productId, ref.productId) || sameId(i.packageId, ref.packageId)));
       await list.save();
       return list;
@@ -843,7 +920,7 @@ const resolvers = {
       requireAuth(ctx);
       const list = await ShoppingList.findById(id);
       if (!list) return false;
-      requireSelfOrAdmin(ctx, list.userId);
+      requireSelfOrPermission(ctx, list.userId);
       await list.deleteOne();
       return true;
     },
@@ -855,6 +932,7 @@ const resolvers = {
 // ------------------------------------------------------------
 const server = new ApolloServer({
   schema: buildSubgraphSchema([{ typeDefs, resolvers }]),
+  plugins: [auditPlugin], // ACCESS_DENIED y ORDER_REJECTED → bitácora
   // Traduce errores de dominio / validación de Mongoose a mensajes limpios.
   formatError: (formatted, error) => {
     const original = error?.originalError ?? error;
