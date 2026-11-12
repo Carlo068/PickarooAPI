@@ -1,0 +1,53 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
+
+"Categoría del evento de auditoría (partición de events_by_day)."
+enum AuditCategory { SECURITY ADMIN CATALOG ORDER }
+
+"Usuario del subgrafo pickaroo: el gateway resuelve sus campos (nombre, correo…)."
+type User @key(fields: "id", resolvable: false) {
+  id: ID!
+}
+
+"Evento inmutable de la bitácora (ScyllaDB)."
+type AuditEvent {
+  id: ID!
+  "LOGIN_SUCCESS, ACCESS_DENIED, PRODUCT_UPDATED, ORDER_STATUS_CHANGED…"
+  type: String!
+  category: AuditCategory!
+  "Id del usuario que actuó, o ANONYMOUS."
+  actorId: String!
+  "Usuario completo (resuelto por el subgrafo pickaroo). Null si fue anónimo."
+  actor: User
+  actorRole: String
+  "Tipo del objeto afectado: User, Product, Package, Order, Store, Category."
+  targetType: String
+  targetId: String
+  success: Boolean!
+  reason: String
+  ip: String
+  userAgent: String
+  "Detalle del evento en JSON (p. ej. cambios de precio { from, to })."
+  metadata: String!
+  "Fecha ISO-8601 (UTC)."
+  occurredAt: String!
+}
+
+type AuditCount {
+  category: AuditCategory!
+  type: String!
+  total: Int!
+  failures: Int!
+}
+
+# Todas requieren el permiso audit:view.
+type Query {
+  "Eventos de una categoría en un día (YYYY-MM-DD, UTC; hoy por omisión), más recientes primero."
+  auditEvents(category: AuditCategory!, day: String, type: String, limit: Int = 50): [AuditEvent!]!
+  "Lo que hizo un usuario, más reciente primero."
+  auditByActor(actorId: ID!, limit: Int = 50): [AuditEvent!]!
+  "Historia de un objeto: una orden, el precio de un producto, un usuario…"
+  auditByTarget(targetType: String!, targetId: ID!, limit: Int = 50): [AuditEvent!]!
+  "Conteo por tipo de evento en un día (todas las categorías)."
+  auditSummary(day: String): [AuditCount!]!
+}

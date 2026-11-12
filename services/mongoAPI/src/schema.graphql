@@ -4,7 +4,8 @@ extend schema
 scalar DateTime
 
 enum Unit { UNIDAD KG LITRO }
-enum UserRole { CUSTOMER ADMIN }
+"Roles del grafo RBAC (Neo4j). Jerarquía: ADMIN → MANAGER → STAFF → CUSTOMER; DELIVERY → CUSTOMER."
+enum UserRole { CUSTOMER STAFF DELIVERY MANAGER ADMIN }
 enum OrderMode { PICKUP DELIVERY }
 enum OrderStatus { PENDING CONFIRMED PREPARING READY IN_DELIVERY DELIVERED CANCELLED }
 "Qué referencia una partida de orden, lista o reporte."
@@ -298,7 +299,7 @@ input CreateUserInput {
   "Mínimo 8 caracteres."
   password: String!
   avatarUrl: String
-  "Solo un administrador puede crear usuarios ADMIN; en el registro abierto siempre es CUSTOMER."
+  "En el registro abierto siempre es CUSTOMER; otro rol requiere el permiso users:manage."
   role: UserRole = CUSTOMER
 }
 
@@ -313,6 +314,48 @@ type AuthPayload {
   "Segundos de vida del token (y de su sesión en Redis)."
   expiresIn: Int!
   user: User!
+  "Rol, permisos efectivos y sucursales leídos de Neo4j al iniciar sesión."
+  access: Access!
+  "Menú de navegación según el rol (Neo4j)."
+  menu: [MenuItem!]!
+}
+
+# ------------------------------------------------------------
+# Control de acceso (RBAC en Neo4j)
+# ------------------------------------------------------------
+"Lo que un usuario puede hacer. Se calcula en el login y viaja en su sesión."
+type Access {
+  userId: ID!
+  role: UserRole!
+  "Permisos efectivos: los del rol más los de todos los roles que hereda (p. ej. orders:prepare)."
+  permissions: [String!]!
+  "Sucursales asignadas (relación WORKS_AT). El personal solo opera órdenes de estas sucursales."
+  stores: [Store!]!
+  "True si Neo4j no respondía al iniciar sesión: la sesión no tiene permisos."
+  degraded: Boolean!
+}
+
+"Elemento del menú de navegación (con submenús)."
+type MenuItem {
+  id: ID!
+  title: String!
+  order: Int!
+  "Ruta del cliente web; null en los contenedores de submenús."
+  path: String
+  children: [MenuItem!]!
+}
+
+"Rol del catálogo RBAC."
+type RoleInfo {
+  name: UserRole!
+  description: String
+  "Roles de los que hereda permisos."
+  inherits: [UserRole!]!
+  "Permisos asignados directamente al rol."
+  permissions: [String!]!
+  "Permisos propios más los heredados."
+  effectivePermissions: [String!]!
+  userCount: Int!
 }
 
 input CategoryInput {
@@ -442,6 +485,14 @@ input ShoppingListInput {
 type Query {
   "Usuario autenticado (requiere token)."
   me: User
+  "Rol, permisos y sucursales de la sesión actual."
+  myAccess: Access!
+  "Menú de navegación del usuario autenticado."
+  myMenu: [MenuItem!]!
+  "Catálogo de roles con su herencia y permisos (users:manage)."
+  roles: [RoleInfo!]!
+  "Acceso de cualquier usuario según Neo4j (users:manage)."
+  userAccess(userId: ID!): Access
   categories: [Category!]!
   category(id: ID!): Category
 
@@ -457,7 +508,8 @@ type Query {
   users(limit: Int = 20, offset: Int = 0): [User!]!
   user(id: ID!): User
 
-  orders(userId: ID, status: OrderStatus, limit: Int = 20, offset: Int = 0): [Order!]!
+  "Cliente: las suyas. Personal: las de sus sucursales (repartidor: solo DELIVERY). ADMIN: todas."
+  orders(userId: ID, storeId: ID, status: OrderStatus, limit: Int = 20, offset: Int = 0): [Order!]!
   order(id: ID!): Order
   orderByNumber(number: String!): Order
 
@@ -483,6 +535,12 @@ type Mutation {
   login(input: LoginInput!): AuthPayload!
   "Revoca la sesión del token actual: deja de servir aunque no haya expirado."
   logout: Boolean!
+
+  "Cambia el rol en Neo4j (y su espejo en Mongo) y revoca las sesiones del usuario (users:manage)."
+  assignRole(userId: ID!, role: UserRole!): Access!
+  "Asigna una sucursal al personal (WORKS_AT) y revoca sus sesiones (users:manage)."
+  assignUserToStore(userId: ID!, storeId: ID!): Access!
+  removeUserFromStore(userId: ID!, storeId: ID!): Access!
 
   createUser(input: CreateUserInput!): User!
   addUserAddress(userId: ID!, address: AddressInput!): User!

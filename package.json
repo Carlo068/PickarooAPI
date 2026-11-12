@@ -10,7 +10,8 @@
     "install:all": "npm install",
     "dev:gateway": "npm run dev --workspace=gateway",
     "dev:campamentos": "npm run dev --workspace=services/mongoAPI",
-    "dev": "npx concurrently \"npm run dev:campamentos\" \"npm run dev:gateway\""
+    "dev:auditoria": "npm run dev --workspace=services/auditAPI",
+    "dev": "npx concurrently -n api,audit,gateway \"npm run dev:campamentos\" \"npm run dev:auditoria\" \"npm run dev:gateway\""
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

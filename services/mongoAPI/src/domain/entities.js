@@ -5,7 +5,7 @@
 export const ORDER_MODES = ['PICKUP', 'DELIVERY'];
 export const ORDER_STATUSES = ['PENDING', 'CONFIRMED', 'PREPARING', 'READY', 'IN_DELIVERY', 'DELIVERED', 'CANCELLED'];
 export const UNITS = ['UNIDAD', 'KG', 'LITRO'];
-export const USER_ROLES = ['CUSTOMER', 'ADMIN'];
+export { ROLES as USER_ROLES } from './access.js';
 
 // Un paquete (combo para carne asada, el producto principal de CARNYFRUT)
 // agrupa productos del catálogo. No tiene stock propio: su disponibilidad
@@ -355,10 +355,12 @@ export function canTransition(from, to) {
   return (TRANSITIONS[from] ?? []).includes(to);
 }
 
-export function assertTransition(from, to) {
+export function assertTransition(from, to, mode) {
   if (!ORDER_STATUSES.includes(to)) throw new DomainError(`Estado inválido: ${to}.`);
   if (from === to) throw new DomainError(`La orden ya está en estado ${to}.`);
   if (!canTransition(from, to)) throw new DomainError(`Transición no permitida: ${from} -> ${to}.`);
+  // Una orden de recogida se entrega en mostrador: nunca sale a reparto.
+  if (to === 'IN_DELIVERY' && mode && mode !== 'DELIVERY') throw new DomainError('Una orden de recogida (PICKUP) no sale a reparto.');
   return true;
 }
 
