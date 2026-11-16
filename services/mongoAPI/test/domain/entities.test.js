@@ -58,19 +58,21 @@ describe('dinero: round2 / sumMoney', () => {
 });
 
 describe('DomainError', () => {
-  test('código por defecto, código explícito y details', () => {
-    const a = new DomainError('x');
+  test('el código es obligatorio y debe estar en el catálogo', () => {
+    assert.throws(() => new DomainError('x'), TypeError);
+    assert.throws(() => new DomainError('x', 'NO_EXISTE'), TypeError);
+    const a = new DomainError('x', 'CART_EMPTY');
     assert.equal(a.name, 'DomainError');
     assert.ok(a instanceof Error);
     assert.equal(a.message, 'x');
-    assert.deepEqual(a.extensions, { code: 'DOMAIN_RULE_VIOLATION' });
+    assert.deepEqual(a.extensions, { code: 'CART_EMPTY' });
     const b = new DomainError('y', 'PRICE_CHANGED', { newQuote: { total: 1 } });
     assert.equal(b.extensions.code, 'PRICE_CHANGED');
     assert.deepEqual(b.extensions.newQuote, { total: 1 });
   });
   test('details no puede pisar el code', () => {
-    const e = new DomainError('z', 'A', { code: 'B' });
-    assert.equal(e.extensions.code, 'A');
+    const e = new DomainError('z', 'CART_EMPTY', { code: 'B' });
+    assert.equal(e.extensions.code, 'CART_EMPTY');
   });
 });
 

@@ -25,7 +25,7 @@ import { isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
 import { emitEvent, requestInfo, CATEGORIES } from './infrastructure/events.js';
 import { DEFAULT_ROLE, PERMISSIONS, hasPermission, isRole } from './domain/access.js';
-import { DomainError } from './domain/entities.js';
+import { DomainError } from './domain/errors.js';
 
 const SESSION_TTL_SECONDS = parseInt(process.env.JWT_TTL_SECONDS) || 3600;
 
@@ -38,7 +38,7 @@ if (!JWT_SECRET) {
 const sessionKey = jti => `session:${jti}`;
 const userSessionsKey = userId => `user:${userId}:sessions`;
 
-const authError = (message, code) => new GraphQLError(message, { extensions: { code } });
+const authError = (message, code, details = {}) => new GraphQLError(message, { extensions: { ...details, code } });
 
 // ---------- Guardas para los resolvers ----------
 export function requireAuth(ctx) {
@@ -48,7 +48,7 @@ export function requireAuth(ctx) {
 
 export function requirePermission(ctx, permission) {
   const user = requireAuth(ctx);
-  if (!hasPermission(user, permission)) throw authError(`Se requiere el permiso "${permission}".`, 'FORBIDDEN');
+  if (!hasPermission(user, permission)) throw forbidden(`Se requiere el permiso "${permission}".`, 'PERMISSION_REQUIRED', { permission });
   return user;
 }
 
@@ -56,12 +56,13 @@ export function requirePermission(ctx, permission) {
 export function requireSelfOrPermission(ctx, ownerId, permission = PERMISSIONS.USERS_MANAGE) {
   const user = requireAuth(ctx);
   if (String(user.id) !== String(ownerId) && !hasPermission(user, permission)) {
-    throw authError('No tienes permiso para este recurso.', 'FORBIDDEN');
+    throw forbidden('No tienes permiso para este recurso.', 'NOT_RESOURCE_OWNER');
   }
   return user;
 }
 
-export const forbidden = message => authError(message, 'FORBIDDEN');
+// `reason` (ver FORBIDDEN_REASONS) dice cuál regla; el código sigue siendo FORBIDDEN para la bitácora de accesos.
+export const forbidden = (message, reason, details = {}) => authError(message, 'FORBIDDEN', { ...details, reason });
 
 // ---------- Contexto: se ejecuta en CADA petición ----------
 function parseSession(raw) {
@@ -199,7 +200,7 @@ export const createAuthResolvers = redisClient => {
   async function loadManagedUser(ctx, userId) {
     requirePermission(ctx, PERMISSIONS.USERS_MANAGE);
     const user = await User.findById(userId);
-    if (!user) throw new DomainError(`Usuario no encontrado (${userId}).`);
+    if (!user) throw new DomainError(`Usuario no encontrado (${userId}).`, 'NOT_FOUND', { entity: 'USER', id: String(userId) });
     await rbac.ensureUser({ id: user._id, email: user.email, name: user.name }, isRole(user.role) ? user.role : DEFAULT_ROLE);
     return user;
   }
@@ -237,7 +238,7 @@ export const createAuthResolvers = redisClient => {
 
     Mutation: {
       login: async (_, { input }, ctx) => {
-        if (!redisClient.isReady) throw authError('El servicio de sesiones no está disponible. Intenta de nuevo.', 'SERVICE_UNAVAILABLE');
+        if (!redisClient.isReady) throw authError('El servicio de sesiones no está disponible. Intenta de nuevo.', 'SERVICE_UNAVAILABLE', { service: 'SESSIONS' });
 
         const email = input.email.trim().toLowerCase();
         const user = await User.findOne({ email }).select('+passwordHash');
@@ -251,7 +252,7 @@ export const createAuthResolvers = redisClient => {
             reason: !user ? 'Correo no registrado' : !valid ? 'Contraseña incorrecta' : 'Cuenta desactivada',
             metadata: { email },
           }, ctx);
-          throw authError('Credenciales inválidas.', 'UNAUTHENTICATED');
+          throw authError('Credenciales inválidas.', 'INVALID_CREDENTIALS');
         }
 
         const access = await resolveAccess(user, ctx);
@@ -300,7 +301,7 @@ export const createAuthResolvers = redisClient => {
 
       assignRole: async (_, { userId, role }, ctx) => {
         const user = await loadManagedUser(ctx, userId);
-        if (String(user._id) === String(ctx.currentUser.id)) throw forbidden('No puedes cambiar tu propio rol.');
+        if (String(user._id) === String(ctx.currentUser.id)) throw forbidden('No puedes cambiar tu propio rol.', 'CANNOT_CHANGE_OWN_ROLE');
         const previous = await rbac.setRole(user._id, role);
         user.role = role;
         await user.save();
@@ -314,7 +315,7 @@ export const createAuthResolvers = redisClient => {
       assignUserToStore: async (_, { userId, storeId }, ctx) => {
         const user = await loadManagedUser(ctx, userId);
         const store = await Store.findById(storeId);
-        if (!store) throw new DomainError(`Sucursal no encontrada (${storeId}).`);
+        if (!store) throw new DomainError(`Sucursal no encontrada (${storeId}).`, 'NOT_FOUND', { entity: 'STORE', id: String(storeId) });
         await rbac.syncStores([store]);
         await rbac.assignStore(user._id, store._id);
         return afterAccessChange(user, ctx, {
@@ -326,7 +327,7 @@ export const createAuthResolvers = redisClient => {
       removeUserFromStore: async (_, { userId, storeId }, ctx) => {
         const user = await loadManagedUser(ctx, userId);
         const storeName = await rbac.removeStore(user._id, storeId);
-        if (!storeName) throw new DomainError('El usuario no está asignado a esa sucursal.');
+        if (!storeName) throw new DomainError('El usuario no está asignado a esa sucursal.', 'USER_NOT_ASSIGNED_TO_STORE', { userId: String(userId), storeId: String(storeId) });
         return afterAccessChange(user, ctx, {
           type: 'STORE_ASSIGNMENT_CHANGED', category: CATEGORIES.ADMIN,
           reason: `Retirado de ${storeName}`, metadata: { action: 'REMOVE', storeId: String(storeId), store: storeName },

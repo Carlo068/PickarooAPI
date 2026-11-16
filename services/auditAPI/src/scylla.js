@@ -15,6 +15,7 @@
 // ============================================================
 
 import cassandra from 'cassandra-driver';
+import { GraphQLError } from 'graphql';
 
 const { LocalDate } = cassandra.types;
 
@@ -121,7 +122,7 @@ const toEvent = row => ({
 });
 
 async function select(query, params) {
-  if (!client) throw new Error('La bitácora (ScyllaDB) no está disponible.');
+  if (!client) throw new GraphQLError('La bitácora (ScyllaDB) no está disponible.', { extensions: { code: 'SERVICE_UNAVAILABLE', service: 'AUDIT_LOG' } });
   const result = await client.execute(query, params, { prepare: true });
   return result.rows.map(toEvent);
 }

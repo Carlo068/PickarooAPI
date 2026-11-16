@@ -12,6 +12,7 @@ export { ROLES as USER_ROLES } from './access.js';
 // se deriva del stock de sus productos.
 export const PACKAGE_MIN_ITEMS = 2;
 export const PACKAGE_MAX_ITEMS = 40;
+export const MIN_NAME_LENGTH = 2;
 
 // ------------------------------------------------------------
 // Dinero: se trabaja en pesos (MXN) con 2 decimales. Se redondea
@@ -20,25 +21,23 @@ export const PACKAGE_MAX_ITEMS = 40;
 export const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 export const sumMoney = xs => round2(xs.reduce((a, b) => a + Number(b || 0), 0));
 
-// `code` viaja al cliente en extensions.code; `details` agrega datos útiles
-// para reaccionar al error (p. ej. la cotización nueva tras PRICE_CHANGED).
-export class DomainError extends Error {
-  constructor(message, code = 'DOMAIN_RULE_VIOLATION', details = {}) {
-    super(message);
-    this.name = 'DomainError';
-    this.extensions = { ...details, code };
-  }
-}
+// DomainError y el catálogo de códigos viven en errors.js (todo código es obligatorio).
+import { DomainError } from './errors.js';
+export { DomainError };
 
-const assertName = (name, what) => {
-  if (String(name ?? '').trim().length < 2) throw new DomainError(`${what} necesita un nombre de al menos 2 caracteres.`);
+// `entity` (PRODUCT | PACKAGE) viaja en extensions para que el cliente arme la frase.
+const assertName = (name, what, entity) => {
+  if (String(name ?? '').trim().length < MIN_NAME_LENGTH) {
+    throw new DomainError(`${what} necesita un nombre de al menos ${MIN_NAME_LENGTH} caracteres.`, 'INVALID_NAME', { entity, minLength: MIN_NAME_LENGTH });
+  }
 };
-const assertPositivePrice = (price, what) => {
+const assertPositivePrice = (price, what, entity) => {
   const n = Number(price);
-  if (!Number.isFinite(n) || n <= 0) throw new DomainError(`El precio ${what} debe ser un número positivo.`);
+  if (!Number.isFinite(n) || n <= 0) throw new DomainError(`El precio ${what} debe ser un número positivo.`, 'INVALID_PRICE', { entity });
 };
-const assertPositiveInt = (n, what) => {
-  if (!Number.isInteger(n) || n <= 0) throw new DomainError(`${what} debe ser un entero positivo.`);
+// `context` dice dónde se pidió la cantidad: ORDER_LINE | PACKAGE_ITEM.
+const assertPositiveInt = (n, what, context) => {
+  if (!Number.isInteger(n) || n <= 0) throw new DomainError(`${what} debe ser un entero positivo.`, 'INVALID_QUANTITY', { context });
 };
 
 // ------------------------------------------------------------
@@ -72,25 +71,27 @@ export function applyDiscount(unitPrice, percent) {
 // Reglas previas a persistir (las invocan los hooks de Mongoose y los resolvers)
 // ------------------------------------------------------------
 export function assertProductPersistable(data = {}) {
-  assertName(data.name, 'El producto');
-  assertPositivePrice(data.price, 'del producto');
+  assertName(data.name, 'El producto', 'PRODUCT');
+  assertPositivePrice(data.price, 'del producto', 'PRODUCT');
   const stock = data.stock ?? 0;
-  if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero no negativo.');
+  if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero no negativo.', 'INVALID_STOCK');
   return true;
 }
 
+const sizeDetails = count => ({ count, min: PACKAGE_MIN_ITEMS, max: PACKAGE_MAX_ITEMS });
+
 export function assertPackagePersistable(data = {}) {
-  assertName(data.name, 'El paquete');
-  assertPositivePrice(data.price, 'del paquete');
+  assertName(data.name, 'El paquete', 'PACKAGE');
+  assertPositivePrice(data.price, 'del paquete', 'PACKAGE');
   const items = data.items ?? [];
-  if (items.length < PACKAGE_MIN_ITEMS) throw new DomainError(`Un paquete debe incluir al menos ${PACKAGE_MIN_ITEMS} productos.`);
-  if (items.length > PACKAGE_MAX_ITEMS) throw new DomainError(`Un paquete no puede tener más de ${PACKAGE_MAX_ITEMS} productos.`);
+  if (items.length < PACKAGE_MIN_ITEMS) throw new DomainError(`Un paquete debe incluir al menos ${PACKAGE_MIN_ITEMS} productos.`, 'PACKAGE_SIZE_OUT_OF_RANGE', sizeDetails(items.length));
+  if (items.length > PACKAGE_MAX_ITEMS) throw new DomainError(`Un paquete no puede tener más de ${PACKAGE_MAX_ITEMS} productos.`, 'PACKAGE_SIZE_OUT_OF_RANGE', sizeDetails(items.length));
   for (const item of items) {
-    if (!item || item.productId == null) throw new DomainError('Cada producto del paquete necesita un productId.');
-    assertPositiveInt(item.quantity, 'La cantidad de cada producto del paquete');
+    if (!item || item.productId == null) throw new DomainError('Cada producto del paquete necesita un productId.', 'INVALID_PACKAGE_ITEM');
+    assertPositiveInt(item.quantity, 'La cantidad de cada producto del paquete', 'PACKAGE_ITEM');
   }
   const ids = items.map(i => String(i.productId));
-  if (new Set(ids).size !== ids.length) throw new DomainError('El paquete tiene productos duplicados.');
+  if (new Set(ids).size !== ids.length) throw new DomainError('El paquete tiene productos duplicados.', 'DUPLICATE_PACKAGE_PRODUCT');
   return true;
 }
 
@@ -113,7 +114,7 @@ export class Product {
   }
 
   assertAvailable() {
-    if (!this.isActive) throw new DomainError(`El producto "${this.name}" no está disponible.`);
+    if (!this.isActive) throw new DomainError(`El producto "${this.name}" no está disponible.`, 'ITEM_UNAVAILABLE', { itemType: 'PRODUCT', id: this.id ?? null, name: this.name });
   }
 
   currentDiscountPercent(at = new Date()) {
@@ -148,9 +149,12 @@ export class Package {
   }
 
   assertAvailable() {
-    if (!this.isActive) throw new DomainError(`El paquete "${this.name}" no está disponible.`);
+    const base = { itemType: 'PACKAGE', id: this.id ?? null, name: this.name };
+    if (!this.isActive) throw new DomainError(`El paquete "${this.name}" no está disponible.`, 'ITEM_UNAVAILABLE', base);
     const off = this.items.find(i => !i.product.isActive);
-    if (off) throw new DomainError(`El paquete "${this.name}" no está disponible: "${off.product.name}" está desactivado.`);
+    if (off) throw new DomainError(`El paquete "${this.name}" no está disponible: "${off.product.name}" está desactivado.`, 'ITEM_UNAVAILABLE', {
+      ...base, componentId: off.product.id ?? null, componentName: off.product.name,
+    });
   }
 
   // Lo que costaría comprar su contenido por separado, con descuentos vigentes.
@@ -186,10 +190,10 @@ export function deliveryFee({ mode, subtotal, store }) {
 // Consistencia modo <-> destino
 // ------------------------------------------------------------
 export function assertModeConsistency({ mode, store, deliveryAddress, requireAddress = false }) {
-  if (!ORDER_MODES.includes(mode)) throw new DomainError(`Modo de orden inválido: ${mode}.`);
-  if (mode === 'PICKUP' && !store) throw new DomainError('Una orden de recogida necesita una sucursal.');
+  if (!ORDER_MODES.includes(mode)) throw new DomainError(`Modo de orden inválido: ${mode}.`, 'INVALID_ORDER_MODE', { mode: mode ?? null });
+  if (mode === 'PICKUP' && !store) throw new DomainError('Una orden de recogida necesita una sucursal.', 'STORE_REQUIRED');
   // La dirección solo es obligatoria al CONFIRMAR la orden, no al cotizar.
-  if (requireAddress && mode === 'DELIVERY' && !deliveryAddress) throw new DomainError('Una orden a domicilio necesita una dirección de entrega.');
+  if (requireAddress && mode === 'DELIVERY' && !deliveryAddress) throw new DomainError('Una orden a domicilio necesita una dirección de entrega.', 'DELIVERY_ADDRESS_REQUIRED');
 }
 
 // ------------------------------------------------------------
@@ -220,11 +224,11 @@ export function stockDemand(items) {
 // ------------------------------------------------------------
 export function priceOrder({ mode, store, deliveryAddress, lines, requireAddress = false, at = new Date() }) {
   assertModeConsistency({ mode, store, deliveryAddress, requireAddress });
-  if (!Array.isArray(lines) || lines.length === 0) throw new DomainError('La orden no tiene productos.');
+  if (!Array.isArray(lines) || lines.length === 0) throw new DomainError('La orden no tiene productos.', 'EMPTY_ORDER');
 
   const products = new Map();
   const items = lines.map(line => {
-    assertPositiveInt(line.quantity, 'La cantidad');
+    assertPositiveInt(line.quantity, 'La cantidad', 'ORDER_LINE');
 
     if (line.package) {
       const pkg = line.package;
@@ -263,7 +267,9 @@ export function priceOrder({ mode, store, deliveryAddress, lines, requireAddress
   const demand = stockDemand(items);
   for (const { productId, quantity } of demand) {
     const p = products.get(productId);
-    if (quantity > p.stock) throw new DomainError(`Sin stock suficiente de "${p.name}" (se necesitan ${quantity}, disponible: ${p.stock}).`);
+    if (quantity > p.stock) throw new DomainError(`Sin stock suficiente de "${p.name}" (se necesitan ${quantity}, disponible: ${p.stock}).`, 'INSUFFICIENT_STOCK', {
+      productId: p.id, name: p.name, requested: quantity, available: p.stock,
+    });
   }
 
   const subtotal = orderSubtotal(items);
@@ -356,11 +362,11 @@ export function canTransition(from, to) {
 }
 
 export function assertTransition(from, to, mode) {
-  if (!ORDER_STATUSES.includes(to)) throw new DomainError(`Estado inválido: ${to}.`);
-  if (from === to) throw new DomainError(`La orden ya está en estado ${to}.`);
-  if (!canTransition(from, to)) throw new DomainError(`Transición no permitida: ${from} -> ${to}.`);
+  if (!ORDER_STATUSES.includes(to)) throw new DomainError(`Estado inválido: ${to}.`, 'INVALID_ORDER_STATUS', { status: to ?? null });
+  if (from === to) throw new DomainError(`La orden ya está en estado ${to}.`, 'ORDER_ALREADY_IN_STATUS', { status: to });
+  if (!canTransition(from, to)) throw new DomainError(`Transición no permitida: ${from} -> ${to}.`, 'INVALID_STATUS_TRANSITION', { from: from ?? null, to });
   // Una orden de recogida se entrega en mostrador: nunca sale a reparto.
-  if (to === 'IN_DELIVERY' && mode && mode !== 'DELIVERY') throw new DomainError('Una orden de recogida (PICKUP) no sale a reparto.');
+  if (to === 'IN_DELIVERY' && mode && mode !== 'DELIVERY') throw new DomainError('Una orden de recogida (PICKUP) no sale a reparto.', 'PICKUP_CANNOT_BE_DELIVERED');
   return true;
 }
 

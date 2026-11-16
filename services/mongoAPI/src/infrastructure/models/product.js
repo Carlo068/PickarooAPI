@@ -29,7 +29,7 @@ const product = main({
 });
 // La regla de negocio vive en el dominio; la infraestructura la invoca antes de persistir.
 product.pre('validate', function () {
-  try { assertProductPersistable(this); } catch (err) { this.invalidate('price', err.message); }
+  try { assertProductPersistable(this); } catch (err) { this.invalidate('price', err.message, undefined, err.extensions?.code); }
 });
 product.index({ categoryId: 1, isActive: 1 });
 product.index({ name: 'text', description: 'text' });
