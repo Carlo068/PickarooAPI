@@ -46,14 +46,21 @@ PickarooAPI/
 ├── README.md
 ├── package.json
 ├── docker-compose.yml
+├── schema/
+│   └── api.graphql               esquema para clientes (generado, no editar)
+├── scripts/
+│   ├── package.json
+│   └── build-schema.js           npm run schema:build / schema:check
 ├── docs/
 │   └── PLAN-neo4j-scylladb.md
 ├── gateway/
 │   ├── package.json
+│   ├── .env.example
 │   └── index.js
 └── services/
     ├── auditAPI/                 bitácora: RabbitMQ → ScyllaDB + consultas GraphQL
     │   ├── package.json
+    │   ├── .env.example
     │   └── src/
     │       ├── index.js
     │       ├── schema.graphql
@@ -62,6 +69,7 @@ PickarooAPI/
     │       └── scylla.js         keyspace, tablas y consultas CQL
     └── mongoAPI/
         ├── package.json
+        ├── .env.example
         └── src/
             ├── index.js
             ├── auth.js
@@ -854,7 +862,29 @@ Variables:
 
 Los reportes pueden devolver arreglos vacíos si no existen pedidos en los estados y fechas correspondientes.
 
-## 13. Alcance y consideraciones de mantenimiento
+## 13. Clientes: esquema y conexión
+
+**`schema/api.graphql`** es el esquema que ven los clientes (app Android y dashboard) a través del gateway, sin la maquinaria de federación (`@key`, `_entities`, `join__*`…). Los clientes generan sus tipos a partir de este archivo, sin levantar servidores ni bases de datos. Está generado: no se edita a mano.
+
+```bash
+npm run schema:build   # compone los schema.graphql de los subgrafos y escribe schema/api.graphql
+npm run schema:check   # falla si el archivo está desactualizado; no lo modifica
+```
+
+Todo cambio en un `schema.graphql` de un subgrafo debe ir acompañado, **en el mismo commit**, del `schema/api.graphql` regenerado.
+
+URLs del gateway para los clientes:
+
+| Cliente | URL |
+|---|---|
+| Dashboard (navegador) | `http://localhost:4000/` |
+| Emulador de Android | `http://10.0.2.2:4000/` (`10.0.2.2` es la dirección del equipo anfitrión vista desde el emulador) |
+
+El CORS del gateway está abierto en desarrollo (valor por defecto del servidor independiente de Apollo) y debe restringirse antes de cualquier despliegue.
+
+Para configurar cada servicio se puede copiar su plantilla: `gateway/.env.example`, `services/mongoAPI/.env.example` y `services/auditAPI/.env.example` (a `.env` en la misma carpeta). Los secretos son marcadores de posición que deben sustituirse.
+
+## 14. Alcance y consideraciones de mantenimiento
 
 Esta versión contiene los elementos de Docker, dominio, Mongoose, GraphQL y agregación del núcleo documental, pero su presencia no equivale a una certificación de funcionamiento bajo carga o en producción.
 

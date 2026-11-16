@@ -1,0 +1,754 @@
+# GENERADO AUTOMÁTICAMENTE. NO EDITAR A MANO.
+# Esquema GraphQL que ven los clientes a través del gateway (sin directivas de federación).
+# Se genera a partir de los subgrafos con: npm run schema:build
+# Verificación (CI/local): npm run schema:check
+# Regenerar y commitear este archivo en el mismo commit que cambie un schema.graphql de un subgrafo.
+
+"""
+Lo que un usuario puede hacer. Se calcula en el login y viaja en su sesión.
+"""
+type Access {
+  userId: ID!
+  role: UserRole!
+
+  """
+  Permisos efectivos: los del rol más los de todos los roles que hereda (p. ej. orders:prepare).
+  """
+  permissions: [String!]!
+
+  """
+  Sucursales asignadas (relación WORKS_AT). El personal solo opera órdenes de estas sucursales.
+  """
+  stores: [Store!]!
+
+  """
+  True si Neo4j no respondía al iniciar sesión: la sesión no tiene permisos.
+  """
+  degraded: Boolean!
+}
+
+"""Dirección guardada por un usuario."""
+type Address {
+  id: ID!
+  label: String!
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+  isDefault: Boolean!
+}
+
+input AddressInput {
+  label: String!
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+
+  """Marcarla como predeterminada (la primera dirección siempre lo es)."""
+  isDefault: Boolean = false
+}
+
+"""Categoría del evento de auditoría (partición de events_by_day)."""
+enum AuditCategory {
+  SECURITY
+  ADMIN
+  CATALOG
+  ORDER
+}
+
+type AuditCount {
+  category: AuditCategory!
+  type: String!
+  total: Int!
+  failures: Int!
+}
+
+"""Evento inmutable de la bitácora (ScyllaDB)."""
+type AuditEvent {
+  id: ID!
+
+  """LOGIN_SUCCESS, ACCESS_DENIED, PRODUCT_UPDATED, ORDER_STATUS_CHANGED…"""
+  type: String!
+  category: AuditCategory!
+
+  """Id del usuario que actuó, o ANONYMOUS."""
+  actorId: String!
+
+  """
+  Usuario completo (resuelto por el subgrafo pickaroo). Null si fue anónimo.
+  """
+  actor: User
+  actorRole: String
+
+  """
+  Tipo del objeto afectado: User, Product, Package, Order, Store, Category.
+  """
+  targetType: String
+  targetId: String
+  success: Boolean!
+  reason: String
+  ip: String
+  userAgent: String
+
+  """Detalle del evento en JSON (p. ej. cambios de precio { from, to })."""
+  metadata: String!
+
+  """Fecha ISO-8601 (UTC)."""
+  occurredAt: String!
+}
+
+"""
+Resultado de iniciar sesión. Enviar el token en el header `Authorization: Bearer <token>`.
+"""
+type AuthPayload {
+  token: String!
+
+  """Segundos de vida del token (y de su sesión en Redis)."""
+  expiresIn: Int!
+  user: User!
+
+  """
+  Rol, permisos efectivos y sucursales leídos de Neo4j al iniciar sesión.
+  """
+  access: Access!
+
+  """Menú de navegación según el rol (Neo4j)."""
+  menu: [MenuItem!]!
+}
+
+"""
+El precio no se guarda en el carrito: se calcula al leerlo contra el catálogo actual.
+"""
+type Cart {
+  items: [CartLine!]!
+  unavailable: [UnavailableCartLine!]!
+  itemCount: Int!
+
+  """
+  Cotización de las partidas disponibles (null si no hay ninguna). Su quoteId se manda a checkoutCart.
+  """
+  quote: OrderQuote
+
+  """
+  Motivo por el que no se pudo cotizar (p. ej. stock insuficiente al sumar producto suelto y paquete).
+  """
+  quoteError: String
+}
+
+"""Partida de carrito: indicar productId O packageId."""
+input CartItemInput {
+  productId: ID
+  packageId: ID
+  quantity: Int!
+}
+
+type CartLine {
+  type: ItemType!
+  product: Product
+  package: Package
+  quantity: Int!
+
+  """False si la partida aparece en `unavailable`."""
+  available: Boolean!
+}
+
+type Category {
+  id: ID!
+  name: String!
+  icon: String
+  sortOrder: Int!
+  products: [Product!]!
+}
+
+input CategoryInput {
+  name: String!
+  icon: String
+  sortOrder: Int = 0
+}
+
+"""
+Compra el carrito del usuario autenticado (las partidas salen de Redis).
+"""
+input CheckoutCartInput {
+  mode: OrderMode!
+  storeId: ID
+  address: LocationInput
+  addressId: ID
+  notes: String
+  idempotencyKey: String
+  quoteId: ID
+}
+
+"""
+Cuánto producto se necesita para surtir los paquetes vendidos en un periodo (para las compras del restaurante).
+"""
+type ComponentDemandRow {
+  productId: ID!
+  name: String!
+
+  """Unidades del producto requeridas por los paquetes vendidos."""
+  quantityNeeded: Int!
+
+  """Paquetes vendidos que lo contienen."""
+  packagesSold: Int!
+
+  """En cuántos paquetes distintos aparece."""
+  inPackages: Int!
+}
+
+input CreateOrderInput {
+  userId: ID!
+  mode: OrderMode!
+  storeId: ID
+
+  """
+  Dirección para DELIVERY. Si se omite se usa addressId o la predeterminada del usuario.
+  """
+  address: LocationInput
+  addressId: ID
+  items: [CartItemInput!]!
+  notes: String
+
+  """Evita órdenes duplicadas por doble envío del cliente."""
+  idempotencyKey: String
+
+  """
+  Cotización que el cliente aceptó. Si los precios cambiaron, la compra se rechaza con PRICE_CHANGED y extensions.newQuote.
+  """
+  quoteId: ID
+}
+
+input CreateUserInput {
+  name: String!
+  email: String!
+
+  """Mínimo 8 caracteres."""
+  password: String!
+  avatarUrl: String
+
+  """
+  En el registro abierto siempre es CUSTOMER; otro rol requiere el permiso users:manage.
+  """
+  role: UserRole = CUSTOMER
+}
+
+scalar DateTime
+
+input DiscountInput {
+  percent: Float!
+  label: String
+  startsAt: DateTime
+  endsAt: DateTime
+}
+
+"""Qué referencia una partida de orden, lista o reporte."""
+enum ItemType {
+  PRODUCT
+  PACKAGE
+}
+
+"""
+Dirección sin identidad propia: la de una sucursal o la copia de entrega de una orden.
+"""
+type Location {
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+}
+
+input LocationInput {
+  street: String!
+  city: String!
+  state: String
+  zipCode: String
+  lat: Float
+  lng: Float
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+"""Elemento del menú de navegación (con submenús)."""
+type MenuItem {
+  id: ID!
+  title: String!
+  order: Int!
+
+  """Ruta del cliente web; null en los contenedores de submenús."""
+  path: String
+  children: [MenuItem!]!
+}
+
+type Mutation {
+  login(input: LoginInput!): AuthPayload!
+
+  """
+  Revoca la sesión del token actual: deja de servir aunque no haya expirado.
+  """
+  logout: Boolean!
+
+  """
+  Cambia el rol en Neo4j (y su espejo en Mongo) y revoca las sesiones del usuario (users:manage).
+  """
+  assignRole(userId: ID!, role: UserRole!): Access!
+
+  """
+  Asigna una sucursal al personal (WORKS_AT) y revoca sus sesiones (users:manage).
+  """
+  assignUserToStore(userId: ID!, storeId: ID!): Access!
+  removeUserFromStore(userId: ID!, storeId: ID!): Access!
+  createUser(input: CreateUserInput!): User!
+  addUserAddress(userId: ID!, address: AddressInput!): User!
+  setDefaultAddress(userId: ID!, addressId: ID!): User!
+  removeUserAddress(userId: ID!, addressId: ID!): User!
+  createCategory(input: CategoryInput!): Category!
+  createProduct(input: ProductInput!): Product!
+  updateProduct(id: ID!, input: ProductUpdateInput!): Product!
+  setProductActive(id: ID!, active: Boolean!): Product!
+  setProductStock(id: ID!, stock: Int!): Product!
+  addProductDiscount(productId: ID!, input: DiscountInput!): Product!
+  removeProductDiscount(productId: ID!, discountId: ID!): Product!
+  createPackage(input: PackageInput!): Package!
+  updatePackage(id: ID!, input: PackageUpdateInput!): Package!
+  setPackageActive(id: ID!, active: Boolean!): Package!
+  createStore(input: StoreInput!): Store!
+  updateStore(id: ID!, input: StoreUpdateInput!): Store!
+  createOrder(input: CreateOrderInput!): Order!
+
+  """
+  Agrega (o suma cantidad a) un producto O un paquete al carrito del usuario autenticado.
+  """
+  addToCart(productId: ID, packageId: ID, quantity: Int = 1): Cart!
+
+  """Fija la cantidad exacta; 0 quita la partida."""
+  setCartItemQuantity(productId: ID, packageId: ID, quantity: Int!): Cart!
+  removeFromCart(productId: ID, packageId: ID): Cart!
+  clearCart: Boolean!
+  checkoutCart(input: CheckoutCartInput!): Order!
+  updateOrderStatus(id: ID!, status: OrderStatus!): Order!
+  cancelOrder(id: ID!): Order!
+  createShoppingList(input: ShoppingListInput!): ShoppingList!
+
+  """Agrega (o suma cantidad a) un producto O un paquete."""
+  addItemToShoppingList(listId: ID!, productId: ID, packageId: ID, quantity: Int = 1): ShoppingList!
+  removeItemFromShoppingList(listId: ID!, productId: ID, packageId: ID): ShoppingList!
+  deleteShoppingList(id: ID!): Boolean!
+}
+
+type Order {
+  id: ID!
+  number: String!
+  user: User!
+  mode: OrderMode!
+  store: Store!
+  deliveryAddress: Location
+  status: OrderStatus!
+  items: [OrderItem!]!
+
+  """Derivado de las partidas."""
+  subtotal: Float!
+
+  """Derivado de las partidas."""
+  discountTotal: Float!
+  deliveryFee: Float!
+  total: Float!
+  notes: String
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"""
+Partida de una orden o cotización. Copia lo cobrado al momento de comprar.
+"""
+type OrderItem {
+  type: ItemType!
+  product: Product
+  package: Package
+  name: String!
+  unit: Unit
+  quantity: Int!
+  unitPrice: Float!
+  discountPercent: Float!
+
+  """Derivado: unitPrice × quantity − lineTotal."""
+  lineDiscount: Float!
+  lineTotal: Float!
+
+  """Contenido del paquete al momento de la compra (vacío en productos)."""
+  contents: [PackageItem!]!
+}
+
+enum OrderMode {
+  PICKUP
+  DELIVERY
+}
+
+"""Previsualización de precios de un carrito antes de confirmar la orden."""
+type OrderQuote {
+  mode: OrderMode!
+  items: [OrderItem!]!
+  subtotal: Float!
+  discountTotal: Float!
+  deliveryFee: Float!
+  total: Float!
+
+  """
+  Se manda en createOrder/checkoutCart para confirmar este total. Null si Redis no está disponible.
+  """
+  quoteId: ID
+
+  """La cotización vale 15 minutos."""
+  expiresAt: DateTime
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  IN_DELIVERY
+  DELIVERED
+  CANCELLED
+}
+
+"""
+Combo de productos (p. ej. paquete para carne asada). Precio fijo; su stock se deriva del de sus productos.
+"""
+type Package {
+  id: ID!
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  isActive: Boolean!
+  items: [PackageItem!]!
+
+  """
+  Paquetes completos que se pueden armar con el stock actual (0 si algún producto está desactivado).
+  """
+  availableStock: Int!
+
+  """
+  Lo que costaría su contenido comprado por separado, con descuentos vigentes.
+  """
+  alaCarteTotal: Float!
+
+  """
+  alaCarteTotal − price. Negativo si el paquete sale más caro que comprar suelto.
+  """
+  savings: Float!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"""Alta de un paquete. Debe incluir al menos 2 productos distintos."""
+input PackageInput {
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  isActive: Boolean = true
+  items: [PackageItemInput!]!
+}
+
+type PackageItem {
+  productId: ID!
+  product: Product!
+  quantity: Int!
+}
+
+input PackageItemInput {
+  productId: ID!
+  quantity: Int!
+}
+
+input PackageUpdateInput {
+  name: String
+  description: String
+  price: Float
+  imageUrl: String
+  isActive: Boolean
+  items: [PackageItemInput!]
+}
+
+type Product {
+  id: ID!
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  unit: Unit!
+  stock: Int!
+  isActive: Boolean!
+  category: Category!
+  discounts: [ProductDiscount!]!
+
+  """Porcentaje de descuento vigente ahora (0 si no hay)."""
+  activeDiscountPercent: Float!
+
+  """Precio unitario con el descuento vigente aplicado."""
+  effectivePrice: Float!
+
+  """Paquetes activos que incluyen este producto."""
+  packages: [Package!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+"""
+Promoción de un producto. Vigente dentro de [startsAt, endsAt]; no se acumulan: aplica la de mayor porcentaje.
+"""
+type ProductDiscount {
+  id: ID!
+  percent: Float!
+  label: String
+  startsAt: DateTime
+  endsAt: DateTime
+  isCurrent: Boolean!
+}
+
+input ProductInput {
+  categoryId: ID!
+  name: String!
+  description: String
+  price: Float!
+  imageUrl: String
+  unit: Unit = UNIDAD
+  stock: Int = 0
+  isActive: Boolean = true
+}
+
+input ProductUpdateInput {
+  categoryId: ID
+  name: String
+  description: String
+  price: Float
+  imageUrl: String
+  unit: Unit
+  isActive: Boolean
+}
+
+type Query {
+  """
+  Eventos de una categoría en un día (YYYY-MM-DD, UTC; hoy por omisión), más recientes primero.
+  """
+  auditEvents(category: AuditCategory!, day: String, type: String, limit: Int = 50): [AuditEvent!]!
+
+  """Lo que hizo un usuario, más reciente primero."""
+  auditByActor(actorId: ID!, limit: Int = 50): [AuditEvent!]!
+
+  """
+  Historia de un objeto: una orden, el precio de un producto, un usuario…
+  """
+  auditByTarget(targetType: String!, targetId: ID!, limit: Int = 50): [AuditEvent!]!
+
+  """Conteo por tipo de evento en un día (todas las categorías)."""
+  auditSummary(day: String): [AuditCount!]!
+
+  """Usuario autenticado (requiere token)."""
+  me: User
+
+  """Rol, permisos y sucursales de la sesión actual."""
+  myAccess: Access!
+
+  """Menú de navegación del usuario autenticado."""
+  myMenu: [MenuItem!]!
+
+  """Catálogo de roles con su herencia y permisos (users:manage)."""
+  roles: [RoleInfo!]!
+
+  """Acceso de cualquier usuario según Neo4j (users:manage)."""
+  userAccess(userId: ID!): Access
+  categories: [Category!]!
+  category(id: ID!): Category
+  products(categoryId: ID, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
+  product(id: ID!): Product
+  packages(activeOnly: Boolean = true): [Package!]!
+  package(id: ID!): Package
+  stores(activeOnly: Boolean = true): [Store!]!
+  store(id: ID!): Store
+  users(limit: Int = 20, offset: Int = 0): [User!]!
+  user(id: ID!): User
+
+  """
+  Cliente: las suyas. Personal: las de sus sucursales (repartidor: solo DELIVERY). ADMIN: todas.
+  """
+  orders(userId: ID, storeId: ID, status: OrderStatus, limit: Int = 20, offset: Int = 0): [Order!]!
+  order(id: ID!): Order
+  orderByNumber(number: String!): Order
+  shoppingLists(userId: ID!): [ShoppingList!]!
+  shoppingList(id: ID!): ShoppingList
+
+  """
+  Cotiza un carrito (precios, descuentos y costo de envío) sin crear la orden.
+  """
+  quoteOrder(input: QuoteInput!): OrderQuote!
+
+  """
+  Carrito del usuario autenticado, contrastado con el catálogo actual y cotizado.
+  """
+  cart(mode: OrderMode = PICKUP, storeId: ID): Cart!
+
+  """
+  Últimas 20 órdenes del usuario autenticado (ids en Redis, datos desde Mongo).
+  """
+  recentOrders: [Order!]!
+
+  """
+  Pipeline de agregación: ventas por producto y paquete en un periodo ($match → $unwind → $group → $sort).
+  """
+  salesReport(from: DateTime!, to: DateTime!): [SalesRow!]!
+
+  """
+  Pipeline de agregación anidada: explota los paquetes vendidos en sus productos para planear compras.
+  """
+  packageComponentDemand(from: DateTime!, to: DateTime!): [ComponentDemandRow!]!
+}
+
+input QuoteInput {
+  mode: OrderMode!
+  storeId: ID
+  items: [CartItemInput!]!
+}
+
+"""Rol del catálogo RBAC."""
+type RoleInfo {
+  name: UserRole!
+  description: String
+
+  """Roles de los que hereda permisos."""
+  inherits: [UserRole!]!
+
+  """Permisos asignados directamente al rol."""
+  permissions: [String!]!
+
+  """Permisos propios más los heredados."""
+  effectivePermissions: [String!]!
+  userCount: Int!
+}
+
+type SalesRow {
+  type: ItemType!
+  itemId: ID!
+  name: String!
+  quantity: Int!
+  revenue: Float!
+  orderCount: Int!
+}
+
+type ShoppingList {
+  id: ID!
+  name: String!
+  user: User!
+  items: [ShoppingListItem!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+input ShoppingListInput {
+  userId: ID!
+  name: String!
+}
+
+type ShoppingListItem {
+  type: ItemType!
+  product: Product
+  package: Package
+  quantity: Int!
+}
+
+type Store {
+  id: ID!
+  name: String!
+  address: Location!
+  phone: String
+  schedule: String
+  isActive: Boolean!
+
+  """Tarifa base de reparto de esta sucursal (MXN)."""
+  deliveryFee: Float!
+
+  """Subtotal a partir del cual el reparto es gratis (null = nunca gratis)."""
+  freeDeliveryThreshold: Float
+}
+
+input StoreInput {
+  name: String!
+  address: LocationInput!
+  phone: String
+  schedule: String
+  deliveryFee: Float = 0
+  freeDeliveryThreshold: Float
+}
+
+input StoreUpdateInput {
+  name: String
+  address: LocationInput
+  phone: String
+  schedule: String
+  isActive: Boolean
+  deliveryFee: Float
+  freeDeliveryThreshold: Float
+}
+
+type UnavailableCartLine {
+  type: ItemType!
+  productId: ID
+  packageId: ID
+  name: String!
+  quantity: Int!
+  reason: UnavailableReason!
+
+  """Cuántas unidades se pueden comprar ahora."""
+  availableQuantity: Int!
+}
+
+"""Por qué una partida del carrito no se puede comprar ahora."""
+enum UnavailableReason {
+  DELETED
+  INACTIVE
+  OUT_OF_STOCK
+  INSUFFICIENT_STOCK
+}
+
+enum Unit {
+  UNIDAD
+  KG
+  LITRO
+}
+
+"""
+Usuario del subgrafo pickaroo: el gateway resuelve sus campos (nombre, correo…).
+"""
+type User {
+  id: ID!
+  name: String!
+  email: String!
+  avatarUrl: String
+  role: UserRole!
+  isActive: Boolean!
+  addresses: [Address!]!
+  defaultAddress: Address
+  createdAt: DateTime!
+}
+
+"""
+Roles del grafo RBAC (Neo4j). Jerarquía: ADMIN → MANAGER → STAFF → CUSTOMER; DELIVERY → CUSTOMER.
+"""
+enum UserRole {
+  CUSTOMER
+  STAFF
+  DELIVERY
+  MANAGER
+  ADMIN
+}
