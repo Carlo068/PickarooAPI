@@ -14,7 +14,8 @@
     "dev": "npx concurrently -n api,audit,gateway \"npm run dev:campamentos\" \"npm run dev:auditoria\" \"npm run dev:gateway\"",
     "schema:build": "node scripts/build-schema.js",
     "schema:check": "node scripts/build-schema.js --check",
-    "test": "npm run test --workspaces --if-present && npm run schema:check"
+    "test": "npm run test --workspaces --if-present && npm run schema:check",
+    "test:integration": "node test/integration/run.js"
   },
   "devDependencies": {
     "@apollo/composition": "^2.14.4",

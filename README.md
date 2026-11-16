@@ -51,6 +51,8 @@ PickarooAPI/
 ├── scripts/
 │   ├── package.json
 │   └── build-schema.js           npm run schema:build / schema:check
+├── test/
+│   └── integration/              npm run test:integration (contra el Compose)
 ├── docs/
 │   └── PLAN-neo4j-scylladb.md
 ├── gateway/
@@ -758,6 +760,22 @@ Ejecuta las pruebas unitarias del dominio y del contrato de errores (`services/m
 
 El Gateway intenta componer los subgrafos hasta 15 veces, con una espera de dos segundos entre fallos. mongoAPI y auditAPI deben estar disponibles dentro de ese periodo (auditAPI responde aunque ScyllaDB aún no esté listo).
 
+### Pruebas de integración
+
+Con el Compose arriba (`docker compose up -d`), desde la raíz:
+
+```bash
+npm run test:integration
+```
+
+Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos y bitácora. Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de medio minuto.
+
+- **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
+- **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
+- **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), carritos, cotizaciones, pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar.
+- **Lo que no se limpia:** las filas de auditoría en ScyllaDB (la bitácora es inmutable) y los mensajes de RabbitMQ. El auditAPI del dev y el de pruebas consumen la misma cola y escriben en la misma ScyllaDB, así que cualquiera de los dos puede guardar un evento de la corrida; las pruebas de bitácora consultan hasta que aparece.
+- **Sin Docker:** si un servicio del Compose no responde, las pruebas se omiten con un mensaje (`integration tests skipped: MongoDB not reachable on localhost:27017`) y el comando termina con código 0. Nunca arranca Docker ni contenedores.
+
 ### Persistencia y apagado
 
 Compose utiliza `mongo:8.0`, `rabbitmq:3.13-management`, `redis/redis-stack:latest`, `neo4j:5.26` y `scylladb/scylla:5.4` (modo desarrollo, 1 CPU, 750 MB), con la red `pickaroo-network` y los volúmenes:
@@ -1033,6 +1051,6 @@ Aspectos relevantes al continuar el desarrollo:
 - La idempotencia no compara el contenido de solicitudes repetidas.
 - Las cantidades son enteras: no se puede pedir medio kilo de un producto vendido por `KG`.
 - La selección de campos GraphQL no evita por sí sola consultas repetidas al resolver relaciones.
-- Existen pruebas unitarias de las reglas de dominio (`domain/entities.js` y `domain/access.js`), que se ejecutan con `npm test` y no necesitan Docker ni bases de datos. Todavía no hay pruebas de integración de los resolvers, de las bases de datos ni del Gateway. Los ejemplos de este README son procedimientos de uso, no evidencia de pruebas ejecutadas.
+- Existen pruebas unitarias de las reglas de dominio (`domain/entities.js` y `domain/access.js`), que se ejecutan con `npm test` y no necesitan Docker ni bases de datos, y pruebas de integración contra el Compose (`npm run test:integration`, sección 10) que recorren el Gateway, los resolvers y las bases. Los ejemplos de este README son procedimientos de uso, no evidencia de pruebas ejecutadas.
 
 Para cambiar estas conductas debe modificarse la implementación y mantenerse sincronizada la documentación. Este README no altera modelos, operaciones, datos ni infraestructura.
