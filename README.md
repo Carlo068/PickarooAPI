@@ -612,6 +612,16 @@ ScyllaDB tarda alrededor de un minuto en aceptar conexiones después de `docker 
 
 El comando `dev:campamentos` apunta a `services/mongoAPI`; no se debe sustituir por un nombre de script que no esté definido en `package.json`.
 
+### Pruebas
+
+Desde la raíz, sin levantar Docker:
+
+```bash
+npm test
+```
+
+Ejecuta las pruebas unitarias del dominio (`services/mongoAPI/test/`, con el ejecutor integrado de Node) y `npm run schema:check`, de modo que un `schema/api.graphql` desactualizado también hace fallar el comando. Termina con código distinto de cero si algo falla.
+
 | Servicio | Dirección local |
 |---|---|
 | Gateway GraphQL | `http://localhost:4000/` |
@@ -901,6 +911,6 @@ Aspectos relevantes al continuar el desarrollo:
 - La idempotencia no compara el contenido de solicitudes repetidas.
 - Las cantidades son enteras: no se puede pedir medio kilo de un producto vendido por `KG`.
 - La selección de campos GraphQL no evita por sí sola consultas repetidas al resolver relaciones.
-- No se incluyen pruebas automatizadas ni un script `test` en los paquetes actuales. Los ejemplos de este README son procedimientos de uso, no evidencia de pruebas ejecutadas.
+- Existen pruebas unitarias de las reglas de dominio (`domain/entities.js` y `domain/access.js`), que se ejecutan con `npm test` y no necesitan Docker ni bases de datos. Todavía no hay pruebas de integración de los resolvers, de las bases de datos ni del Gateway. Los ejemplos de este README son procedimientos de uso, no evidencia de pruebas ejecutadas.
 
 Para cambiar estas conductas debe modificarse la implementación y mantenerse sincronizada la documentación. Este README no altera modelos, operaciones, datos ni infraestructura.
