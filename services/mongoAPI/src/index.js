@@ -38,12 +38,14 @@ import {
   round2,
 } from './domain/entities.js';
 import { DomainError, notFoundError } from './domain/errors.js';
+import { assertValidLocation, assertTrackable, isTrackable, newLocationRecord, locationView, locationTtlSeconds } from './domain/driver-location.js';
 import { formatApiError } from './infrastructure/format-error.js';
 import { redisClient, initRedis } from './infrastructure/redis-om.js';
 import { getProduct, invalidateProducts, getUser, cacheUser, userView } from './infrastructure/entity-cache.js';
 import { hashPassword } from './infrastructure/passwords.js';
 import * as cartStore from './infrastructure/cart-store.js';
 import { saveQuote, getQuote, deleteQuote } from './infrastructure/quote-store.js';
+import { createLocationStore } from './infrastructure/location-store.js';
 import { RECENT_ORDERS, pushRecentOrder, getRecentOrderIds, setRecentOrders } from './infrastructure/recent-orders.js';
 import { initNeo4j, isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
@@ -52,7 +54,7 @@ import { runMigrations } from './infrastructure/migrations.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
 import {
   PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, orderStatusDenial, canSeeStatusActor,
-  acceptDeliveryDenial, releaseDeliveryDenial,
+  acceptDeliveryDenial, releaseDeliveryDenial, reportLocationDenial,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from './domain/access.js';
 
@@ -625,6 +627,10 @@ async function changeOrderStatus(order, status, ctx, { cancel = false } = {}) {
 }
 
 async function finishStatusChange(order, previous, status, ctx) {
+  // Salió de reparto (entregada o cancelada): su última posición ya no se sirve. La escritura de
+  // Mongo ya salió bien y esto no la espera: un Redis lento o colgado no retrasa el stock, el evento
+  // ni la respuesta. clear nunca lanza ni rechaza; si falla lo registra y el TTL limpia.
+  if (previous === 'IN_DELIVERY') void locationStore.clear(order._id);
   // Repone el stock consumido, incluido el contenido de los paquetes.
   if (status === 'CANCELLED') await releaseStock(stockDemand(order.items));
   emitEvent({
@@ -726,6 +732,42 @@ async function releaseDelivery(orderId, ctx) {
   }
 }
 
+// ---------- Reparto: ubicación del repartidor (Redis, solo el último punto) ----------
+// Se reporta cada ~3 s por repartidor y se lee cada ~2 s por cliente: de la orden se
+// carga solo lo que deciden el acceso y el estado (domain/access.js, driver-location.js).
+const LOCATION_ORDER_FIELDS = 'status mode driverId storeId userId';
+const loadOrderForLocation = orderId =>
+  (mongoose.isValidObjectId(orderId) ? Order.findById(orderId).select(LOCATION_ORDER_FIELDS).lean() : null);
+
+// Una sola vez al arrancar: el TTL de cada punto (DRIVER_LOCATION_TTL_SECONDS, 1 a 86400 s; 600 por omisión).
+const locationStore = createLocationStore(redisClient, { ttlSeconds: locationTtlSeconds(process.env.DRIVER_LOCATION_TTL_SECONDS) });
+
+// Primero quién (permiso, repartidor asignado) y después el estado, para que la app
+// se detenga ante "no es tuya" y ante "ya no está en reparto"; al final, las coordenadas.
+// La hora de recepción (at y seq) es la del reloj de Redis y se toma antes de esperar a MongoDB:
+// un reporte lento no pisa a uno más nuevo y el reloj de este proceso no interviene.
+async function reportDriverLocation(orderId, lat, lng, ctx) {
+  const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
+  const receivedMs = await locationStore.now();
+  const order = await loadOrderForLocation(orderId);
+  if (!order) throw notFound('ORDER', orderId);
+  const denial = reportLocationDenial(me, order);
+  if (denial) denyOrder(denial);
+  assertTrackable(order);
+  assertValidLocation(lat, lng);
+  await locationStore.save(order._id, newLocationRecord({ lat, lng, nowMs: receivedMs }));
+  return true; // también si se ignoró por el límite de 1 por segundo: un cliente insistente no es un error
+}
+
+// El punto vigente de una orden que el solicitante ya puede ver; solo mientras va en camino.
+// Solo coordenadas y tiempos: nunca el repartidor. La edad se calcula con la hora de Redis;
+// un punto con hora del futuro más allá de la tolerancia se trata como inválido (null).
+async function currentDriverLocation(order) {
+  if (!isTrackable(order)) return null;
+  const { record, nowMs } = await locationStore.get(order._id);
+  return record && locationView(record, nowMs);
+}
+
 const resolvers = {
   DateTime,
 
@@ -804,6 +846,8 @@ const resolvers = {
       const user = o.driverId ? await getUser(o.driverId) : null;
       return user ? { id: user.id, name: user.name } : null;
     },
+    // Mismas reglas que la consulta driverLocation (quien no puede ver la orden, null).
+    driverLocation: (o, _, ctx) => (canViewOrder(ctx.currentUser, o) ? currentDriverLocation(o) : null),
   },
 
   OrderStatusChange: {
@@ -894,6 +938,13 @@ const resolvers = {
     currentDelivery: (_, __, ctx) => {
       const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
       return Order.findOne({ driverId: oid(me.id), status: { $in: ACTIVE_DELIVERY_STATUSES } }).exec();
+    },
+    // Quien puede ver la orden (viewableOrder); null si no existe o no va en camino.
+    // Sesión primero: sin ella no se consulta MongoDB.
+    driverLocation: async (_, { orderId }, ctx) => {
+      requireAuth(ctx);
+      const order = viewableOrder(ctx, await loadOrderForLocation(orderId));
+      return order && currentDriverLocation(order);
     },
 
     shoppingLists: (_, { userId }, ctx) => {
@@ -1255,6 +1306,7 @@ const resolvers = {
     // ---------- Reparto ----------
     acceptDelivery: (_, { orderId }, ctx) => acceptDelivery(orderId, ctx),
     releaseDelivery: (_, { orderId }, ctx) => releaseDelivery(orderId, ctx),
+    reportDriverLocation: (_, { orderId, lat, lng }, ctx) => reportDriverLocation(orderId, lat, lng, ctx),
 
     // ---------- Listas guardadas ----------
     createShoppingList: async (_, { input }, ctx) => {

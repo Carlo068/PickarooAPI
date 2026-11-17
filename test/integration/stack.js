@@ -12,7 +12,7 @@
 //   Neo4j  (:User {id}) y (:Store {id}) con los _id de pickaroodb_it.
 //   Redis  (base lógica 1, no la 0 del dev) session:<jti>, user:<id>:sessions,
 //          cart:<id>, user:<id>:orders:recent, User:<id>, Product:<id>, las
-//          quote:<uuid> de sus sucursales y los refresh tokens de sus usuarios
+//          quote:<uuid> de sus sucursales, driver:loc:<orderId> de sus órdenes y los refresh tokens de sus usuarios
 //          (user:<id>:refresh-families, refresh-family:<familyId>[:sessions],
 //          refresh:<hash>, refresh:spent:<hash> y refresh:grace:<hash>).
 // Las filas de ScyllaDB y los mensajes de RabbitMQ no se pueden borrar.
@@ -61,6 +61,8 @@ export function loadConfig() {
     refreshTtlSeconds: 10,
     // Ventana de gracia corta: las pruebas de reutilización esperan a que pase.
     refreshGraceSeconds: 2,
+    // Distinto del de 600 s por omisión: así la prueba de ubicación comprueba que el TTL de la clave sale de DRIVER_LOCATION_TTL_SECONDS.
+    driverLocationTtlSeconds: 120,
     // Base lógica propia en el mismo Redis: al conectar, mongoAPI vacía Product:*, User:*
     // y user:*:orders:recent de SU base; así no vacía los cachés del dev (base 0).
     redisDb: env.IT_REDIS_DB ? parseInt(env.IT_REDIS_DB, 10) : 1,
@@ -170,7 +172,7 @@ export function compareIsolation(before, after) {
 export async function cleanup(config) {
   const ids = await withMongo(config.mongoUri(config.db), async db => {
     const list = async name => (await db.collection(name).find({}, { projection: { _id: 1 } }).toArray()).map(d => String(d._id));
-    return { users: await list('users'), stores: await list('stores'), products: await list('products') };
+    return { users: await list('users'), stores: await list('stores'), products: await list('products'), orders: await list('orders') };
   });
 
   const jtis = new Set(fs.existsSync(config.jtiFile) ? fs.readFileSync(config.jtiFile, 'utf8').split(/\s+/).filter(Boolean) : []);
@@ -196,6 +198,7 @@ export async function cleanup(config) {
       ...[...families].flatMap(familyId => [`refresh-family:${familyId}`, `refresh-family:${familyId}:sessions`]),
       ...ids.users.flatMap(id => [`user:${id}:sessions`, `user:${id}:refresh-families`, `cart:${id}`, `user:${id}:orders:recent`, `User:${id}`]),
       ...ids.products.map(id => `Product:${id}`),
+      ...ids.orders.map(id => `driver:loc:${id}`),
     );
     // Cotizaciones: se reconocen por la sucursal de la base de pruebas.
     const stores = new Set(ids.stores);
@@ -227,7 +230,7 @@ export async function cleanup(config) {
 // inexistente para que mongoAPI y el gateway no lean los .env del dev.
 function childEnv(config, extra) {
   const base = { ...env };
-  for (const k of Object.keys(base)) if (/^(SEED_|CACHE_|MONGODB_|NEO4J_|REDIS_|REFRESH_|RABBITMQ_|SCYLLADB_|JWT_|PORT_|IT_)/.test(k)) delete base[k];
+  for (const k of Object.keys(base)) if (/^(SEED_|CACHE_|MONGODB_|NEO4J_|REDIS_|REFRESH_|DRIVER_|RABBITMQ_|SCYLLADB_|JWT_|PORT_|IT_)/.test(k)) delete base[k];
   return {
     ...base,
     DOTENV_CONFIG_PATH: path.join(os.tmpdir(), 'pickaroo-it-no-dotenv'),
@@ -239,6 +242,7 @@ function childEnv(config, extra) {
     // Corto a propósito: la prueba de vencimiento espera a que caduque (refresh.test.js).
     REFRESH_TTL_SECONDS: String(config.refreshTtlSeconds),
     REFRESH_REUSE_GRACE_SECONDS: String(config.refreshGraceSeconds),
+    DRIVER_LOCATION_TTL_SECONDS: String(config.driverLocationTtlSeconds),
     REDIS_URL: config.redisUrl,
     RABBITMQ_URL: config.rabbitUrl,
     RABBITMQ_QUEUE: config.queue,

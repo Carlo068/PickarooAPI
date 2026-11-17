@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import {
   ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG,
   isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder, canSeeStatusActor,
-  orderStatusDenial, acceptDeliveryDenial, releaseDeliveryDenial, isAssignedDriver,
+  orderStatusDenial, acceptDeliveryDenial, releaseDeliveryDenial, reportLocationDenial, isAssignedDriver,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from '../../src/domain/access.js';
 import { ORDER_STATUSES, ORDER_MODES } from '../../src/domain/entities.js';
@@ -485,6 +485,61 @@ describe('acceptDeliveryDenial y releaseDeliveryDenial', () => {
 });
 
 // ---------- Marketplace: catálogo, inventario y reportes por sucursal ----------
+describe('reportLocationDenial y quién lee la ubicación (PIC-77)', () => {
+  const inDelivery = { id: 'O1', userId: 'cliente', storeId: 'S1', mode: 'DELIVERY', status: 'IN_DELIVERY', driverId: 'driver' };
+  const driver = accessOf('DELIVERY', { id: 'driver', storeIds: ['S1'] });
+
+  test('el repartidor asignado puede reportar', () => {
+    assert.equal(reportLocationDenial(driver, inDelivery), null);
+  });
+  test('sigue pudiendo si lo cambiaron de sucursal con la entrega en curso', () => {
+    assert.equal(reportLocationDenial(accessOf('DELIVERY', { id: 'driver', storeIds: ['OTRA'] }), inDelivery), null);
+  });
+  test('ADMIN asignado a la orden (la aceptó él) también reporta', () => {
+    assert.equal(reportLocationDenial(accessOf('ADMIN', { id: 'driver', storeIds: [] }), inDelivery), null);
+  });
+  test('otro repartidor de la sucursal: NOT_ASSIGNED_DRIVER; ADMIN sin ser el asignado, igual', () => {
+    assert.deepEqual(reportLocationDenial(accessOf('DELIVERY', { id: 'otro', storeIds: ['S1'] }), inDelivery), { reason: 'NOT_ASSIGNED_DRIVER' });
+    assert.deepEqual(reportLocationDenial(accessOf('ADMIN', { id: 'admin', storeIds: [] }), inDelivery), { reason: 'NOT_ASSIGNED_DRIVER' });
+  });
+  test('una orden sin repartidor: NO_DRIVER_ASSIGNED, aunque el solicitante sea repartidor de la sucursal', () => {
+    assert.deepEqual(reportLocationDenial(driver, { ...inDelivery, driverId: null }), { reason: 'NO_DRIVER_ASSIGNED' });
+    assert.deepEqual(reportLocationDenial(driver, { ...inDelivery, driverId: undefined }), { reason: 'NO_DRIVER_ASSIGNED' });
+  });
+  test('un repartidor de otra sucursal no se entera de la asignación: STORE_NOT_ASSIGNED', () => {
+    const outsider = accessOf('DELIVERY', { id: 'otro', storeIds: ['OTRA'] });
+    assert.deepEqual(reportLocationDenial(outsider, inDelivery), { reason: 'STORE_NOT_ASSIGNED', storeId: 'S1' });
+    assert.deepEqual(reportLocationDenial(outsider, { ...inDelivery, driverId: null }), { reason: 'STORE_NOT_ASSIGNED', storeId: 'S1' });
+  });
+  test('sin orders:deliver (cliente de la orden, personal de mostrador, gerente): PERMISSION_REQUIRED', () => {
+    const denied = { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER };
+    assert.deepEqual(reportLocationDenial(accessOf('CUSTOMER', { id: 'cliente', storeIds: [] }), inDelivery), denied);
+    assert.deepEqual(reportLocationDenial(accessOf('STAFF', { id: 'x', storeIds: ['S1'] }), inDelivery), denied);
+    assert.deepEqual(reportLocationDenial(accessOf('MANAGER', { id: 'x', storeIds: ['S1'] }), inDelivery), denied);
+    assert.deepEqual(reportLocationDenial(undefined, inDelivery), denied);
+  });
+  test('el asignado que dejó de ser repartidor (volvió a CUSTOMER) ya no reporta', () => {
+    assert.deepEqual(reportLocationDenial(accessOf('CUSTOMER', { id: 'driver', storeIds: [] }), inDelivery), { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER });
+  });
+  test('la denegación no depende del estado de la orden: el estado se revisa después', () => {
+    assert.equal(reportLocationDenial(driver, { ...inDelivery, status: 'READY' }), null);
+    assert.deepEqual(reportLocationDenial(accessOf('DELIVERY', { id: 'otro', storeIds: ['S1'] }), { ...inDelivery, status: 'DELIVERED' }), { reason: 'NOT_ASSIGNED_DRIVER' });
+  });
+
+  test('lee la ubicación quien ve la orden: su cliente, el personal de la sucursal, su repartidor y ADMIN', () => {
+    assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'cliente', storeIds: [] }), inDelivery), true);
+    assert.equal(canViewOrder(accessOf('STAFF', { id: 'x', storeIds: ['S1'] }), inDelivery), true);
+    assert.equal(canViewOrder(accessOf('MANAGER', { id: 'x', storeIds: ['S1'] }), inDelivery), true);
+    assert.equal(canViewOrder(driver, inDelivery), true);
+    assert.equal(canViewOrder(accessOf('ADMIN', { id: 'x', storeIds: [] }), inDelivery), true);
+  });
+  test('no la lee otro cliente, otro repartidor, ni el personal de otra sucursal', () => {
+    assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'otro', storeIds: [] }), inDelivery), false);
+    assert.equal(canViewOrder(accessOf('DELIVERY', { id: 'otro', storeIds: ['S1'] }), inDelivery), false);
+    assert.equal(canViewOrder(accessOf('STAFF', { id: 'x', storeIds: ['OTRA'] }), inDelivery), false);
+  });
+});
+
 describe('storeItemDenial (catalog:manage y stock:manage por sucursal)', () => {
   const staffA = accessOf('STAFF', { storeIds: ['A'] });
   const managerA = accessOf('MANAGER', { storeIds: ['A'] });

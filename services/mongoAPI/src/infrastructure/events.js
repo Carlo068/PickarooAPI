@@ -80,8 +80,13 @@ export function diff(before, input) {
 // ---------- Plugin de Apollo: un solo lugar para accesos denegados y compras rechazadas ----------
 const ORDER_OPERATIONS = new Set(['createOrder', 'checkoutCart']);
 const DENIED = new Set(['FORBIDDEN', 'UNAUTHENTICATED']);
+// Operaciones que la app manda en bucle (reportDriverLocation: cada 3 s por repartidor). Su
+// UNAUTHENTICATED (sesión vencida, o Redis caído, que deja el contexto anónimo) no se registra como
+// ACCESS_DENIED: inundaría RabbitMQ y ScyllaDB. Su FORBIDDEN sí, y las demás operaciones no cambian.
+const QUIET_UNAUTHENTICATED = new Set(['reportDriverLocation']);
 
-export const auditPlugin = {
+// `emit` es emitEvent; las pruebas pasan uno propio para ver qué se registra.
+export const createAuditPlugin = (emit = emitEvent) => ({
   async requestDidStart() {
     return {
       async didEncounterErrors({ contextValue, errors }) {
@@ -92,13 +97,14 @@ export const auditPlugin = {
 
           if (DENIED.has(code)) {
             if (operation === 'login') continue; // ya se registra como LOGIN_FAILED
-            emitEvent({
+            if (code === 'UNAUTHENTICATED' && QUIET_UNAUTHENTICATED.has(operation)) continue;
+            emit({
               type: 'ACCESS_DENIED', category: CATEGORIES.SECURITY, success: false,
               reason: err.message, metadata: { operation, code },
             }, contextValue);
           } else if (ORDER_OPERATIONS.has(operation)) {
             const newQuote = err.originalError?.extensions?.newQuote;
-            emitEvent({
+            emit({
               type: 'ORDER_REJECTED', category: CATEGORIES.ORDER, success: false,
               reason: err.message,
               metadata: { operation, code, ...(newQuote ? { newQuoteTotal: newQuote.total } : {}) },
@@ -108,4 +114,6 @@ export const auditPlugin = {
       },
     };
   },
-};
+});
+
+export const auditPlugin = createAuditPlugin();
