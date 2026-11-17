@@ -78,16 +78,14 @@ Boot the emulator yourself from Android Studio. From the emulator the host's bac
 |---|---|---|
 | PickarooAPI | #4 to #12 | Offline client schema (`schema:build/check`), unit tests, stable error codes, integration test harness, marketplace (catalog and stock per store), refresh tokens with rotation and reuse detection, order status history, driver assignment, driver live location |
 | PickarooFrontend | #3 to #8 | Base (Tailwind, routing, Apollo, codegen, i18n), sign-in and sessions, dashboard shell (menu sidebar, store selector, guards), store orders screen, inventory screen, unsaved-edits guard (data router) |
-| Pickaroo (Android) | up to #21 | Everything through the profile and shop queue; PIC-58 driver GPS (PR #13) |
+| Pickaroo (Android) | up to #24 | Everything through the profile and shop queue; PIC-58 driver GPS (#13); all text in English and Spanish resources (#23, PIC-99); in-app language choice, status-bar and inset fixes, test-runner fix (#24, PIC-100) |
 
-### In flight (branches pushed or ready; check each one's Jira comment)
+### In flight
 
-| Task | Repo and branches | State | What remains |
-|---|---|---|---|
-| PIC-99 (Android text in English and Spanish) and PIC-100 (in-app language choice) | `Pickaroo`: `codex/PIC-99-string-resources` (`f03e1dc`) and `codex/PIC-100-language-choice` (`6b70ee4` plus the fixup `e82cf00`). Both pushed, **not merged**, no pull requests yet. | Code complete and reviewed. Unit tests 304/304. On the emulator the visual checks passed (status bar, 3-button navigation, language dialog, registration in English). The full instrumented suite passed 130/131 on the commit before the review fixes; the review-fix commit then broke the Spanish pin of the test runner (cause found: on Android 13+ AppCompat only applies the per-app locale while an AppCompat activity is alive, so clears done with no activity did nothing). The fix is the **unverified** commit `e82cf00` (`PikarooTestRunner.kt`, `LanguageChoiceTest.kt`). | (1) Cold-boot the emulator. (2) `run-tests.sh instrumented com.example.pikaroo.ui.user` three times, then the full suite (a `QrOrderFlowTest` PixelCopy failure is a known flake: rerun `ui.order`). (3) Fold the fixup without force-pushing: `git checkout -b codex/PIC-100-language-choice-v2 codex/PIC-100-language-choice && GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash origin/main`, push the new branch. (4) Open pull requests, PIC-99 first, then PIC-100. (5) Mark both Done in Jira (they are In Progress until then). Open points from the review, none blocking: shop and driver modes have no language row; the foreground-service notification follows the phone language below Android 13; `UiText.Raw` is used by `ProductsViewModel` for server exception text. |
-| PIC-115 handover documentation | `PickarooAPI` `docs/handover/` | This document | - |
+Nothing is half-done: every task branch is merged, there are no open pull requests, and the working trees were clean at handover. Two things you may meet:
 
-Everything else listed in Jira as In Progress at the epic level (PIC-71, PIC-72, PIC-73, PIC-15, PIC-21, PIC-43, PIC-48, PIC-55) is simply an epic with open children.
+- **The Android working folder had two uncommitted changes that were not made by this work:** `gradle/libs.versions.toml` (Android Gradle plugin 9.1.0 to 9.3.3) and `gradle/wrapper/gradle-wrapper.properties` (Gradle 9.3.1 to 9.5.0). They look like an Android Studio upgrade. The Android tests that passed (137/137) ran with them in place; the unit tests (304) were also run against the committed versions. Decide whether to keep the upgrade (as its own task, with a full emulator run) or discard it.
+- Old branches `codex/PIC-100-language-choice` (before squashing the test-runner fixup) and `codex/PIC-114-...`, `codex/PIC-76-...` etc. still exist on GitHub after their pull requests were merged; delete them when convenient.
 
 ### Backups
 
@@ -97,9 +95,9 @@ Everything else listed in Jira as In Progress at the epic level (PIC-71, PIC-72,
 
 The backlog is in Jira (project PIC). Epics: A = PIC-71 (API), D = PIC-72 (dashboard), L = PIC-73 (Android languages), B = PIC-74 (Android biometric login), E9 = PIC-64 (Android on the real backend).
 
-1. **Finish and merge what is in flight** (section 4).
-2. **Android on the real backend (E9: PIC-105 to PIC-110).** The API now has everything the Android driver and customer flows need: refresh tokens, status history (`Order.statusHistory`), driver assignment and driver location (`reportDriverLocation`; the client rules for it are in the API README section on location: refresh the session on UNAUTHENTICATED, stop only on FORBIDDEN/NOT_FOUND/INVALID_ORDER_STATE, never replay old points). Plan: Apollo Kotlin from `schema/api.graphql`, a mapping layer (statuses PLACED/ACCEPTED/... map to PENDING/CONFIRMED/..., roles to permissions), email login. Details and the mapping table: `PLAN.md` section 2.
-3. **Android biometric sign-in (PIC-102 to PIC-104).** Store the refresh token encrypted by an Android Keystore key that needs a fingerprint; it can be built against the mock first. "Olvidar este dispositivo" calls `logout(refreshToken)`.
+1. **Start from the backlog below**: nothing is in flight.
+2. **Android on the real backend (E9: PIC-105 to PIC-110), recommended first.** The API now has everything the Android driver and customer flows need: refresh tokens, status history (`Order.statusHistory`), driver assignment and driver location (`reportDriverLocation`; the client rules for it are in the API README section on location: refresh the session on UNAUTHENTICATED, stop only on FORBIDDEN/NOT_FOUND/INVALID_ORDER_STATE, never replay old points). Plan: Apollo Kotlin from `schema/api.graphql`, a mapping layer (statuses PLACED/ACCEPTED/... map to PENDING/CONFIRMED/..., roles to permissions), email login. Details and the mapping table: `PLAN.md` section 2.
+3. **Android formats and tests for the two languages (PIC-101)**, then **biometric sign-in (PIC-102 to PIC-104).** Store the refresh token encrypted by an Android Keystore key that needs a fingerprint; it can be built against the mock first. "Olvidar este dispositivo" calls `logout(refreshToken)`.
 4. **Owner role (PIC-82)** in the API (OWNER between MANAGER and ADMIN, `OWNS` relation, owners manage their own staff), then the dashboard screen PIC-98.
 5. **Dashboard screens:** catalog PIC-90, reports PIC-91, stores PIC-92, users and roles PIC-93, audit PIC-94, live deliveries map PIC-95 (needs PIC-77), end-to-end tests PIC-96, language sweep PIC-97.
 6. **Hardening follow-ups:** PIC-112 (API) and PIC-113 / PIC-114 (dashboard), listed in Jira with their details.
