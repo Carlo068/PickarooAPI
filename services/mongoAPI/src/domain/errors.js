@@ -19,6 +19,14 @@ export const ERROR_CODES = {
     fields: ['reason', 'permission?', 'storeId?', 'status?'],
   },
   INVALID_CREDENTIALS: { description: 'Correo o contraseña incorrectos, o cuenta desactivada (no se distingue a propósito).', fields: [] },
+  INVALID_REFRESH_TOKEN: {
+    description: 'El refresh token no existe, venció, fue revocado, es de una familia ya cerrada o su cuenta está desactivada (no se distingue a propósito); hay que iniciar sesión con la contraseña.',
+    fields: [],
+  },
+  REFRESH_TOKEN_REUSED: {
+    description: 'Se presentó un refresh token ya canjeado fuera de la ventana de gracia (posible robo): se revocó su familia completa (el token vigente y sus sesiones); hay que iniciar sesión con la contraseña.',
+    fields: [],
+  },
   SERVICE_UNAVAILABLE: {
     description: 'Un servicio de apoyo no responde (sesiones, carrito, roles o bitácora); conviene reintentar.',
     fields: ['service?'],

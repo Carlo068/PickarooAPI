@@ -334,6 +334,10 @@ type AuthPayload {
   token: String!
   "Segundos de vida del token (y de su sesión en Redis)."
   expiresIn: Int!
+  "Token opaco de un solo uso para pedir otra sesión con la mutación `refreshToken`, sin la contraseña. Guardarlo cifrado; cada canje devuelve uno nuevo."
+  refreshToken: String!
+  "Segundos de vida del refresh token (cada canje los renueva)."
+  refreshExpiresIn: Int!
   user: User!
   "Rol, permisos efectivos y sucursales leídos de Neo4j al iniciar sesión."
   access: Access!
@@ -563,12 +567,16 @@ type Query {
 
 type Mutation {
   login(input: LoginInput!): AuthPayload!
-  "Revoca la sesión del token actual: deja de servir aunque no haya expirado."
-  logout: Boolean!
+  "Canjea un refresh token por una sesión nueva (permisos releídos de Neo4j) y otro refresh token. Público: no lleva Authorization. Un reintento con el mismo token dentro de la ventana de gracia devuelve el mismo resultado. Errores: INVALID_REFRESH_TOKEN, REFRESH_TOKEN_REUSED (borrar el token e ir al login), SERVICE_UNAVAILABLE (conservar el token y reintentar)."
+  refreshToken(token: String!): AuthPayload!
+  "Revoca la sesión del token actual: deja de servir aunque no haya expirado. Con `refreshToken` (del mismo usuario) revoca también ese dispositivo: su refresh token y todas sus sesiones."
+  logout(refreshToken: String): Boolean!
+  "Cierra la sesión en todos los dispositivos: revoca todas las sesiones y todos los refresh tokens del usuario."
+  logoutAllDevices: Boolean!
 
-  "Cambia el rol en Neo4j (y su espejo en Mongo) y revoca las sesiones del usuario (users:manage)."
+  "Cambia el rol en Neo4j (y su espejo en Mongo) y revoca las sesiones y los refresh tokens del usuario (users:manage)."
   assignRole(userId: ID!, role: UserRole!): Access!
-  "Asigna una sucursal al personal (WORKS_AT) y revoca sus sesiones (users:manage)."
+  "Asigna una sucursal al personal (WORKS_AT) y revoca sus sesiones y refresh tokens (users:manage)."
   assignUserToStore(userId: ID!, storeId: ID!): Access!
   removeUserFromStore(userId: ID!, storeId: ID!): Access!
 

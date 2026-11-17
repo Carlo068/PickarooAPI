@@ -81,6 +81,7 @@ PickarooAPI/
             │   ├── entities.js
             │   ├── errors.js     catálogo de códigos de error y DomainError
             │   ├── access.js     roles, permisos, menús y reglas de acceso
+            │   ├── refresh-tokens.js  forma, hash y vencimiento de los refresh tokens
             │   └── migrations.js decisiones puras de las migraciones de datos
             └── infrastructure/
                 ├── neo4j.js
@@ -92,6 +93,7 @@ PickarooAPI/
                 ├── entity-cache.js
                 ├── cart-store.js
                 ├── quote-store.js
+                ├── refresh-store.js  refresh tokens en Redis (rotación y revocación atómicas, Lua)
                 ├── recent-orders.js
                 ├── passwords.js
                 ├── seed.js
@@ -182,6 +184,11 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 |---|---|---|---|
 | Sesiones del JWT | `session:<jti>` (JSON: usuario, rol, permisos, sucursales) | `JWT_TTL_SECONDS` (3600) | `auth.js` |
 | Índice de sesiones | `user:<userId>:sessions` (SET de `jti`) | igual que la sesión | `auth.js` |
+| Refresh tokens | `refresh:<hash>` (JSON: `userId`, `familyId`, `createdAt`, `expiresAt`); `<hash>` es el SHA-256 del token, que nunca se guarda | `REFRESH_TTL_SECONDS` (30 días), completo en cada canje | `refresh-store.js` |
+| Refresh tokens ya canjeados | `refresh:spent:<hash>` (JSON: `familyId`, `userId`) | `REFRESH_TTL_SECONDS` desde el canje (lo que le queda a la familia) | `refresh-store.js` |
+| Ventana de gracia de un canje | `refresh:grace:<hash>` (JSON: `userId`, `familyId`, `jti`, `iat`, `nonce`); ni el token canjeado ni su sucesor | `REFRESH_REUSE_GRACE_SECONDS` (10 s) | `refresh-store.js` |
+| Familia (un dispositivo) | `refresh-family:<familyId>` (hash del token vigente) y `refresh-family:<familyId>:sessions` (SET de `jti` que abrió la familia; cada canje quita hasta 10 de sesiones ya vencidas) | `REFRESH_TTL_SECONDS`, se renueva en cada canje | `refresh-store.js` |
+| Índice de familias | `user:<userId>:refresh-families` (SET de `familyId`) | `REFRESH_TTL_SECONDS`, se renueva en cada login o canje | `refresh-store.js` |
 | Caché de productos (Redis OM, JSON) | `Product:<id>` | 120 s (`CACHE_TTL_PRODUCT`) | `entity-cache.js` |
 | Caché de usuarios (Redis OM, JSON) | `User:<id>` | 3600 s (`CACHE_TTL_USER`) | `entity-cache.js` |
 | Carrito | `cart:<userId>` (HASH `p:<productId>` / `k:<packageId>` → cantidad; una sola sucursal, la de sus partidas) | 7 días, se renueva con cada cambio | `cart-store.js` |
@@ -208,7 +215,7 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 - **Escritura de usuarios:** *write-through*. Tras guardar en MongoDB se escribe la copia ya actualizada.
 - **Lo que decide un cobro nunca sale del caché.** `createOrder` y `quoteOrder` calculan precios, descuentos y stock contra MongoDB, así que un cambio de precio aplica de inmediato a las compras aunque alguna copia tardara en expirar.
 - **Seguridad:** el `passwordHash` no se cachea (el campo es `select: false` y la vista que se guarda no lo incluye).
-- **Redis caído:** las lecturas siguen funcionando desde MongoDB; `login` responde `SERVICE_UNAVAILABLE` y los tokens existentes dejan de aceptarse hasta que Redis vuelva (las sesiones no se pueden verificar). Al conectar (o reconectar) se vacían `Product:*` y `User:*` para no servir copias de cambios hechos mientras Redis o la app estaban caídos.
+- **Redis caído:** las lecturas siguen funcionando desde MongoDB; `login`, `refreshToken`, `assignRole`, `assignUserToStore` y `removeUserFromStore` responden `SERVICE_UNAVAILABLE` (`service: SESSIONS`) y los tokens existentes dejan de aceptarse hasta que Redis vuelva (las sesiones no se pueden verificar). Si Redis se cae a mitad de un canje, de `logout` o de `logoutAllDevices`, la respuesta también es `SERVICE_UNAVAILABLE` (`SESSIONS`), no un error interno: el cliente conserva su refresh token y reintenta. Al conectar (o reconectar) se vacían `Product:*` y `User:*` para no servir copias de cambios hechos mientras Redis o la app estaban caídos.
 - `CACHE_DEBUG=true` imprime cada `HIT`, `MISS`, `SAVE` y `DEL`.
 
 La interfaz **RedisInsight** (`http://localhost:8001`) permite inspeccionar estas claves.
@@ -217,11 +224,50 @@ La interfaz **RedisInsight** (`http://localhost:8001`) permite inspeccionar esta
 
 Autenticación híbrida **JWT + sesión activa en Redis**:
 
-1. `login(input: {email, password})` verifica la contraseña (scrypt, comparación en tiempo constante) y lee de Neo4j el rol, los permisos efectivos y las sucursales del usuario. Firma un JWT HS256 con `sub`, `name`, `email`, `role` y un `jti` único, y guarda `session:<jti>` en Redis con esos permisos y el mismo TTL. Devuelve también `access` y `menu`.
+1. `login(input: {email, password})` verifica la contraseña (scrypt, comparación en tiempo constante) y lee de Neo4j el rol, los permisos efectivos y las sucursales del usuario. Firma un JWT HS256 con `sub`, `name`, `email`, `role` y un `jti` único, y guarda `session:<jti>` en Redis con esos permisos y el mismo TTL. Devuelve también `access`, `menu` y un **refresh token** (`refreshToken`, `refreshExpiresIn`).
 2. Cada petición envía `Authorization: Bearer <token>`. El Gateway reenvía el encabezado al subgrafo, que valida la firma y la expiración **y** que `session:<jti>` siga existiendo. Los permisos salen de la sesión: una petición no consulta Neo4j.
 3. `logout` borra `session:<jti>`: el token deja de servir al instante, aunque no haya expirado.
 
 Correo inexistente, contraseña incorrecta y cuenta desactivada devuelven el mismo mensaje (`Credenciales inválidas.`); el motivo real queda en la bitácora.
+
+#### Refresh tokens: seguir con la sesión sin pedir la contraseña
+
+El token de acceso dura una hora (`JWT_TTL_SECONDS`). Para no pedir la contraseña cada hora, `login` entrega además un refresh token que dura 30 días (`REFRESH_TTL_SECONDS`). Es la credencial que la app Android guarda cifrada detrás de la huella (inicio de sesión biométrico) y que "Olvidar este dispositivo" revoca en el servidor.
+
+- **Opaco y de un solo uso.** Son 256 bits en base64url (43 caracteres), no un JWT: no lleva datos y solo sirve contra Redis. El del login es aleatorio; el de cada canje se deriva del canjeado (ver "Ventana de gracia"). Redis guarda únicamente su SHA-256 (`refresh:<hash>`); las búsquedas y comparaciones son por hash. El token nunca se registra en consola ni en la bitácora ni se cachea.
+- **Familia.** Cada `login` empieza una familia: un inicio de sesión en un dispositivo, la cadena de tokens que se rotan a partir de él. `refresh-family:<familyId>` apunta al token vigente y `refresh-family:<familyId>:sessions` lista los `jti` de las sesiones que abrió. `user:<userId>:refresh-families` indexa las familias del usuario.
+- **Rotación.** `refreshToken(token)` es pública (no lleva `Authorization`). Con un token vigente lo consume, entrega otro de la misma familia con 30 días completos (no los que le quedaban al anterior) y abre una sesión nueva igual que `login`: rol, permisos y sucursales se releen de Neo4j y el menú también. El token de acceso anterior sigue sirviendo hasta que vence o se cierra su sesión. Se registra `TOKEN_REFRESHED` (`familyId`, `jti` nuevo).
+- **Ventana de gracia (`REFRESH_REUSE_GRACE_SECONDS`, 10 s; 0 la desactiva).** En una red móvil la respuesta de un canje puede perderse después de que el servidor rotó, y dos partes de la app pueden canjear el mismo token a la vez. Durante la ventana, presentar el token recién canjeado devuelve **el mismo resultado** que obtuvo el canje ganador: el mismo refresh token sucesor, el mismo token de acceso y la misma sesión (no se emite otro). Se registra `TOKEN_REFRESHED` con `metadata.grace: true`. Solo aplica mientras el sucesor siga vigente: si ya se canjeó (el token presentado tiene dos rotaciones de atraso) o la familia se revocó, el caso sigue como se describe abajo.
+  - *Cómo se reentrega sin guardar el sucesor.* El sucesor no es aleatorio puro: es `HMAC-SHA256(clave = token canjeado, nonce)`, con un nonce aleatorio de 256 bits. El mismo script Lua que rota escribe `refresh:grace:<hash del canjeado>` con lo mínimo para repetir el resultado (`userId`, `familyId`, el `jti` de la sesión, el `iat` de su JWT y el nonce), con TTL igual a la ventana. En el reintento el servidor recalcula el sucesor con el token presentado y el nonce, comprueba que siga siendo el vigente de la familia y vuelve a firmar el JWT con el mismo `jti` e `iat` (HS256 es determinista: sale el mismo token). Alternativa descartada: guardar el sucesor en claro durante la ventana; quien leyera Redis (RedisInsight, un volcado RDB) se llevaría un refresh token vigente.
+  - *Compromiso.* Quien tenga el token canjeado puede obtener el sucesor durante la ventana: es exactamente lo que la ventana concede (el servidor no distingue al dueño que reintenta de un ladrón tan rápido). Fuera de ella el nonce ya no existe y el token canjeado no sirve para calcular nada; Redis solo tiene hashes y el nonce, que sin el token canjeado (que Redis no guarda) no sirve. Pasada la ventana, presentarlo es reutilización. Si el nombre o el correo del usuario cambian dentro de la ventana, el JWT reentregado lleva los datos nuevos (sigue siendo de la misma sesión). `expiresIn` y `refreshExpiresIn` repiten los del ganador, unos segundos más largos que lo que de verdad queda.
+- **Detección de reutilización.** Al rotar, el hash del token consumido queda marcado como usado (`refresh:spent:<hash>`, con la vida que le queda a la familia). Si alguien presenta un token ya usado fuera de la ventana de gracia y su familia sigue viva, el original fue copiado: se revoca **toda la familia** (el token vigente y todas las sesiones que abrió, la del login incluida), se responde `REFRESH_TOKEN_REUSED` y se registra `REFRESH_REUSED` (`SECURITY`, actor = el usuario del token, `metadata.familyId`; nunca el token). Si la familia ya no existe (`logout(refreshToken)`, `logoutAllDevices`, un cambio de acceso o una reutilización anterior), no hay nada que proteger: la respuesta es `INVALID_REFRESH_TOKEN` y solo se registra `REFRESH_FAILED`, sin alerta de robo.
+- **Atomicidad.** Comprobar y rotar es un script Lua en Redis (`infrastructure/refresh-store.js`): Redis lo ejecuta completo sin intercalar otros comandos. Si dos canjes del mismo token llegan a la vez, exactamente uno lo consume; el otro encuentra la marca de usado y, dentro de la ventana de gracia, recibe el mismo resultado que el ganador (sin la ventana contaría como reutilización). El token nuevo, la sesión nueva y el registro de gracia se escriben en el mismo script, así una revocación posterior siempre los alcanza. El script también quita del conjunto `refresh-family:<familyId>:sessions` (y de `user:<userId>:sessions`) hasta 10 `jti` cuyas sesiones ya vencieron, para que no crezca sin límite con un costo fijo por canje. `GETDEL` no bastaba (consume, pero la marca de usado se escribiría en otro paso y el perdedor podría leer "desconocido") y `WATCH/MULTI` exige una conexión aislada y reintentos. La revocación también es un script Lua. Los scripts arman claves a partir de lo que leen: sirven en el Redis de una instancia del Compose, no en Redis Cluster.
+- **Token desconocido, vencido o revocado, de una familia que ya no existe, o cuenta desactivada:** `INVALID_REFRESH_TOKEN` (no se distingue a propósito, como `INVALID_CREDENTIALS`); el motivo real queda en la bitácora como `REFRESH_FAILED`.
+- **Servicios caídos durante el canje:** sin Redis (o si falla a mitad), `SERVICE_UNAVAILABLE` con `service: SESSIONS`. Sin Neo4j la sesión nueva saldría sin permisos, así que el canje se rechaza **antes de rotar** con `SERVICE_UNAVAILABLE` y `service: RBAC` (se registra `RBAC_UNAVAILABLE`): el token sigue sin gastar y el cliente reintenta con el mismo. El `login` con Neo4j caído sí entra con permisos vacíos (ver "Neo4j caído").
+- **Cerrar sesión en un dispositivo:** `logout(refreshToken: "…")` borra la sesión actual y, si el refresh token es del mismo usuario, revoca su familia completa (token y sesiones): es "Olvidar este dispositivo" y la salida total. Sirve el token vigente o uno ya canjeado de la familia (la familia se encuentra por la marca de usado), por si el cliente se quedó con el anterior. Un token ajeno o desconocido se ignora; `logout` sin argumento solo cierra la sesión actual y deja vivo el refresh token (la app lo conserva para entrar con la huella).
+- **Cerrar sesión en todos los dispositivos:** `logoutAllDevices` (requiere sesión) revoca todas las familias y todas las sesiones del usuario y registra `SESSIONS_REVOKED` (`SECURITY`).
+- **Cambios de acceso:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan, además de las sesiones, todas las familias del usuario: un refresh no puede revivir los permisos anteriores. Ver "Cambios de acceso inmediatos" para lo que pasa si Redis no responde.
+
+Qué esperar de `refreshToken`:
+
+| Caso | Respuesta |
+|---|---|
+| Token vigente | `AuthPayload` nuevo (otro refresh token y otra sesión) |
+| Reintento con el token recién canjeado, dentro de la ventana de gracia y con el sucesor sin canjear | El mismo `AuthPayload` que recibió el canje anterior |
+| Token ya canjeado, fuera de la ventana (o con el sucesor ya canjeado), de una familia viva | `REFRESH_TOKEN_REUSED` (se revoca la familia) |
+| Token ya canjeado de una familia revocada (cierre de sesión, cambio de acceso, reutilización anterior) | `INVALID_REFRESH_TOKEN` |
+| Token desconocido, mal formado, vencido o revocado; cuenta desactivada | `INVALID_REFRESH_TOKEN` |
+| Redis no disponible o falla a mitad del canje | `SERVICE_UNAVAILABLE`, `service: SESSIONS` (el token no se gasta, salvo que la rotación ya se haya hecho: entonces el reintento cae en la ventana de gracia) |
+| Neo4j no disponible | `SERVICE_UNAVAILABLE`, `service: RBAC` (el token no se gasta) |
+
+Qué deben hacer los clientes (Android y dashboard):
+
+1. Guardar el refresh token de forma segura (Android: cifrado con Android Keystore; detrás de la huella si el usuario activó el inicio biométrico) y reemplazarlo por el nuevo después de **cada** canje: el anterior deja de servir al terminar la ventana de gracia y presentarlo después cierra la sesión del dispositivo.
+2. Ante `UNAUTHENTICATED`, llamar a `refreshToken` una vez, guardar el par nuevo y reintentar la operación **una sola vez**.
+3. Si el canje no recibe respuesta (tiempo agotado, red caída), reintentarlo **con el mismo token** cuanto antes: dentro de la ventana de gracia el servidor devuelve el mismo resultado.
+4. Con `SERVICE_UNAVAILABLE` (`SESSIONS` o `RBAC`): **conservar el token** y reintentar con espera creciente (*backoff*). No borrar nada ni mandar al login.
+5. Con `INVALID_REFRESH_TOKEN` o `REFRESH_TOKEN_REUSED`: **borrar el token** (y el de acceso) e ir al login con contraseña. Lo mismo si el reintento de la operación vuelve a dar `UNAUTHENTICATED`.
+6. Compartir un solo canje entre las peticiones que reciban `UNAUTHENTICATED` a la vez. La ventana de gracia tolera un canje doble, pero no encadenar canjes: si una parte ya canjeó el sucesor, el token viejo cuenta como reutilización.
 
 ### Autorización: roles en Neo4j (`domain/access.js`, `infrastructure/rbac-graph.js`)
 
@@ -247,8 +293,8 @@ Los permisos efectivos son los del rol más los de todos los roles que hereda (`
 - **Auto-reparación:** un usuario que aún no está en el grafo se crea en su primer login con el rol espejo de MongoDB.
 - **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT`; `scope:all_stores` (ADMIN) ve todas. Lo mismo vale para el catálogo y el inventario: `catalog:manage` (alta y edición de productos y paquetes, descuentos, activar/desactivar) y `stock:manage` (`setProductStock`) solo aplican a artículos de una sucursal del alcance, y los reportes solo cubren esas sucursales. Fuera del alcance: `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED` y `storeId`. La regla es `storeItemDenial` en `domain/access.js` (reportes: `reportStoreScope`).
 - **Categorías globales:** las comparten todas las sucursales, así que crearlas exige `catalog:manage` **y** `scope:all_stores` (solo ADMIN). A un MANAGER le falta el segundo: `FORBIDDEN`, `reason: PERMISSION_REQUIRED`, `permission: scope:all_stores`.
-- **Cambios de acceso inmediatos:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan todas las sesiones del usuario (`user:<id>:sessions`); al volver a entrar recibe los permisos nuevos.
-- **Neo4j caído:** el login funciona con permisos vacíos (`access.degraded = true`) y se registra `RBAC_UNAVAILABLE`. Nadie gana privilegios sin el grafo; los clientes compran normalmente.
+- **Cambios de acceso inmediatos:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan todas las sesiones del usuario (`user:<id>:sessions`) y todos sus refresh tokens (`user:<id>:refresh-families`); al volver a entrar recibe los permisos nuevos. Si Redis no está listo, la operación responde `SERVICE_UNAVAILABLE` (`service: SESSIONS`) **antes** de cambiar nada en Neo4j o MongoDB. Si Redis falla después de aplicar el cambio (entre el cambio y la revocación), la respuesta también es `SERVICE_UNAVAILABLE` (`SESSIONS`), pero el cambio queda hecho y registrado (`ROLE_CHANGED` o `STORE_ASSIGNMENT_CHANGED` se emiten antes de revocar): las sesiones abiertas conservan los permisos anteriores hasta vencer (`JWT_TTL_SECONDS`, una hora), y sus refresh tokens siguen vivos, pero el siguiente canje ya relee el acceso nuevo de Neo4j, así que no revive los permisos anteriores. Para terminar la revocación se repite la operación cuando Redis vuelva (`assignRole` y `assignUserToStore` se pueden repetir; `removeUserFromStore` responde `USER_NOT_ASSIGNED_TO_STORE`, así que en ese caso se usa `assignRole` con el mismo rol).
+- **Neo4j caído:** el login funciona con permisos vacíos (`access.degraded = true`) y se registra `RBAC_UNAVAILABLE`. Nadie gana privilegios sin el grafo; los clientes compran normalmente. `refreshToken`, en cambio, responde `SERVICE_UNAVAILABLE` (`service: RBAC`) sin gastar el token, para que la sesión renovada no quede sin permisos.
 
 Reglas de órdenes (`canChangeOrderStatus`):
 
@@ -263,8 +309,8 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 
 | Acceso | Operaciones |
 |---|---|
-| Público | `login`, `createUser` (registro; siempre `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
-| Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
+| Público | `login`, `refreshToken`, `createUser` (registro; siempre `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
+| Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `logoutAllDevices`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
 | Dueño o `users:manage` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal: las de sus sucursales; repartidor: solo DELIVERY), `cancelOrder`, `updateOrderStatus` (según la tabla anterior) |
 | `stock:manage` en la sucursal del producto | `setProductStock` |
@@ -290,6 +336,8 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `UNAUTHENTICATED` | La operación requiere una sesión iniciada (falta el token o ya no es válido). | — |
 | `FORBIDDEN` | Hay sesión, pero no permiso para la operación o el recurso. `reason` indica cuál regla (ver FORBIDDEN_REASONS). | `reason`, `permission?`, `storeId?`, `status?` |
 | `INVALID_CREDENTIALS` | Correo o contraseña incorrectos, o cuenta desactivada (no se distingue a propósito). | — |
+| `INVALID_REFRESH_TOKEN` | El refresh token no existe, venció, fue revocado, es de una familia ya cerrada o su cuenta está desactivada (no se distingue a propósito); hay que iniciar sesión con la contraseña. | — |
+| `REFRESH_TOKEN_REUSED` | Se presentó un refresh token ya canjeado fuera de la ventana de gracia (posible robo): se revocó su familia completa (el token vigente y sus sesiones); hay que iniciar sesión con la contraseña. | — |
 | `SERVICE_UNAVAILABLE` | Un servicio de apoyo no responde (sesiones, carrito, roles o bitácora); conviene reintentar. | `service?` |
 
 **Validación y datos**
@@ -392,7 +440,8 @@ Notas por código:
 | `OWN_ORDERS_ONLY` | Solo se pueden consultar las órdenes propias. |
 | `CANNOT_CHANGE_OWN_ROLE` | Un usuario no puede cambiar su propio rol. |
 
-- `INVALID_CREDENTIALS` cubre correo inexistente, contraseña incorrecta y cuenta desactivada con el mismo código a propósito. `UNAUTHENTICATED` queda para "no hay sesión válida" (el cliente va al login).
+- `INVALID_CREDENTIALS` cubre correo inexistente, contraseña incorrecta y cuenta desactivada con el mismo código a propósito. `UNAUTHENTICATED` queda para "no hay sesión válida": el cliente canjea su refresh token una vez y reintenta; si no tiene o el canje falla, va al login.
+- `INVALID_REFRESH_TOKEN` y `REFRESH_TOKEN_REUSED` solo los devuelve `refreshToken`; en los dos casos el cliente borra los tokens guardados y va al login. `REFRESH_TOKEN_REUSED` indica que el token pudo haberse copiado (se presentó fuera de la ventana de gracia con su familia viva): la app puede avisar que se cerró la sesión de ese dispositivo por seguridad. Un token de una familia ya cerrada da `INVALID_REFRESH_TOKEN`, sin alerta. En cambio, ante `SERVICE_UNAVAILABLE` el cliente conserva el refresh token y reintenta con espera creciente.
 - `NOT_FOUND.entity` es uno de `USER`, `STORE`, `ADDRESS`, `CATEGORY`, `PRODUCT`, `PACKAGE`, `DISCOUNT`, `ORDER` o `SHOPPING_LIST`; `ITEM_UNAVAILABLE.itemType`, `PRODUCT` o `PACKAGE`; `INVALID_NAME.entity` e `INVALID_PRICE.entity`, `PRODUCT` o `PACKAGE`; `INVALID_QUANTITY.context`, `ORDER_LINE`, `PACKAGE_ITEM` o `CART`; `SERVICE_UNAVAILABLE.service`, `SESSIONS`, `CART`, `RBAC` o `AUDIT_LOG`.
 - `VALIDATION_ERROR` es la validación de Mongoose al guardar. `violations` es `[{ field, rule }]`; `rule` es el código de dominio cuando la regla viene del dominio (p. ej. `INVALID_PRICE`, `INVALID_STOCK`) o el tipo de Mongoose (`required`, `min`, `max`, `enum`, `user defined`…).
 - Una clave única repetida (índice de MongoDB, error E11000) llega como `EMAIL_ALREADY_REGISTERED` si el campo es `email` y como `DUPLICATE_VALUE` con `field` en los demás casos.
@@ -625,8 +674,8 @@ mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `
 
 | Categoría | Eventos |
 |---|---|
-| `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (con el motivo real), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE` |
-| `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED`, `STORE_CREATED`, `STORE_UPDATED` |
+| `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (con el motivo real), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE`, `TOKEN_REFRESHED` (`familyId`, `jti` nuevo), `REFRESH_FAILED` (con el motivo real), `REFRESH_REUSED` (`familyId`), `SESSIONS_REVOKED` (`logoutAllDevices`) |
+| `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED` (cambio de rol o de sucursales; sesiones y familias de refresh tokens revocadas), `STORE_CREATED`, `STORE_UPDATED` |
 | `CATALOG` | `CATEGORY_CREATED`, `PRODUCT_CREATED`, `PRODUCT_UPDATED` (cambios `{ from, to }`, p. ej. precio), `PRODUCT_ACTIVE_CHANGED`, `STOCK_SET`, `DISCOUNT_ADDED`, `DISCOUNT_REMOVED`, `PACKAGE_CREATED`, `PACKAGE_UPDATED`, `PACKAGE_ACTIVE_CHANGED` |
 | `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, `MIXED_STORES`, `STORE_MISMATCH`, stock insuficiente) |
 
@@ -699,10 +748,12 @@ RABBITMQ_QUEUE=pickaroo.events
 REDIS_URL=redis://default:pickaroo123@localhost:6379
 JWT_SECRET=CAMBIAR_POR_UN_SECRETO_LARGO_Y_ALEATORIO
 JWT_TTL_SECONDS=3600
+REFRESH_TTL_SECONDS=2592000
+REFRESH_REUSE_GRACE_SECONDS=10
 SEED=false
 ```
 
-`REDIS_URL` coincide con la contraseña (`--requirepass`) del servicio `redis` del Compose y es también el valor de respaldo del código. `JWT_SECRET` debe definirse: si falta, el servicio genera uno aleatorio al arrancar y todos los tokens dejan de ser válidos en cada reinicio. Para generar uno:
+`REDIS_URL` coincide con la contraseña (`--requirepass`) del servicio `redis` del Compose y es también el valor de respaldo del código. `JWT_SECRET` debe definirse: si falta, el servicio genera uno aleatorio al arrancar y todos los tokens dejan de ser válidos en cada reinicio. `JWT_TTL_SECONDS` es la vida del token de acceso y de su sesión (1 hora por omisión); `REFRESH_TTL_SECONDS`, la de cada refresh token (30 días por omisión; cada canje entrega uno con la vida completa); `REFRESH_REUSE_GRACE_SECONDS`, la ventana de gracia de un canje (10 s por omisión, 0 la desactiva). Para generar uno:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
@@ -809,11 +860,11 @@ Con el Compose arriba (`docker compose up -d`), desde la raíz:
 npm run test:integration
 ```
 
-Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de medio minuto.
+Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
 
-- **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
+- **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida, `REFRESH_TTL_SECONDS=10` (para probar el vencimiento), `REFRESH_REUSE_GRACE_SECONDS=2` (para probar lo que pasa después de la ventana) y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
 - **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
-- **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), carritos, cotizaciones, pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar.
+- **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), los refresh tokens con sus marcas de usado, sus registros de gracia y sus familias, carritos, cotizaciones, pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar.
 - **Lo que no se limpia:** las filas de auditoría en ScyllaDB (la bitácora es inmutable) y los mensajes de RabbitMQ. El auditAPI del dev y el de pruebas consumen la misma cola y escriben en la misma ScyllaDB, así que cualquiera de los dos puede guardar un evento de la corrida; las pruebas de bitácora consultan hasta que aparece.
 - **Sin Docker:** si un servicio del Compose no responde, las pruebas se omiten con un mensaje (`integration tests skipped: MongoDB not reachable on localhost:27017`) y el comando termina con código 0. Nunca arranca Docker ni contenedores.
 
@@ -881,6 +932,8 @@ mutation Login($input: LoginInput!) {
   login(input: $input) {
     token
     expiresIn
+    refreshToken
+    refreshExpiresIn
     user { id name role }
   }
 }
@@ -889,6 +942,16 @@ mutation Login($input: LoginInput!) {
 Variables: `{ "input": { "email": "admin@carnyfrut.mx", "password": "Admin1234" } }`.
 
 Copiar `token` y enviarlo en cada petición como encabezado `Authorization: Bearer <token>` (en Apollo Sandbox, pestaña *Headers*). `query { me { id name role } }` confirma la sesión y `mutation { logout }` la revoca.
+
+Para seguir sin la contraseña cuando el token vence, canjear el refresh token (sin encabezado `Authorization`) y guardar el par nuevo: el anterior ya no sirve.
+
+```graphql
+mutation Refresh($token: String!) {
+  refreshToken(token: $token) { token expiresIn refreshToken refreshExpiresIn }
+}
+```
+
+`mutation { logout(refreshToken: "…") }` cierra la sesión y además revoca ese dispositivo; `mutation { logoutAllDevices }` cierra todas las sesiones del usuario.
 
 Las demás consultas de este apartado se ejecutan con ese encabezado; el catálogo (`products`, `packages`, `stores`) y `quoteOrder` también funcionan sin él. Para `users`, los reportes y las mutaciones de catálogo se necesita el token del administrador; para `createOrder` y las listas, el del cliente (o el del administrador).
 
@@ -1092,7 +1155,7 @@ Esta versión contiene los elementos de Docker, dominio, Mongoose, GraphQL y agr
 
 Aspectos relevantes al continuar el desarrollo:
 
-- La autenticación es JWT + sesión en Redis. No hay limitación de intentos de `login`, recuperación ni cambio de contraseña, ni una operación para desactivar usuarios. Los intentos fallidos sí quedan en la bitácora (`LOGIN_FAILED`).
+- La autenticación es JWT + sesión en Redis, con refresh tokens rotativos de un solo uso. No hay limitación de intentos de `login` ni de `refreshToken`, recuperación ni cambio de contraseña, ni una operación para desactivar usuarios. Los intentos fallidos sí quedan en la bitácora (`LOGIN_FAILED`).
 - Los roles viven en Neo4j; MongoDB guarda un espejo. Si se edita el grafo a mano (sin `assignRole`), el cambio aplica en el siguiente login del usuario, no en sus sesiones abiertas.
 - Cada sucursal es un negocio con su propio catálogo y stock; todavía no hay un rol de dueño de sucursal (OWNER) ni una relación `OWNS`: el alcance del personal sale solo de `WORKS_AT`.
 - La bitácora es de "al menos una vez": si RabbitMQ no está disponible cuando mongoAPI publica, ese evento se pierde (no hay outbox). auditAPI no expone borrado ni edición de eventos.
