@@ -388,6 +388,11 @@ type Order {
   store: Store!
   deliveryAddress: Location
   status: OrderStatus!
+
+  """
+  Cambios de estado, del más antiguo al más reciente. Lo lee quien puede ver la orden.
+  """
+  statusHistory: [OrderStatusChange!]!
   items: [OrderItem!]!
 
   """Derivado de las partidas."""
@@ -454,6 +459,26 @@ enum OrderStatus {
   IN_DELIVERY
   DELIVERED
   CANCELLED
+}
+
+"""Un cambio de estado de la orden."""
+type OrderStatusChange {
+  """Estado al que pasó la orden."""
+  status: OrderStatus!
+  at: DateTime!
+
+  """Rol de quien lo hizo. Null en entradas inferidas."""
+  byRole: UserRole
+
+  """
+  Quien lo hizo. Solo lo ven quienes no son el cliente de la orden (personal de la sucursal, ADMIN); para el cliente es null.
+  """
+  by: User
+
+  """
+  true: la entrada se reconstruyó de las fechas de la orden (anterior al historial); no tiene autor.
+  """
+  inferred: Boolean!
 }
 
 """

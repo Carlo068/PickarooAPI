@@ -3,7 +3,7 @@
 // (contar y escribir en MongoDB) se prueba en test/integration/migration.test.js.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { planCatalogStoreBackfill } from '../../src/domain/migrations.js';
+import { planCatalogStoreBackfill, planStatusHistoryBackfill } from '../../src/domain/migrations.js';
 
 const store = (id, createdAt, name = `Sucursal ${id}`) => ({ _id: { toString: () => id }, name, createdAt });
 
@@ -55,5 +55,46 @@ describe('planCatalogStoreBackfill', () => {
 
   test('pendientes pero ninguna sucursal: NO_STORE (se avisa y quedan sin listar)', () => {
     assert.deepEqual(planCatalogStoreBackfill({ stores: [], pending: { products: 4, packages: 1 } }), { action: 'NO_STORE', products: 4, packages: 1 });
+  });
+});
+
+describe('planStatusHistoryBackfill', () => {
+  const createdAt = new Date('2026-01-01T10:00:00Z');
+  const updatedAt = new Date('2026-01-02T11:00:00Z');
+  const entry = (status, at) => ({ status, at, byUserId: null, byRole: null, inferred: true });
+
+  test('orden PENDING: solo PENDING en createdAt', () => {
+    assert.deepEqual(planStatusHistoryBackfill({ status: 'PENDING', createdAt, updatedAt }), [entry('PENDING', createdAt)]);
+  });
+
+  test('orden que ya cambió: PENDING en createdAt y el estado actual en updatedAt', () => {
+    for (const status of ['CONFIRMED', 'DELIVERED', 'CANCELLED']) {
+      assert.deepEqual(planStatusHistoryBackfill({ status, createdAt, updatedAt }), [entry('PENDING', createdAt), entry(status, updatedAt)]);
+    }
+  });
+
+  test('todas las entradas son inferidas y sin autor', () => {
+    for (const e of planStatusHistoryBackfill({ status: 'READY', createdAt, updatedAt })) {
+      assert.equal(e.inferred, true);
+      assert.equal(e.byUserId, null);
+      assert.equal(e.byRole, null);
+    }
+  });
+
+  test('historial que no empieza en PENDING: solo antepone el PENDING inferido', () => {
+    const real = { status: 'CONFIRMED', at: updatedAt, byUserId: null, byRole: 'STAFF', inferred: false };
+    assert.deepEqual(planStatusHistoryBackfill({ status: 'CONFIRMED', createdAt, updatedAt, statusHistory: [real] }), [entry('PENDING', createdAt)]);
+  });
+
+  test('idempotente: con historial completo no decide nada (null); arreglo vacío o ausente sí', () => {
+    assert.equal(planStatusHistoryBackfill({ status: 'PENDING', createdAt, updatedAt, statusHistory: [entry('PENDING', createdAt)] }), null);
+    assert.equal(planStatusHistoryBackfill({ status: 'CONFIRMED', createdAt, updatedAt, statusHistory: [entry('PENDING', createdAt), entry('CONFIRMED', updatedAt)] }), null);
+    assert.ok(planStatusHistoryBackfill({ status: 'PENDING', createdAt, updatedAt, statusHistory: [] }));
+    assert.ok(planStatusHistoryBackfill({ status: 'PENDING', createdAt, updatedAt }));
+  });
+
+  test('sin updatedAt usa createdAt; sin ninguna fecha no falla', () => {
+    assert.deepEqual(planStatusHistoryBackfill({ status: 'READY', createdAt }).map(e => e.at), [createdAt, createdAt]);
+    assert.equal(planStatusHistoryBackfill({ status: 'PENDING' }).length, 1);
   });
 });

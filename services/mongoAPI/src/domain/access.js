@@ -147,3 +147,8 @@ export function canViewOrder(access, order) {
   if (hasPermission(access, P.ORDERS_PREPARE)) return true;
   return hasPermission(access, P.ORDERS_DELIVER) && order.mode === 'DELIVERY';
 }
+
+// Quién hizo un cambio de estado (`by` en el historial): lo ve quien puede ver
+// la orden y NO es su cliente (personal de la sucursal o ADMIN). El cliente ve
+// solo el rol (byRole), nunca la identidad del empleado.
+export const canSeeStatusActor = (access, order) => !isOwner(access, order) && canViewOrder(access, order);

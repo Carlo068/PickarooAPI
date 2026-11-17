@@ -21,6 +21,8 @@ import {
   orderSubtotal,
   orderDiscountTotal,
   assertTransition,
+  statusChangeEntry,
+  STATUS_HISTORY_MAX,
   assertPackagePersistable,
   assertPackageSameStore,
   assertQuoteStillValid,
@@ -45,7 +47,7 @@ import { initEvents, emitEvent, diff, auditPlugin, CATEGORIES } from './infrastr
 import { runMigrations } from './infrastructure/migrations.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
 import {
-  PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus,
+  PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus, canSeeStatusActor,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from './domain/access.js';
 
@@ -386,6 +388,8 @@ async function placeOrder({ userId, mode, storeId, address, addressId, items, no
       deliveryFee: priced.deliveryFee,
       total: priced.total,
       notes,
+      // Quien crea la orden: el cliente, o el admin / gestor de usuarios que la crea a su nombre.
+      statusHistory: [statusChangeEntry('PENDING', ctx.currentUser?.id ? ctx.currentUser : { id: user._id, role: 'CUSTOMER' })],
     });
   } catch (err) {
     await releaseStock(taken);
@@ -532,12 +536,51 @@ const DateTime = new GraphQLScalarType({
 const authResolvers = createAuthResolvers(redisClient); // sesión, acceso (Neo4j) y administración de roles
 
 // Cambia el estado de una orden (valida la transición y repone stock al cancelar).
-async function changeOrderStatus(order, status, ctx) {
-  assertTransition(order.status, status, order.mode);
-  const previous = order.status;
-  order.status = status;
-  await order.save();
+// El cambio y su entrada en statusHistory son UNA escritura atómica condicionada
+// al estado que se validó: si otra petición movió la orden en medio, no escribe
+// nada, se relee y se vuelve a validar contra el estado real (el perdedor recibe
+// ORDER_ALREADY_IN_STATUS / INVALID_STATUS_TRANSITION, o se aplica si sigue siendo
+// válido). Así nunca hay una transición sin entrada ni una entrada sin transición.
+// Actualización con pipeline (Mongoose no castea aquí: ids como ObjectId y fechas como Date).
+// Si el historial está vacío, ausente o no empieza en PENDING (la migración no corrió),
+// antepone el PENDING inferido; luego agrega la entrada nueva y conserva solo las últimas
+// STATUS_HISTORY_MAX (findOneAndUpdate no corre los validadores del esquema).
+function statusChangeUpdate(status, actor) {
+  const entry = statusChangeEntry(status, actor);
+  if (entry.byUserId != null) entry.byUserId = oid(entry.byUserId);
+  const history = { $ifNull: ['$statusHistory', []] };
+  const firstStatus = { $arrayElemAt: [{ $map: { input: history, as: 'e', in: '$$e.status' } }, 0] };
+  const seed = { status: 'PENDING', at: { $ifNull: ['$createdAt', '$updatedAt'] }, byUserId: null, byRole: null, inferred: true };
+  return [{
+    $set: {
+      status: { $literal: status },
+      __v: { $add: [{ $ifNull: ['$__v', 0] }, 1] },
+      statusHistory: {
+        $slice: [{ $concatArrays: [{ $cond: [{ $ne: [firstStatus, 'PENDING'] }, [seed], []] }, history, [{ $literal: entry }]] }, -STATUS_HISTORY_MAX],
+      },
+    },
+  }];
+}
 
+async function changeOrderStatus(order, status, ctx) {
+  const actor = ctx.currentUser;
+  // Cada reintento significa que el estado avanzó, y las transiciones no regresan: termina.
+  for (;;) {
+    assertTransition(order.status, status, order.mode);
+    const previous = order.status;
+    const updated = await Order.findOneAndUpdate(
+      { _id: order._id, status: previous },
+      statusChangeUpdate(status, actor),
+      { returnDocument: 'after' },
+    );
+    if (updated) return finishStatusChange(updated, previous, status, ctx);
+    const id = order._id;
+    order = await Order.findById(id);
+    if (!order) throw notFound('ORDER', id);
+  }
+}
+
+async function finishStatusChange(order, previous, status, ctx) {
   // Repone el stock consumido, incluido el contenido de los paquetes.
   if (status === 'CANCELLED') await releaseStock(stockDemand(order.items));
   emitEvent({
@@ -619,6 +662,13 @@ const resolvers = {
     store: o => Store.findById(o.storeId).exec(),
     subtotal: o => orderSubtotal(o.items),
     discountTotal: o => orderDiscountTotal(o.items),
+    // Más antiguo primero. `order` viaja con cada entrada para decidir quién ve `by`.
+    statusHistory: o => (o.statusHistory ?? []).map(h => ({ ...h.toObject(), order: o })),
+  },
+
+  OrderStatusChange: {
+    // El cliente ve el rol, no quién fue; el personal de la sucursal y ADMIN, sí.
+    by: (h, _, ctx) => (h.byUserId && canSeeStatusActor(ctx.currentUser, h.order) ? getUser(h.byUserId) : null),
   },
 
   ShoppingListItem: {

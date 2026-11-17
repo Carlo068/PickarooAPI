@@ -12,7 +12,7 @@ import {
   cartLineStatus, reconcileCart, assertQuoteStillValid,
   assertPackageSameStore, linesStoreId, cartStoreId, assertCartAccepts,
   lineDiscount, orderSubtotal, orderDiscountTotal,
-  canTransition, assertTransition, buildOrderNumber,
+  canTransition, assertTransition, buildOrderNumber, statusChangeEntry, STATUS_HISTORY_MAX,
 } from '../../src/domain/entities.js';
 
 // ---------- helpers ----------
@@ -922,5 +922,24 @@ describe('marketplace: una sucursal por paquete, compra y carrito', () => {
     const priced = priceOrder({ mode: 'DELIVERY', store: s2, lines, at: AT });
     assert.equal(priced.deliveryFee, 55);
     assert.equal(priced.total, 155);
+  });
+});
+
+describe('statusChangeEntry (historial de estados)', () => {
+  test('registra estado, fecha, autor y rol; no es inferida', () => {
+    const at = new Date('2026-03-01T10:00:00Z');
+    assert.deepEqual(statusChangeEntry('CONFIRMED', { id: 'u1', role: 'STAFF' }, at), { status: 'CONFIRMED', at, byUserId: 'u1', byRole: 'STAFF', inferred: false });
+  });
+
+  test('sin actor deja autor y rol en null y usa la hora actual', () => {
+    const before = Date.now();
+    const e = statusChangeEntry('PENDING');
+    assert.equal(e.byUserId, null);
+    assert.equal(e.byRole, null);
+    assert.ok(e.at.getTime() >= before);
+  });
+
+  test('el tope cubre toda transición posible (a lo más un estado nuevo por transición)', () => {
+    assert.ok(STATUS_HISTORY_MAX >= ORDER_STATUSES.length);
   });
 });

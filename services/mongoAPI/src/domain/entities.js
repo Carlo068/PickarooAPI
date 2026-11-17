@@ -462,6 +462,17 @@ export function assertTransition(from, to, mode) {
   return true;
 }
 
+// ------------------------------------------------------------
+// Historial de estados: una entrada por transición, solo se agrega.
+// ------------------------------------------------------------
+// Hay ~7 estados y las transiciones no regresan: 20 es holgura, no un objetivo.
+export const STATUS_HISTORY_MAX = 20;
+
+// Entrada de una transición real. `actor` es el access de la sesión ({ id, role }).
+export function statusChangeEntry(status, actor, at = new Date()) {
+  return { status, at, byUserId: actor?.id ?? null, byRole: actor?.role ?? null, inferred: false };
+}
+
 // Número de orden legible para el mostrador: PK-<yyyymmdd>-<sufijo>
 export function buildOrderNumber(date = new Date(), suffix) {
   const ymd = date.toISOString().slice(0, 10).replace(/-/g, '');
