@@ -16,6 +16,8 @@ export const SEED_USERS = {
   MANAGER: { email: 'gerente@carnyfrut.mx', password: 'Manager1234' },
   STAFF: { email: 'empleado@carnyfrut.mx', password: 'Staff1234' },
   DELIVERY: { email: 'repartidor@carnyfrut.mx', password: 'Delivery1234' },
+  // Segundo repartidor de CARNYFRUT Centro (PIC-76): dos repartidores compiten por una orden.
+  DELIVERY2: { email: 'repartidor2@carnyfrut.mx', password: 'Delivery1234' },
   CUSTOMER: { email: 'cliente@demo.mx', password: 'Cliente1234' },
   // Frutería La Huerta: segundo negocio del seed (marketplace).
   HUERTA_MANAGER: { email: 'gerente@lahuerta.mx', password: 'Manager1234' },
@@ -130,11 +132,27 @@ export async function newCustomer() {
 export async function newUser(role) {
   const email = `it-${role.toLowerCase()}-${uid()}@pickaroo.test`;
   const password = 'Prueba1234';
+  const name = `${role} IT ${uid()}`;
   const { createUser } = await ok(`mutation($input: CreateUserInput!) { createUser(input: $input) { id role } }`, {
-    input: { name: `${role} IT ${uid()}`, email, password, role },
+    input: { name, email, password, role },
   }, await tokenOf('ADMIN'));
-  return { id: createUser.id, email, password };
+  return { id: createUser.id, email, password, name };
 }
+
+// Personal nuevo asignado a una sucursal (por omisión CARNYFRUT Centro), con su
+// sesión (el acceso se resuelve al iniciar sesión, después de asignarlo).
+export async function newStoreUser(role, storeId) {
+  const user = await newUser(role);
+  await ok('mutation($u: ID!, $s: ID!) { assignUserToStore(userId: $u, storeId: $s) { role } }', {
+    u: user.id, s: storeId ?? (await seedStore()).id,
+  }, await tokenOf('ADMIN'));
+  const { token } = await login(user.email, user.password);
+  return { ...user, token };
+}
+
+// Repartidor propio de una prueba: lleva una sola entrega a la vez, así que las
+// pruebas de reparto no comparten el del seed.
+export const newDriver = storeId => newStoreUser('DELIVERY', storeId);
 
 // ---------- Catálogo propio de cada prueba ----------
 // Marketplace: cada producto y paquete es de una sucursal. Por omisión, la del
@@ -209,6 +227,12 @@ export async function createOrder(customer, { items, mode = 'PICKUP', storeId, i
 }
 
 export const UPDATE_STATUS = `mutation($id: ID!, $status: OrderStatus!) { updateOrderStatus(id: $id, status: $status) { id status } }`;
+
+export const ACCEPT_DELIVERY = 'mutation($id: ID!) { acceptDelivery(orderId: $id) { id status driver { id name } assignedAt } }';
+
+export async function acceptDelivery(orderId, token) {
+  return (await ok(ACCEPT_DELIVERY, { id: orderId }, token)).acceptDelivery;
+}
 
 export async function moveOrder(orderId, statuses, token) {
   for (const status of statuses) {

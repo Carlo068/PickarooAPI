@@ -106,6 +106,16 @@ export const ERROR_CODES = {
   INVALID_STATUS_TRANSITION: { description: 'La transición de estado no está permitida.', fields: ['from', 'to'] },
   PICKUP_CANNOT_BE_DELIVERED: { description: 'Una orden de recogida (PICKUP) no puede salir a reparto.', fields: [] },
 
+  // ---------- Reparto ----------
+  ORDER_NOT_AVAILABLE: {
+    description: 'La orden no se puede aceptar ni liberar. `reason`: TAKEN (ya tiene repartidor), NOT_READY (aún no está lista), PICKED_UP (ya salió a reparto), NOT_DELIVERY (es de recogida), CANCELLED o DELIVERED.',
+    fields: ['orderId', 'reason'],
+  },
+  ALREADY_DELIVERING: {
+    description: 'El repartidor ya tiene una entrega activa (`activeOrderId`, READY o IN_DELIVERY asignada a él); solo puede llevar una a la vez.',
+    fields: ['activeOrderId'],
+  },
+
   // ---------- Roles y sucursales de usuarios ----------
   UNKNOWN_ROLE: { description: 'El rol indicado no existe.', fields: ['role'] },
   ROLE_GRAPH_NODE_NOT_FOUND: { description: 'El usuario o la sucursal no existen en el grafo de roles (Neo4j).', fields: ['userId', 'storeId?'] },
@@ -129,6 +139,9 @@ export const FORBIDDEN_REASONS = {
   STORE_NOT_ASSIGNED: 'La sucursal `storeId` no está asignada al usuario.',
   OWN_ORDERS_ONLY: 'Solo se pueden consultar las órdenes propias.',
   CANNOT_CHANGE_OWN_ROLE: 'Un usuario no puede cambiar su propio rol.',
+  NOT_ASSIGNED_DRIVER: 'La orden a domicilio tiene otro repartidor asignado: solo él (o ADMIN) la recoge y la entrega; liberarla pueden él, el personal de mostrador de la sucursal (orders:prepare) o ADMIN.',
+  NO_DRIVER_ASSIGNED: 'La orden a domicilio no tiene repartidor asignado: primero hay que aceptarla (acceptDelivery). Al reintentar releaseDelivery significa que ya se liberó.',
+  OWN_ORDER: 'Un repartidor no puede aceptar el reparto de una orden suya.',
 };
 
 export const isErrorCode = code => typeof code === 'string' && Object.hasOwn(ERROR_CODES, code);

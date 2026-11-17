@@ -13,6 +13,7 @@ import {
   assertPackageSameStore, linesStoreId, cartStoreId, assertCartAccepts,
   lineDiscount, orderSubtotal, orderDiscountTotal,
   canTransition, assertTransition, buildOrderNumber, statusChangeEntry, STATUS_HISTORY_MAX,
+  ACTIVE_DELIVERY_STATUSES, DELIVERY_UNAVAILABLE_REASONS, deliveryUnavailableReason, orderNotAvailableError,
 } from '../../src/domain/entities.js';
 
 // ---------- helpers ----------
@@ -732,6 +733,13 @@ describe('transiciones de estado (README: Estados permitidos)', () => {
           assert.throws(() => assertTransition(from, to, 'DELIVERY'), /ya está en estado/);
           assert.throws(() => assertTransition(from, to, 'PICKUP'), DomainError);
         });
+      } else if (allowed && from === 'READY' && to === 'DELIVERED') {
+        // PIC-76: una orden a domicilio pasa por IN_DELIVERY; READY -> DELIVERED es solo de recogida.
+        test(`assertTransition ${from} -> ${to}: solo para PICKUP`, () => {
+          assert.equal(assertTransition(from, to, 'PICKUP'), true);
+          assert.equal(assertTransition(from, to), true); // sin modo no se restringe
+          assert.throws(() => assertTransition(from, to, 'DELIVERY'), e => e.extensions.code === 'INVALID_STATUS_TRANSITION');
+        });
       } else if (allowed && to === 'IN_DELIVERY') {
         test(`assertTransition ${from} -> ${to}: solo para DELIVERY`, () => {
           assert.equal(assertTransition(from, to, 'DELIVERY'), true);
@@ -760,15 +768,60 @@ describe('transiciones de estado (README: Estados permitidos)', () => {
     assert.equal(canTransition('BOGUS', 'CONFIRMED'), false);
     throwsDomain(() => assertTransition('BOGUS', 'CONFIRMED', 'DELIVERY'));
   });
-  test('READY -> DELIVERED vale para PICKUP y DELIVERY (la tabla no distingue)', () => {
+  test('READY -> DELIVERED vale para PICKUP; en DELIVERY se entrega desde IN_DELIVERY', () => {
     assert.equal(assertTransition('READY', 'DELIVERED', 'PICKUP'), true);
-    assert.equal(assertTransition('READY', 'DELIVERED', 'DELIVERY'), true);
+    throwsDomain(() => assertTransition('READY', 'DELIVERED', 'DELIVERY'), 'INVALID_STATUS_TRANSITION');
+    assert.equal(assertTransition('IN_DELIVERY', 'DELIVERED', 'DELIVERY'), true);
   });
   test('DELIVERED y CANCELLED son terminales', () => {
     for (const to of ORDER_STATUSES) {
       assert.equal(canTransition('DELIVERED', to), false);
       assert.equal(canTransition('CANCELLED', to), false);
     }
+  });
+});
+
+describe('reparto: deliveryUnavailableReason (PIC-76)', () => {
+  const order = (over = {}) => ({ _id: 'O1', number: 'PK-1', mode: 'DELIVERY', status: 'READY', driverId: null, ...over });
+
+  test('libre: DELIVERY, READY y sin repartidor (null o ausente)', () => {
+    assert.equal(deliveryUnavailableReason(order()), null);
+    const { driverId: _omit, ...missing } = order();
+    assert.equal(deliveryUnavailableReason(missing), null);
+  });
+  test('TAKEN: READY con repartidor', () => {
+    assert.equal(deliveryUnavailableReason(order({ driverId: 'd1' })), 'TAKEN');
+  });
+  test('NOT_READY: antes de READY', () => {
+    for (const status of ['PENDING', 'CONFIRMED', 'PREPARING']) assert.equal(deliveryUnavailableReason(order({ status })), 'NOT_READY', status);
+  });
+  test('PICKED_UP: ya salió a reparto, con o sin repartidor (ADMIN sin asignar)', () => {
+    assert.equal(deliveryUnavailableReason(order({ status: 'IN_DELIVERY', driverId: 'd1' })), 'PICKED_UP');
+    assert.equal(deliveryUnavailableReason(order({ status: 'IN_DELIVERY' })), 'PICKED_UP');
+  });
+  test('CANCELLED y DELIVERED ganan sobre el repartidor', () => {
+    assert.equal(deliveryUnavailableReason(order({ status: 'CANCELLED', driverId: 'd1' })), 'CANCELLED');
+    assert.equal(deliveryUnavailableReason(order({ status: 'DELIVERED', driverId: 'd1' })), 'DELIVERED');
+  });
+  test('NOT_DELIVERY: una orden PICKUP nunca está disponible, en ningún estado', () => {
+    for (const status of ORDER_STATUSES) assert.equal(deliveryUnavailableReason(order({ mode: 'PICKUP', status })), 'NOT_DELIVERY', status);
+  });
+  test('toda razón devuelta es del catálogo; los estados activos son READY e IN_DELIVERY', () => {
+    for (const mode of ORDER_MODES) {
+      for (const status of ORDER_STATUSES) {
+        for (const driverId of [null, 'd1']) {
+          const reason = deliveryUnavailableReason(order({ mode, status, driverId }));
+          assert.ok(reason === null || DELIVERY_UNAVAILABLE_REASONS.includes(reason), `${mode} ${status} ${driverId}: ${reason}`);
+        }
+      }
+    }
+    assert.deepEqual(ACTIVE_DELIVERY_STATUSES, ['READY', 'IN_DELIVERY']);
+  });
+  test('orderNotAvailableError: ORDER_NOT_AVAILABLE con orderId (cadena) y reason', () => {
+    const e = orderNotAvailableError(order({ driverId: 'd1' }));
+    assert.ok(e instanceof DomainError);
+    assert.deepEqual(e.extensions, { code: 'ORDER_NOT_AVAILABLE', orderId: 'O1', reason: 'TAKEN' });
+    assert.deepEqual(orderNotAvailableError({ id: 7, status: 'READY' }, 'NOT_READY').extensions, { code: 'ORDER_NOT_AVAILABLE', orderId: '7', reason: 'NOT_READY' });
   });
 });
 

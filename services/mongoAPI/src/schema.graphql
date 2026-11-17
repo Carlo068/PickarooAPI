@@ -170,6 +170,12 @@ type OrderItem {
   contents: [PackageItem!]!
 }
 
+"Quién hizo un cambio de estado: solo id y nombre (ni correo ni direcciones)."
+type OrderActor {
+  id: ID!
+  name: String!
+}
+
 "Un cambio de estado de la orden."
 type OrderStatusChange {
   "Estado al que pasó la orden."
@@ -177,10 +183,16 @@ type OrderStatusChange {
   at: DateTime!
   "Rol de quien lo hizo. Null en entradas inferidas."
   byRole: UserRole
-  "Quien lo hizo. Solo lo ven quienes no son el cliente de la orden (personal de la sucursal, ADMIN); para el cliente es null."
-  by: User
+  "Quien lo hizo (id y nombre). Solo lo ven quienes no son el cliente de la orden (personal de la sucursal, su repartidor, ADMIN); para el cliente es null."
+  by: OrderActor
   "true: la entrada se reconstruyó de las fechas de la orden (anterior al historial); no tiene autor."
   inferred: Boolean!
+}
+
+"Repartidor de una orden: solo id y nombre (el cliente no ve su correo ni su rol)."
+type OrderDriver {
+  id: ID!
+  name: String!
 }
 
 type Order @key(fields: "id") {
@@ -191,6 +203,10 @@ type Order @key(fields: "id") {
   store: Store!
   deliveryAddress: Location
   status: OrderStatus!
+  "Repartidor que aceptó la orden (acceptDelivery). Null si nadie la ha aceptado o se liberó; se conserva al entregarla o cancelarla."
+  driver: OrderDriver
+  "Cuándo la aceptó su repartidor actual."
+  assignedAt: DateTime
   "Cambios de estado, del más antiguo al más reciente. Lo lee quien puede ver la orden."
   statusHistory: [OrderStatusChange!]!
   items: [OrderItem!]!
@@ -557,10 +573,17 @@ type Query {
   users(limit: Int = 20, offset: Int = 0): [User!]!
   user(id: ID!): User
 
-  "Cliente: las suyas. Personal: las de sus sucursales (repartidor: solo DELIVERY). ADMIN: todas."
+  "Cliente: las suyas. Personal: las de sus sucursales (repartidor: las disponibles para aceptar más las asignadas a él). ADMIN: todas."
   orders(userId: ID, storeId: ID, status: OrderStatus, limit: Int = 20, offset: Int = 0): [Order!]!
   order(id: ID!): Order
   orderByNumber(number: String!): Order
+
+  "Órdenes DELIVERY en READY sin repartidor de las sucursales del alcance (orders:deliver; ADMIN: todas), la más antigua primero."
+  availableDeliveries(storeId: ID, limit: Int = 20, offset: Int = 0): [Order!]!
+  "Entregas del repartidor autenticado (orders:deliver). active: true, la activa (READY o IN_DELIVERY asignada a él); false, las entregadas y canceladas, la más reciente primero."
+  myDeliveries(active: Boolean = false, limit: Int = 20, offset: Int = 0): [Order!]!
+  "La entrega activa del repartidor autenticado, o null (orders:deliver)."
+  currentDelivery: Order
 
   shoppingLists(userId: ID!): [ShoppingList!]!
   shoppingList(id: ID!): ShoppingList
@@ -625,8 +648,13 @@ type Mutation {
   removeFromCart(productId: ID, packageId: ID): Cart!
   clearCart: Boolean!
   checkoutCart(input: CheckoutCartInput!): Order!
+  "Pasos de reparto de una orden DELIVERY (READY → IN_DELIVERY → DELIVERED, sin saltarse IN_DELIVERY): su repartidor asignado o ADMIN; sin repartidor nadie la saca a reparto (FORBIDDEN NOT_ASSIGNED_DRIVER / NO_DRIVER_ASSIGNED)."
   updateOrderStatus(id: ID!, status: OrderStatus!): Order!
   cancelOrder(id: ID!): Order!
+  "El repartidor toma una orden DELIVERY en READY sin repartidor de su sucursal (orders:deliver), que no sea suya (OWN_ORDER). Atómico: si otro la tomó, ORDER_NOT_AVAILABLE; si ya lleva otra, ALREADY_DELIVERING."
+  acceptDelivery(orderId: ID!): Order!
+  "Devuelve a la lista de disponibles una orden aceptada que sigue en READY: su repartidor, el personal de mostrador de la sucursal (orders:prepare) o ADMIN."
+  releaseDelivery(orderId: ID!): Order!
 
   createShoppingList(input: ShoppingListInput!): ShoppingList!
   "Agrega (o suma cantidad a) un producto O un paquete."

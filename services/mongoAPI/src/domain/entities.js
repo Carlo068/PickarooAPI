@@ -457,10 +457,41 @@ export function assertTransition(from, to, mode) {
   if (!ORDER_STATUSES.includes(to)) throw new DomainError(`Estado inválido: ${to}.`, 'INVALID_ORDER_STATUS', { status: to ?? null });
   if (from === to) throw new DomainError(`La orden ya está en estado ${to}.`, 'ORDER_ALREADY_IN_STATUS', { status: to });
   if (!canTransition(from, to)) throw new DomainError(`Transición no permitida: ${from} -> ${to}.`, 'INVALID_STATUS_TRANSITION', { from: from ?? null, to });
+  // Una orden a domicilio se entrega desde el reparto: READY → IN_DELIVERY → DELIVERED.
+  if (from === 'READY' && to === 'DELIVERED' && mode === 'DELIVERY') {
+    throw new DomainError('Una orden a domicilio pasa por IN_DELIVERY antes de entregarse.', 'INVALID_STATUS_TRANSITION', { from, to });
+  }
   // Una orden de recogida se entrega en mostrador: nunca sale a reparto.
   if (to === 'IN_DELIVERY' && mode && mode !== 'DELIVERY') throw new DomainError('Una orden de recogida (PICKUP) no sale a reparto.', 'PICKUP_CANNOT_BE_DELIVERED');
   return true;
 }
+
+// ------------------------------------------------------------
+// Reparto: asignación de la orden a un repartidor
+// ------------------------------------------------------------
+// Una orden asignada en estos estados es la entrega activa de su repartidor
+// (máximo una por repartidor: índice único parcial en models/order.js).
+export const ACTIVE_DELIVERY_STATUSES = ['READY', 'IN_DELIVERY'];
+
+// Por qué una orden no está libre para aceptarla (extensions.reason de ORDER_NOT_AVAILABLE).
+export const DELIVERY_UNAVAILABLE_REASONS = ['TAKEN', 'NOT_READY', 'PICKED_UP', 'NOT_DELIVERY', 'CANCELLED', 'DELIVERED'];
+
+// null si la orden se puede aceptar: DELIVERY, READY y sin repartidor.
+export function deliveryUnavailableReason(order) {
+  if (order.mode !== 'DELIVERY') return 'NOT_DELIVERY';
+  if (order.status === 'CANCELLED') return 'CANCELLED';
+  if (order.status === 'DELIVERED') return 'DELIVERED';
+  if (order.status === 'IN_DELIVERY') return 'PICKED_UP';
+  if (order.status !== 'READY') return 'NOT_READY';
+  if (order.driverId != null) return 'TAKEN';
+  return null;
+}
+
+export const orderNotAvailableError = (order, reason = deliveryUnavailableReason(order)) => new DomainError(
+  `La orden ${order.number ?? order._id ?? order.id} no está disponible para reparto (${reason}).`,
+  'ORDER_NOT_AVAILABLE',
+  { orderId: String(order._id ?? order.id), reason },
+);
 
 // ------------------------------------------------------------
 // Historial de estados: una entrada por transición, solo se agrega.

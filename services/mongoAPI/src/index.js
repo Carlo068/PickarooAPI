@@ -9,6 +9,7 @@ import { GraphQLScalarType, Kind, parse } from 'graphql';
 import mongoose from 'mongoose';
 
 import { User, Category, Product, Package, Store, Order, ShoppingList, models } from './infrastructure/models/index.js';
+import { ONE_ACTIVE_DELIVERY_INDEX } from './infrastructure/models/order.js';
 import {
   Product as ProductEntity,
   Package as PackageEntity,
@@ -23,6 +24,9 @@ import {
   assertTransition,
   statusChangeEntry,
   STATUS_HISTORY_MAX,
+  ACTIVE_DELIVERY_STATUSES,
+  deliveryUnavailableReason,
+  orderNotAvailableError,
   assertPackagePersistable,
   assertPackageSameStore,
   assertQuoteStillValid,
@@ -47,7 +51,8 @@ import { initEvents, emitEvent, diff, auditPlugin, CATEGORIES } from './infrastr
 import { runMigrations } from './infrastructure/migrations.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
 import {
-  PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus, canSeeStatusActor,
+  PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, orderStatusDenial, canSeeStatusActor,
+  acceptDeliveryDenial, releaseDeliveryDenial,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from './domain/access.js';
 
@@ -61,6 +66,20 @@ const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/pickarood
 await mongoose.connect(mongoUri);
 console.log('✅ MongoDB (pickaroodb) conectado.');
 await Promise.all(models.map(m => m.syncIndexes().catch(err => console.warn(`Índices de ${m.modelName}:`, err.message))));
+// Una entrega activa por repartidor depende de este índice (models/order.js). Si no
+// se pudo crear (p. ej. datos que ya lo violan), la API sigue, pero hay que verlo:
+// acceptDelivery conserva una comprobación previa, que no protege ante aceptaciones simultáneas.
+if (!(await Order.collection.indexExists(ONE_ACTIVE_DELIVERY_INDEX).catch(() => false))) {
+  console.error([
+    '',
+    `🚨🚨🚨 ÍNDICE AUSENTE: orders.${ONE_ACTIVE_DELIVERY_INDEX} 🚨🚨🚨`,
+    'No se pudo crear el índice único que garantiza UNA entrega activa por repartidor.',
+    'Dos aceptaciones simultáneas del mismo repartidor podrían quedar escritas.',
+    'Revisa el aviso "Índices de Order" de arriba, corrige los pedidos READY / IN_DELIVERY',
+    'con el mismo driverId y reinicia mongoAPI.',
+    '',
+  ].join('\n'));
+}
 // Migraciones de datos (idempotentes), antes del seed. También: npm run migrate.
 await runMigrations().catch(err => console.error('⚠️  Migración de datos fallida:', err.message));
 
@@ -121,8 +140,9 @@ function viewableOrder(ctx, order) {
   return order;
 }
 
-// Qué órdenes ve quien consulta: un cliente las suyas; el personal las de sus
-// sucursales (el repartidor solo las de reparto); scope:all_stores todas.
+// Qué órdenes ve quien consulta: un cliente las suyas; el personal de mostrador
+// las de sus sucursales; el repartidor las disponibles para aceptar de sus
+// sucursales más las asignadas a él; scope:all_stores todas.
 function ordersFilter(me, { userId, storeId }) {
   if (userId && String(userId) === String(me.id)) return { userId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) };
 
@@ -134,10 +154,15 @@ function ordersFilter(me, { userId, storeId }) {
   const delivers = hasPermission(me, PERMISSIONS.ORDERS_DELIVER);
   if (prepares || delivers) {
     if (storeId && !inStoreScope(me, storeId)) throw forbidden('Esa sucursal no está asignada a tu usuario.', 'STORE_NOT_ASSIGNED', { storeId: String(storeId) });
+    const stores = storeId ? oid(storeId) : { $in: me.storeIds.map(oid) };
+    const customer = userId ? { userId: oid(userId) } : {};
+    if (prepares) return { storeId: stores, ...customer };
     return {
-      storeId: storeId ? oid(storeId) : { $in: me.storeIds.map(oid) },
-      ...(userId ? { userId: oid(userId) } : {}),
-      ...(prepares ? {} : { mode: 'DELIVERY' }),
+      ...customer,
+      $or: [
+        { storeId: stores, mode: 'DELIVERY', status: 'READY', driverId: null },
+        { driverId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) },
+      ],
     };
   }
 
@@ -157,6 +182,20 @@ function catalogEvent(ctx, type, targetType, doc, reason, metadata = {}) {
 function deny(denial) {
   if (denial.reason === 'STORE_NOT_ASSIGNED') throw forbidden('Esa sucursal no está asignada a tu usuario.', 'STORE_NOT_ASSIGNED', { storeId: denial.storeId });
   throw forbidden(`Se requiere el permiso "${denial.permission}".`, 'PERMISSION_REQUIRED', { permission: denial.permission });
+}
+
+// FORBIDDEN de un cambio de estado o de una entrega (orderStatusDenial,
+// acceptDeliveryDenial, releaseDeliveryDenial). `cancel`: la denegación genérica es ORDER_CANCEL_DENIED.
+function denyOrder(denial, { cancel = false } = {}) {
+  const status = denial.status ? { status: denial.status } : {};
+  if (denial.reason === 'NOT_ASSIGNED_DRIVER') throw forbidden('La orden tiene otro repartidor asignado.', 'NOT_ASSIGNED_DRIVER', status);
+  if (denial.reason === 'NO_DRIVER_ASSIGNED') throw forbidden('La orden aún no tiene repartidor: primero hay que aceptarla.', 'NO_DRIVER_ASSIGNED', status);
+  if (denial.reason === 'OWN_ORDER') throw forbidden('No puedes repartir una orden tuya.', 'OWN_ORDER');
+  if (denial.reason === 'ORDER_STATUS_CHANGE_DENIED') {
+    if (cancel) throw forbidden('No tienes permiso para cancelar esta orden.', 'ORDER_CANCEL_DENIED');
+    throw forbidden(`No tienes permiso para pasar esta orden a ${denial.status}.`, 'ORDER_STATUS_CHANGE_DENIED', status);
+  }
+  deny(denial); // PERMISSION_REQUIRED, STORE_NOT_ASSIGNED
 }
 
 // catalog:manage o stock:manage sobre los artículos de la sucursal `storeId`.
@@ -535,12 +574,14 @@ const DateTime = new GraphQLScalarType({
 // ------------------------------------------------------------
 const authResolvers = createAuthResolvers(redisClient); // sesión, acceso (Neo4j) y administración de roles
 
-// Cambia el estado de una orden (valida la transición y repone stock al cancelar).
-// El cambio y su entrada en statusHistory son UNA escritura atómica condicionada
-// al estado que se validó: si otra petición movió la orden en medio, no escribe
-// nada, se relee y se vuelve a validar contra el estado real (el perdedor recibe
-// ORDER_ALREADY_IN_STATUS / INVALID_STATUS_TRANSITION, o se aplica si sigue siendo
-// válido). Así nunca hay una transición sin entrada ni una entrada sin transición.
+// Cambia el estado de una orden (valida quién puede y la transición, y repone
+// stock al cancelar). El cambio y su entrada en statusHistory son UNA escritura
+// atómica condicionada al estado y al repartidor que se validaron: si otra
+// petición movió la orden, la aceptó o la liberó en medio, no escribe nada, se
+// relee y se vuelve a validar contra la orden real, permiso y repartidor
+// incluidos (el perdedor recibe ORDER_ALREADY_IN_STATUS, INVALID_STATUS_TRANSITION
+// o NOT_ASSIGNED_DRIVER, o se aplica si sigue siendo válido). Así nunca hay una
+// transición sin entrada ni una entrada sin transición.
 // Actualización con pipeline (Mongoose no castea aquí: ids como ObjectId y fechas como Date).
 // Si el historial está vacío, ausente o no empieza en PENDING (la migración no corrió),
 // antepone el PENDING inferido; luego agrega la entrada nueva y conserva solo las últimas
@@ -562,14 +603,17 @@ function statusChangeUpdate(status, actor) {
   }];
 }
 
-async function changeOrderStatus(order, status, ctx) {
+async function changeOrderStatus(order, status, ctx, { cancel = false } = {}) {
   const actor = ctx.currentUser;
-  // Cada reintento significa que el estado avanzó, y las transiciones no regresan: termina.
+  // Cada reintento significa que el estado avanzó (las transiciones no regresan)
+  // o que cambió el repartidor de una orden READY: termina.
   for (;;) {
+    const denial = orderStatusDenial(actor, order, status);
+    if (denial) denyOrder(denial, { cancel });
     assertTransition(order.status, status, order.mode);
     const previous = order.status;
     const updated = await Order.findOneAndUpdate(
-      { _id: order._id, status: previous },
+      { _id: order._id, status: previous, driverId: order.driverId ?? null },
       statusChangeUpdate(status, actor),
       { returnDocument: 'after' },
     );
@@ -589,6 +633,97 @@ async function finishStatusChange(order, previous, status, ctx) {
     metadata: { number: order.number, from: previous, to: status, storeId: String(order.storeId), mode: order.mode },
   }, ctx);
   return order;
+}
+
+// ---------- Reparto: aceptar y liberar una entrega ----------
+// Aceptar no cambia el estado (la orden sigue READY): statusHistory no registra
+// nada; la asignación se lee en Order.driver y Order.assignedAt.
+async function loadOrder(orderId) {
+  const order = mongoose.isValidObjectId(orderId) ? await Order.findById(orderId) : null;
+  if (!order) throw notFound('ORDER', orderId);
+  return order;
+}
+
+// Una entrega activa por repartidor: el índice único parcial
+// `one_active_delivery_per_driver` (models/order.js) rechaza con E11000 la
+// escritura que le daría una segunda orden READY / IN_DELIVERY.
+const isActiveDeliveryClash = err => err?.code === 11000 && Object.hasOwn(err.keyPattern ?? {}, 'driverId');
+const activeDeliveryOf = driverId => Order.findOne({ driverId: oid(driverId), status: { $in: ACTIVE_DELIVERY_STATUSES } }).select('_id');
+const alreadyDelivering = activeId => new DomainError('Ya tienes una entrega activa: termínala o libérala antes de aceptar otra.', 'ALREADY_DELIVERING', {
+  activeOrderId: activeId == null ? null : String(activeId),
+});
+
+function deliveryEvent(type, order, driverId, ctx) {
+  emitEvent({
+    type, category: CATEGORIES.ORDER, targetType: 'Order', targetId: order._id,
+    reason: `Orden ${order.number}`,
+    metadata: { number: order.number, storeId: String(order.storeId), driverId: String(driverId) },
+  }, ctx);
+}
+
+// Una sola escritura condicionada a que la orden siga libre ({ READY, DELIVERY,
+// driverId: null }): de dos aceptaciones simultáneas solo una la encuentra así.
+// Si nada coincide se relee para decir por qué (ORDER_NOT_AVAILABLE + reason).
+async function acceptDelivery(orderId, ctx) {
+  const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
+  let order = await loadOrder(orderId);
+  const denial = acceptDeliveryDenial(me, order);
+  if (denial) denyOrder(denial);
+  for (let clashes = 0; ;) {
+    // Defensa en profundidad: si el índice único faltara, esto aún impide una
+    // segunda entrega activa en serie (ante aceptaciones simultáneas, solo el índice).
+    const active = await activeDeliveryOf(me.id);
+    if (active && !sameId(active._id, order._id)) throw alreadyDelivering(active._id);
+    let updated;
+    try {
+      updated = await Order.findOneAndUpdate(
+        { _id: order._id, mode: 'DELIVERY', status: 'READY', driverId: null },
+        { $set: { driverId: oid(me.id), assignedAt: new Date() }, $inc: { __v: 1 } },
+        { returnDocument: 'after' },
+      );
+    } catch (err) {
+      if (!isActiveDeliveryClash(err)) throw err;
+      const holding = await activeDeliveryOf(me.id);
+      // La entrega activa terminó entre el choque y la consulta: se reintenta una vez.
+      if (!holding && (clashes += 1) < 2) continue;
+      throw alreadyDelivering(holding?._id);
+    }
+    if (updated) {
+      deliveryEvent('DELIVERY_ACCEPTED', updated, me.id, ctx);
+      return updated;
+    }
+    order = await loadOrder(order._id);
+    // El mismo repartidor la reintenta (p. ej. tras un corte de red): ya es suya.
+    if (order.status === 'READY' && sameId(order.driverId, me.id)) return order;
+    const reason = deliveryUnavailableReason(order);
+    if (reason) throw orderNotAvailableError(order, reason);
+    // Se liberó entre la escritura y la relectura: se intenta de nuevo.
+  }
+}
+
+// Solo mientras sigue READY. Condicionada al repartidor que se validó: si en medio
+// otro la liberó y la tomó, se relee y se vuelve a validar quién puede liberarla.
+async function releaseDelivery(orderId, ctx) {
+  const me = requireAuth(ctx);
+  let order = await loadOrder(orderId);
+  for (;;) {
+    const denial = releaseDeliveryDenial(me, order);
+    if (denial) denyOrder(denial);
+    const reason = deliveryUnavailableReason(order);
+    if (reason && reason !== 'TAKEN') throw orderNotAvailableError(order, reason);
+    if (order.driverId == null) return order; // ya estaba libre
+    const { driverId } = order;
+    const updated = await Order.findOneAndUpdate(
+      { _id: order._id, status: 'READY', driverId },
+      { $set: { driverId: null, assignedAt: null }, $inc: { __v: 1 } },
+      { returnDocument: 'after' },
+    );
+    if (updated) {
+      deliveryEvent('DELIVERY_RELEASED', updated, driverId, ctx);
+      return updated;
+    }
+    order = await loadOrder(order._id);
+  }
 }
 
 const resolvers = {
@@ -664,11 +799,20 @@ const resolvers = {
     discountTotal: o => orderDiscountTotal(o.items),
     // Más antiguo primero. `order` viaja con cada entrada para decidir quién ve `by`.
     statusHistory: o => (o.statusHistory ?? []).map(h => ({ ...h.toObject(), order: o })),
+    // Solo id y nombre: el cliente no ve el correo ni el rol del repartidor.
+    driver: async o => {
+      const user = o.driverId ? await getUser(o.driverId) : null;
+      return user ? { id: user.id, name: user.name } : null;
+    },
   },
 
   OrderStatusChange: {
     // El cliente ve el rol, no quién fue; el personal de la sucursal y ADMIN, sí.
-    by: (h, _, ctx) => (h.byUserId && canSeeStatusActor(ctx.currentUser, h.order) ? getUser(h.byUserId) : null),
+    // Solo id y nombre (OrderActor): ni correo ni direcciones del empleado o repartidor.
+    by: async (h, _, ctx) => {
+      const user = h.byUserId && canSeeStatusActor(ctx.currentUser, h.order) ? await getUser(h.byUserId) : null;
+      return user ? { id: user.id, name: user.name } : null;
+    },
   },
 
   ShoppingListItem: {
@@ -729,6 +873,28 @@ const resolvers = {
     },
     order: async (_, { id }, ctx) => viewableOrder(ctx, await Order.findById(id).exec()),
     orderByNumber: async (_, { number }, ctx) => viewableOrder(ctx, await Order.findOne({ number }).exec()),
+
+    // ---------- Reparto (orders:deliver) ----------
+    // Mismo alcance que los reportes: con storeId esa sucursal (si es del alcance); sin él, las del alcance (ADMIN: todas).
+    availableDeliveries: (_, { storeId, limit, offset }, ctx) => {
+      const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
+      const scope = reportStoreScope(me, storeId);
+      if (scope.denied) deny(scope.denied);
+      const stores = scope.storeIds == null ? {} : { storeId: { $in: scope.storeIds.filter(id => mongoose.isValidObjectId(id)).map(oid) } };
+      return Order.find({ ...stores, mode: 'DELIVERY', status: 'READY', driverId: null })
+        .sort({ createdAt: 1, _id: 1 }).skip(offset).limit(Math.min(limit, 100)).exec();
+    },
+    // active: la entrega en curso; si no, el historial (entregadas y canceladas), la más reciente primero.
+    myDeliveries: (_, { active, limit, offset }, ctx) => {
+      const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
+      const status = active ? ACTIVE_DELIVERY_STATUSES : ['DELIVERED', 'CANCELLED'];
+      return Order.find({ driverId: oid(me.id), status: { $in: status } })
+        .sort({ updatedAt: -1, _id: -1 }).skip(offset).limit(Math.min(limit, 100)).exec();
+    },
+    currentDelivery: (_, __, ctx) => {
+      const me = requirePermission(ctx, PERMISSIONS.ORDERS_DELIVER);
+      return Order.findOne({ driverId: oid(me.id), status: { $in: ACTIVE_DELIVERY_STATUSES } }).exec();
+    },
 
     shoppingLists: (_, { userId }, ctx) => {
       requireSelfOrPermission(ctx, userId);
@@ -1068,23 +1234,27 @@ const resolvers = {
     },
 
     // El personal mueve las órdenes de SUS sucursales: orders:prepare (confirmar,
-    // preparar, lista, entregar en mostrador, cancelar) u orders:deliver (reparto).
+    // preparar, lista, entregar en mostrador, cancelar) u orders:deliver (reparto:
+    // solo el repartidor asignado, o ADMIN). El permiso se valida en changeOrderStatus.
     updateOrderStatus: async (_, { id, status }, ctx) => {
-      const me = requireAuth(ctx);
+      requireAuth(ctx);
       const order = await Order.findById(id);
       if (!order) throw notFound('ORDER', id);
-      if (!canChangeOrderStatus(me, order, status)) throw forbidden(`No tienes permiso para pasar esta orden a ${status}.`, 'ORDER_STATUS_CHANGE_DENIED', { status });
       return changeOrderStatus(order, status, ctx);
     },
 
-    // El cliente cancela la suya (si el estado lo permite); el personal, las de su sucursal.
+    // El cliente cancela la suya (si el estado lo permite); el personal, las de su
+    // sucursal. Cancelar una orden asignada conserva su driverId como historia.
     cancelOrder: async (_, { id }, ctx) => {
-      const me = requireAuth(ctx);
+      requireAuth(ctx);
       const order = await Order.findById(id);
       if (!order) throw notFound('ORDER', id);
-      if (!canChangeOrderStatus(me, order, 'CANCELLED')) throw forbidden('No tienes permiso para cancelar esta orden.', 'ORDER_CANCEL_DENIED');
-      return changeOrderStatus(order, 'CANCELLED', ctx);
+      return changeOrderStatus(order, 'CANCELLED', ctx, { cancel: true });
     },
+
+    // ---------- Reparto ----------
+    acceptDelivery: (_, { orderId }, ctx) => acceptDelivery(orderId, ctx),
+    releaseDelivery: (_, { orderId }, ctx) => releaseDelivery(orderId, ctx),
 
     // ---------- Listas guardadas ----------
     createShoppingList: async (_, { input }, ctx) => {

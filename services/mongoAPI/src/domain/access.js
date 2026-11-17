@@ -26,7 +26,7 @@ const P = PERMISSIONS;
 
 export const PERMISSION_CATALOG = [
   { name: P.ORDERS_PREPARE, description: 'Confirmar, preparar, marcar listas y cancelar órdenes de su sucursal; entregar las de recogida.' },
-  { name: P.ORDERS_DELIVER, description: 'Llevar a domicilio y marcar como entregadas las órdenes DELIVERY de su sucursal.' },
+  { name: P.ORDERS_DELIVER, description: 'Aceptar las órdenes DELIVERY listas de su sucursal y llevar y marcar como entregadas las asignadas a él (una a la vez).' },
   { name: P.STOCK_MANAGE, description: 'Ajustar el inventario de los productos de sus sucursales.' },
   { name: P.CATALOG_MANAGE, description: 'Crear y editar productos, paquetes y descuentos de sus sucursales (categorías: además scope:all_stores).' },
   { name: P.REPORTS_VIEW, description: 'Consultar los reportes de ventas y demanda de sus sucursales.' },
@@ -135,17 +135,83 @@ export function requiredOrderPermission(order, to) {
   return P.ORDERS_PREPARE; // CONFIRMED, PREPARING, READY, CANCELLED
 }
 
-export function canChangeOrderStatus(access, order, to) {
-  if (to === 'CANCELLED' && isOwner(access, order)) return true; // el cliente cancela la suya
-  return inStoreScope(access, order.storeId) && hasPermission(access, requiredOrderPermission(order, to));
+// ------------------------------------------------------------
+// Reparto: la orden DELIVERY la lleva su repartidor asignado (order.driverId)
+// ------------------------------------------------------------
+export const isAssignedDriver = (access, order) =>
+  access?.id != null && order.driverId != null && String(access.id) === String(order.driverId);
+
+// El repartidor asignado que sigue siendo repartidor (orders:deliver). No exige la
+// sucursal: si lo cambian de sucursal con una entrega en curso, la puede terminar.
+// Si deja de ser repartidor (p. ej. vuelve a CUSTOMER), ya no ve ni mueve la orden.
+const isActingDriver = (access, order) => isAssignedDriver(access, order) && hasPermission(access, P.ORDERS_DELIVER);
+
+// ADMIN reparte en cualquier sucursal sin estar asignado (orders:deliver + scope:all_stores).
+const deliversAnywhere = access => hasPermission(access, P.ORDERS_DELIVER) && hasPermission(access, P.ALL_STORES);
+
+// Recogerla (READY → IN_DELIVERY) y entregarla (IN_DELIVERY → DELIVERED) en una
+// orden a domicilio. READY → DELIVERED no es un paso de la ruta: en DELIVERY lo
+// rechaza assertTransition (INVALID_STATUS_TRANSITION).
+const isRouteStep = (order, to) =>
+  order.mode === 'DELIVERY' && (to === 'IN_DELIVERY' || (to === 'DELIVERED' && order.status === 'IN_DELIVERY'));
+
+// Lista para que un repartidor la acepte: DELIVERY, READY y sin repartidor.
+const isOpenDelivery = order => order.mode === 'DELIVERY' && order.status === 'READY' && order.driverId == null;
+
+// Personal que opera órdenes en esa sucursal (mostrador o reparto).
+const isStoreCrew = (access, storeId) =>
+  inStoreScope(access, storeId) && (hasPermission(access, P.ORDERS_PREPARE) || hasPermission(access, P.ORDERS_DELIVER));
+
+// null si puede pasar la orden a `to`; si no, { reason, status } (una razón de FORBIDDEN_REASONS).
+// Los pasos de la ruta de una orden DELIVERY son de su repartidor asignado. Invariante:
+// una orden IN_DELIVERY siempre tiene repartidor, así que recogerla sin repartidor
+// es NO_DRIVER_ASSIGNED para todos, ADMIN incluido (ADMIN la acepta primero). ADMIN sí
+// puede recoger o entregar la de otro repartidor, y entregar una IN_DELIVERY sin
+// repartidor anterior a esta regla. El resto del personal de la sucursal recibe
+// NOT_ASSIGNED_DRIVER (o NO_DRIVER_ASSIGNED); quien no es de la sucursal no se entera.
+export function orderStatusDenial(access, order, to) {
+  if (to === 'CANCELLED' && isOwner(access, order)) return null; // el cliente cancela la suya
+  if (isRouteStep(order, to)) {
+    if (isActingDriver(access, order)) return null;
+    if (!isStoreCrew(access, order.storeId)) return { reason: 'ORDER_STATUS_CHANGE_DENIED', status: to };
+    if (deliversAnywhere(access) && (order.driverId != null || to === 'DELIVERED')) return null;
+    return { reason: order.driverId == null ? 'NO_DRIVER_ASSIGNED' : 'NOT_ASSIGNED_DRIVER', status: to };
+  }
+  if (inStoreScope(access, order.storeId) && hasPermission(access, requiredOrderPermission(order, to))) return null;
+  return { reason: 'ORDER_STATUS_CHANGE_DENIED', status: to };
 }
 
-// Personal de la sucursal: ve las órdenes que puede operar.
+export const canChangeOrderStatus = (access, order, to) => orderStatusDenial(access, order, to) === null;
+
+// Aceptar una entrega: orders:deliver en la sucursal de la orden, y que no sea
+// una orden propia (nadie se reparte a sí mismo).
+export function acceptDeliveryDenial(access, order) {
+  if (!hasPermission(access, P.ORDERS_DELIVER)) return { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER };
+  if (!inStoreScope(access, order.storeId)) return { reason: 'STORE_NOT_ASSIGNED', storeId: order.storeId == null ? null : String(order.storeId) };
+  if (isOwner(access, order)) return { reason: 'OWN_ORDER' };
+  return null;
+}
+
+// Liberar una entrega: su repartidor asignado (si sigue siendo repartidor), el
+// personal de mostrador de la sucursal (orders:prepare) o ADMIN. Otro repartidor:
+// NOT_ASSIGNED_DRIVER, o NO_DRIVER_ASSIGNED si ya está libre.
+export function releaseDeliveryDenial(access, order) {
+  if (isActingDriver(access, order)) return null;
+  const prepares = hasPermission(access, P.ORDERS_PREPARE);
+  if (!prepares && !hasPermission(access, P.ORDERS_DELIVER)) return { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER };
+  if (!inStoreScope(access, order.storeId)) return { reason: 'STORE_NOT_ASSIGNED', storeId: order.storeId == null ? null : String(order.storeId) };
+  if (prepares) return null;
+  return { reason: order.driverId == null ? 'NO_DRIVER_ASSIGNED' : 'NOT_ASSIGNED_DRIVER' };
+}
+
+// Quién ve una orden: su cliente, su repartidor asignado (mientras siga siendo
+// repartidor, de la sucursal que sea), el personal de mostrador de la sucursal,
+// ADMIN, y el resto de repartidores de la sucursal solo mientras está libre para aceptarla.
 export function canViewOrder(access, order) {
-  if (isOwner(access, order)) return true;
+  if (isOwner(access, order) || isActingDriver(access, order)) return true;
   if (!inStoreScope(access, order.storeId)) return false;
   if (hasPermission(access, P.ORDERS_PREPARE)) return true;
-  return hasPermission(access, P.ORDERS_DELIVER) && order.mode === 'DELIVERY';
+  return hasPermission(access, P.ORDERS_DELIVER) && isOpenDelivery(order);
 }
 
 // Quién hizo un cambio de estado (`by` en el historial): lo ve quien puede ver
