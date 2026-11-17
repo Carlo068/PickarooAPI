@@ -7,7 +7,8 @@
 // y para los reportes.
 
 import mongoose from 'mongoose';
-import { UNITS, ORDER_MODES, ORDER_STATUSES, PACKAGE_MAX_ITEMS } from '../../domain/entities.js';
+import { UNITS, ORDER_MODES, ORDER_STATUSES, PACKAGE_MAX_ITEMS, STATUS_HISTORY_MAX } from '../../domain/entities.js';
+import { ROLES } from '../../domain/access.js';
 import { text, optionalText, money, integer, ref, optionalRef, choice, array, sub, main, assertOneRef } from './helpers.js';
 import { location } from './location.js';
 import { packageItem } from './package.js';
@@ -25,6 +26,16 @@ const orderItem = sub({
 });
 orderItem.pre('validate', assertOneRef);
 
+// Una entrada por transición, solo se agrega (ver changeOrderStatus). Las
+// inferidas (migración) no tienen autor.
+const statusChange = sub({
+  status: choice(ORDER_STATUSES),
+  at: { type: Date, required: [true, 'El campo {PATH} es obligatorio.'] },
+  byUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  byRole: { type: String, enum: { values: ROLES, message: 'El valor de {PATH} no está permitido.' }, default: null },
+  inferred: { type: Boolean, default: false },
+});
+
 const order = main({
   number: { ...text(40), unique: true },
   idempotencyKey: { type: String, trim: true, maxlength: 128, default: null },
@@ -33,6 +44,7 @@ const order = main({
   mode: choice(ORDER_MODES),
   deliveryAddress: { type: location, default: null }, // solo DELIVERY
   status: choice(ORDER_STATUSES, 'PENDING'),
+  statusHistory: array(statusChange, STATUS_HISTORY_MAX),
   items: array(orderItem, 200, 1),
   deliveryFee: { ...money(0), default: 0 },
   total: money(0), // lo cobrado al cliente

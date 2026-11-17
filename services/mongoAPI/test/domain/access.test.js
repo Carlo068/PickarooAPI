@@ -7,7 +7,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG,
-  isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder,
+  isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder, canSeeStatusActor,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from '../../src/domain/access.js';
 import { ORDER_STATUSES, ORDER_MODES } from '../../src/domain/entities.js';
@@ -407,5 +407,28 @@ describe('reportStoreScope (reportes por sucursal)', () => {
   test('MANAGER con storeId: la suya sí, otra STORE_NOT_ASSIGNED', () => {
     assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: ['A'] }), 'A'), { storeIds: ['A'] });
     assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: ['A'] }), 'B'), { denied: { reason: 'STORE_NOT_ASSIGNED', storeId: 'B' } });
+  });
+});
+
+describe('canSeeStatusActor (quién ve `by` en statusHistory)', () => {
+  const order = { id: 'O1', userId: 'cliente', storeId: 'S1', mode: 'PICKUP' };
+  const delivery = { ...order, mode: 'DELIVERY' };
+
+  test('el cliente de la orden nunca ve quién fue, aunque sea ADMIN', () => {
+    assert.equal(canSeeStatusActor(accessOf('CUSTOMER', { id: 'cliente', storeIds: [] }), order), false);
+    assert.equal(canSeeStatusActor(accessOf('ADMIN', { id: 'cliente', storeIds: [] }), order), false);
+  });
+
+  test('personal de la sucursal y ADMIN lo ven', () => {
+    for (const role of ['STAFF', 'MANAGER']) assert.equal(canSeeStatusActor(accessOf(role, { id: 'x', storeIds: ['S1'] }), order), true, role);
+    assert.equal(canSeeStatusActor(accessOf('ADMIN', { id: 'x', storeIds: [] }), order), true);
+    assert.equal(canSeeStatusActor(accessOf('DELIVERY', { id: 'x', storeIds: ['S1'] }), delivery), true);
+  });
+
+  test('quien no puede ver la orden tampoco ve quién fue', () => {
+    assert.equal(canSeeStatusActor(accessOf('STAFF', { id: 'x', storeIds: ['OTRA'] }), order), false);
+    assert.equal(canSeeStatusActor(accessOf('DELIVERY', { id: 'x', storeIds: ['S1'] }), order), false); // PICKUP
+    assert.equal(canSeeStatusActor(accessOf('CUSTOMER', { id: 'otro', storeIds: [] }), order), false);
+    assert.equal(canSeeStatusActor(null, order), false);
   });
 });

@@ -460,7 +460,7 @@ La aplicación exporta siete modelos. Cada dato vive en un solo lugar: lo que se
 | `products` | Sucursal (`storeId`), nombre, descripción, precio, imagen, unidad, stock y estado. | `discounts[]`: hasta 20 promociones. |
 | `packages` | Sucursal (`storeId`), nombre, descripción, precio fijo, imagen y estado. **Sin stock propio.** | `items[]`: entre 2 y 40 productos de su sucursal con su cantidad. |
 | `stores` | Nombre, contacto, horario y política de reparto. | `address`: ubicación incrustada. |
-| `orders` | Número, usuario, sucursal, modalidad, estado, envío, total y notas. | `items[]`: hasta 200 partidas; `deliveryAddress`: copia de la ubicación. |
+| `orders` | Número, usuario, sucursal, modalidad, estado, envío, total y notas. | `items[]`: hasta 200 partidas; `deliveryAddress`: copia de la ubicación; `statusHistory[]`: hasta 20 cambios de estado (`status`, `at`, `byUserId`, `byRole`, `inferred`), solo se agrega. |
 | `shopping_lists` | Usuario y nombre de la lista. | `items[]`: hasta 200 partidas de productos o paquetes. |
 
 ### Incrustación
@@ -498,6 +498,13 @@ Antes del marketplace los productos y paquetes no tenían sucursal. La migració
 - Si hay sucursales pero ninguna está activa, usa la más antigua y registra una advertencia: sus artículos quedan ocultos al público hasta reactivar esa sucursal.
 - Si hay artículos sin sucursal y no existe ninguna sucursal, registra una advertencia y los deja así: no se listan (`products` y `packages` solo muestran artículos de sucursales activas) y no se pueden comprar (`ITEM_WITHOUT_STORE`) hasta crear una sucursal y volver a correrla.
 - Las categorías no se migran: siguen siendo globales, incluidas las creadas a mano.
+
+### Migración del historial de estados
+
+Las órdenes anteriores a `statusHistory` no lo tienen. La migración `backfillStatusHistory` (`infrastructure/migrations.js`; la decisión pura es `planStatusHistoryBackfill` en `domain/migrations.js`) sintetiza, para cada orden sin historial (campo ausente o vacío), `PENDING` en `createdAt` y, si el estado actual no es `PENDING`, ese estado en `updatedAt` (la única fecha que se conservaba). Ambas entradas llevan `inferred: true` y no tienen autor (`byRole` y `by` nulos). Registra cuántas órdenes cambió (`🧭 Migración historial de estados: órdenes N`).
+
+- Corre en cada arranque de mongoAPI junto con la anterior y también con `npm run migrate`.
+- Es idempotente: cada escritura repite la condición "sin historial", así que una segunda corrida cambia 0 órdenes y una orden que cambió de estado durante la migración no se pisa.
 
 ## 4. Productos y paquetes
 
@@ -601,6 +608,16 @@ La clave opcional `idempotencyKey` evita crear otra orden para el mismo usuario 
 | `CANCELLED` | Ninguno |
 
 `updateOrderStatus` aplica estas transiciones y publica `ORDER_STATUS_CHANGED`. `cancelOrder` delega en esa operación. Repetir el mismo estado se rechaza; la tabla no distingue entre entrega y recogida.
+
+### Historial de estados: `statusHistory`
+
+Cada orden guarda su línea de tiempo en `statusHistory: [{ status, at, byUserId, byRole, inferred }]`, de la más antigua a la más reciente. Es un modelo de lectura para el cliente y el personal: la bitácora de auditoría (sección 9) sigue siendo el registro de seguridad, solo la lee ADMIN y no cambia (`ORDER_STATUS_CHANGED` se sigue publicando).
+
+- **Solo se agrega**, una entrada por transición, con tope de 20 (hay siete estados y las transiciones no regresan; lo valida el modelo). `createOrder` y `checkoutCart` escriben la entrada inicial `PENDING` con el cliente como autor (`byRole: CUSTOMER`); cada cambio exitoso, incluida la cancelación (que repone el stock), agrega `{ status: destino, at: ahora, byUserId, byRole }` del usuario de la sesión.
+- **Atómico con el cambio de estado.** `changeOrderStatus` valida la transición y la aplica con un solo `findOneAndUpdate` condicionado al estado validado (`{ _id, status: previo }`) que hace `$set` del estado y `$push` de la entrada. Si otra petición movió la orden antes, la escritura no hace nada, se relee la orden y se valida de nuevo contra el estado real: el perdedor recibe `ORDER_ALREADY_IN_STATUS` o `INVALID_STATUS_TRANSITION`, y si la transición sigue siendo válida (por ejemplo cancelar tras confirmar) se aplica y deja su propia entrada. Nunca hay una transición sin su entrada ni una entrada sin transición. Antes se hacía cargar y guardar con `optimisticConcurrency`, que fallaba el guardado del perdedor sin una respuesta de dominio; la actualización condicionada conserva esa exclusión y da el error correcto. La escritura incrementa `__v` para no romper a quien guarde un documento ya cargado.
+- **GraphQL:** `Order.statusHistory: [OrderStatusChange!]!` con `{ status, at, byRole, by, inferred }`. Lo lee quien puede leer la orden (`canViewOrder`); no hay permiso nuevo.
+- **Privacidad de `by`.** `by` (el `User`) solo se resuelve para quien no es el cliente de la orden: el personal de la sucursal que puede verla o ADMIN (`canSeeStatusActor` en `domain/access.js`). Para el cliente es `null`, pero sigue viendo `byRole` (`STAFF`, `DELIVERY`...). Si el cliente es además ADMIN, en su propia orden tampoco ve `by`.
+- **Órdenes anteriores.** Las creadas antes del historial se completan con la migración `backfillStatusHistory` (sección 3): entradas `inferred: true` y sin autor. Las nuevas son siempre `inferred: false`.
 
 ### Inventario
 

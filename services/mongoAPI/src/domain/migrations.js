@@ -34,3 +34,21 @@ export function planCatalogStoreBackfill({ stores = [], pending = {} } = {}) {
   const [oldest] = [...(active.length ? active : stores)].sort((a, b) => time(a.createdAt) - time(b.createdAt) || idOf(a).localeCompare(idOf(b)));
   return { action: 'ASSIGN', storeId: idOf(oldest), storeName: oldest.name ?? null, storeActive: isActive(oldest), products, packages };
 }
+
+// Historial de estados: las órdenes anteriores a PIC-78 no lo tienen. Se
+// sintetiza PENDING en createdAt y, si ya cambió de estado, el estado actual en
+// updatedAt (la única fecha que se conserva). Las entradas van `inferred: true`
+// y sin autor. Una orden cuyo historial no empieza en PENDING (un cambio de estado
+// llegó antes de la migración) recibe solo el PENDING inferido al inicio.
+// Devuelve las entradas a anteponer, o null si el historial ya está completo (idempotente).
+export function planStatusHistoryBackfill(order) {
+  const existing = Array.isArray(order?.statusHistory) ? order.statusHistory : [];
+  if (existing.length && existing[0]?.status === 'PENDING') return null;
+  const createdAt = order.createdAt ?? order.updatedAt ?? new Date(0);
+  const history = [{ status: 'PENDING', at: createdAt, byUserId: null, byRole: null, inferred: true }];
+  if (existing.length) return history;
+  if (order.status && order.status !== 'PENDING') {
+    history.push({ status: order.status, at: order.updatedAt ?? createdAt, byUserId: null, byRole: null, inferred: true });
+  }
+  return history;
+}

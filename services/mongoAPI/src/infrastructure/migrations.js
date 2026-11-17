@@ -7,8 +7,8 @@
 // ============================================================
 
 import mongoose from 'mongoose';
-import { Product, Package, Store } from './models/index.js';
-import { planCatalogStoreBackfill } from '../domain/migrations.js';
+import { Product, Package, Store, Order } from './models/index.js';
+import { planCatalogStoreBackfill, planStatusHistoryBackfill } from '../domain/migrations.js';
 
 // Sin storeId = campo ausente o null.
 const WITHOUT_STORE = { storeId: null };
@@ -45,6 +45,27 @@ export async function backfillCatalogStores(log = console) {
   return { products: p.modifiedCount, packages: k.modifiedCount };
 }
 
+// Historial incompleto = ausente, vacío o que no empieza en PENDING (toda orden nueva nace con PENDING).
+const WITHOUT_HISTORY = { 'statusHistory.0.status': { $ne: 'PENDING' } };
+
+// PIC-78: sintetiza el historial de estados de las órdenes anteriores y antepone
+// PENDING a las que quedaron sin él. Cada escritura es un pipeline que antepone
+// las entradas al historial actual y repite la condición de incompleto: una orden
+// que cambió de estado entre la lectura y la escritura (y ya se completó sola)
+// no se toca, y las entradas reales que lleguen en medio no se pierden.
+// Devuelve { orders } modificadas.
+export async function backfillStatusHistory(log = console) {
+  const ops = [];
+  const cursor = Order.collection.find(WITHOUT_HISTORY, { projection: { status: 1, createdAt: 1, updatedAt: 1, statusHistory: 1 } });
+  for await (const order of cursor) {
+    const history = planStatusHistoryBackfill(order);
+    if (history) ops.push({ updateOne: { filter: { _id: order._id, ...WITHOUT_HISTORY }, update: [{ $set: { statusHistory: { $concatArrays: [history, { $ifNull: ['$statusHistory', []] }] } } }] } });
+  }
+  const modified = ops.length ? (await Order.collection.bulkWrite(ops, { ordered: false })).modifiedCount : 0;
+  log.log(`🧭 Migración historial de estados: órdenes ${modified}${modified ? ' (entradas inferidas)' : ' (nada pendiente)'}.`);
+  return { orders: modified };
+}
+
 export async function runMigrations(log = console) {
-  return { catalogStores: await backfillCatalogStores(log) };
+  return { catalogStores: await backfillCatalogStores(log), statusHistory: await backfillStatusHistory(log) };
 }
