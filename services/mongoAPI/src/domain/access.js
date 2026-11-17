@@ -27,9 +27,9 @@ const P = PERMISSIONS;
 export const PERMISSION_CATALOG = [
   { name: P.ORDERS_PREPARE, description: 'Confirmar, preparar, marcar listas y cancelar órdenes de su sucursal; entregar las de recogida.' },
   { name: P.ORDERS_DELIVER, description: 'Llevar a domicilio y marcar como entregadas las órdenes DELIVERY de su sucursal.' },
-  { name: P.STOCK_MANAGE, description: 'Ajustar el inventario de productos.' },
-  { name: P.CATALOG_MANAGE, description: 'Crear y editar categorías, productos, paquetes y descuentos.' },
-  { name: P.REPORTS_VIEW, description: 'Consultar los reportes de ventas y demanda.' },
+  { name: P.STOCK_MANAGE, description: 'Ajustar el inventario de los productos de sus sucursales.' },
+  { name: P.CATALOG_MANAGE, description: 'Crear y editar productos, paquetes y descuentos de sus sucursales (categorías: además scope:all_stores).' },
+  { name: P.REPORTS_VIEW, description: 'Consultar los reportes de ventas y demanda de sus sucursales.' },
   { name: P.STORES_MANAGE, description: 'Crear y editar sucursales.' },
   { name: P.USERS_MANAGE, description: 'Ver usuarios, asignar roles y sucursales.' },
   { name: P.AUDIT_VIEW, description: 'Consultar la bitácora de auditoría.' },
@@ -82,6 +82,48 @@ export const hasPermission = (access, permission) => Boolean(access?.permissions
 export function inStoreScope(access, storeId) {
   if (hasPermission(access, P.ALL_STORES)) return true;
   return storeId != null && (access?.storeIds ?? []).includes(String(storeId));
+}
+
+// ------------------------------------------------------------
+// Marketplace: cada sucursal es un negocio con su catálogo y su stock
+//
+// Las denegaciones se devuelven (no se lanzan): null si se puede, o
+// { reason, permission? | storeId? } (una razón de FORBIDDEN_REASONS) para
+// que el resolver arme el FORBIDDEN.
+// ------------------------------------------------------------
+
+// catalog:manage y stock:manage aplican solo a los artículos de una sucursal
+// del alcance del usuario: sus WORKS_AT, o todas con scope:all_stores.
+export function storeItemDenial(access, permission, storeId) {
+  if (!hasPermission(access, permission)) return { reason: 'PERMISSION_REQUIRED', permission };
+  if (!inStoreScope(access, storeId)) return { reason: 'STORE_NOT_ASSIGNED', storeId: storeId == null ? null : String(storeId) };
+  return null;
+}
+
+// ¿Administra el catálogo o el inventario de esta sucursal? (ve sus artículos aunque esté inactiva)
+export const managesStoreItems = (access, storeId) =>
+  !storeItemDenial(access, P.CATALOG_MANAGE, storeId) || !storeItemDenial(access, P.STOCK_MANAGE, storeId);
+
+// ¿Ve los artículos ocultos de esta sucursal (los de una sucursal inactiva y
+// los productos o paquetes desactivados)? Quien los administra o scope:all_stores.
+export const seesStoreItems = (access, storeId) => hasPermission(access, P.ALL_STORES) || managesStoreItems(access, storeId);
+
+// Las categorías son globales, compartidas por todas las sucursales: crearlas
+// exige catalog:manage y además scope:all_stores (ADMIN).
+export function categoryDenial(access) {
+  if (!hasPermission(access, P.CATALOG_MANAGE)) return { reason: 'PERMISSION_REQUIRED', permission: P.CATALOG_MANAGE };
+  if (!hasPermission(access, P.ALL_STORES)) return { reason: 'PERMISSION_REQUIRED', permission: P.ALL_STORES };
+  return null;
+}
+
+// Sucursales que cubre un reporte. Con storeId: esa, si está en el alcance.
+// Sin storeId: todas las del alcance ({ storeIds: null } = todas, con scope:all_stores).
+export function reportStoreScope(access, storeId) {
+  if (storeId != null) {
+    return inStoreScope(access, storeId) ? { storeIds: [String(storeId)] } : { denied: { reason: 'STORE_NOT_ASSIGNED', storeId: String(storeId) } };
+  }
+  if (hasPermission(access, P.ALL_STORES)) return { storeIds: null };
+  return { storeIds: (access?.storeIds ?? []).map(String) };
 }
 
 const isOwner = (access, order) => access?.id != null && String(access.id) === String(order.userId);

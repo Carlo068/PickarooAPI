@@ -54,6 +54,7 @@ redisClient.on('ready', () => {
 // direcciones) se guardan serializadas; el passwordHash nunca se cachea.
 export const productSchema = new Schema('Product', {
   mongoId: { type: 'string' },
+  storeId: { type: 'string' },
   categoryId: { type: 'string' },
   name: { type: 'string' },
   description: { type: 'string' },

@@ -12,6 +12,8 @@ export const packageItem = sub({
 });
 
 const pkg = main({
+  // Marketplace: el paquete es de una sucursal y solo contiene productos de ella. No cambia después del alta.
+  storeId: { ...ref('Store'), immutable: true },
   name: text(200),
   description: optionalText(4000),
   price: money(0.01),
@@ -23,6 +25,7 @@ pkg.pre('validate', function () {
   try { assertPackagePersistable(this); } catch (err) { this.invalidate('items', err.message, undefined, err.extensions?.code); }
 });
 pkg.index({ isActive: 1 });
+pkg.index({ storeId: 1, isActive: 1 }); // paquetes de una sucursal
 pkg.index({ 'items.productId': 1 }); // "¿qué paquetes contienen este producto?"
 
 export const Package = mongoose.model('Package', pkg, 'packages');

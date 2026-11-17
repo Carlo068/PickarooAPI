@@ -17,6 +17,8 @@ discount.pre('validate', function () {
 });
 
 const product = main({
+  // Marketplace: cada producto (y su stock) es de una sucursal. No cambia después del alta.
+  storeId: { ...ref('Store'), immutable: true },
   categoryId: ref('Category'),
   name: text(200),
   description: optionalText(4000),
@@ -32,6 +34,7 @@ product.pre('validate', function () {
   try { assertProductPersistable(this); } catch (err) { this.invalidate('price', err.message, undefined, err.extensions?.code); }
 });
 product.index({ categoryId: 1, isActive: 1 });
+product.index({ storeId: 1, categoryId: 1, isActive: 1 }); // catálogo de una sucursal
 product.index({ name: 'text', description: 'text' });
 
 export const Product = mongoose.model('Product', product, 'products');

@@ -22,8 +22,12 @@ import {
   orderDiscountTotal,
   assertTransition,
   assertPackagePersistable,
+  assertPackageSameStore,
   assertQuoteStillValid,
   reconcileCart,
+  linesStoreId,
+  cartStoreId,
+  assertCartAccepts,
   buildOrderNumber,
   round2,
 } from './domain/entities.js';
@@ -38,8 +42,12 @@ import { RECENT_ORDERS, pushRecentOrder, getRecentOrderIds, setRecentOrders } fr
 import { initNeo4j, isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
 import { initEvents, emitEvent, diff, auditPlugin, CATEGORIES } from './infrastructure/events.js';
+import { runMigrations } from './infrastructure/migrations.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
-import { PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus } from './domain/access.js';
+import {
+  PERMISSIONS, DEFAULT_ROLE, hasPermission, inStoreScope, canViewOrder, canChangeOrderStatus,
+  storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
+} from './domain/access.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const typeDefs = parse(fs.readFileSync(path.join(__dirname, 'schema.graphql'), 'utf8'));
@@ -51,6 +59,8 @@ const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/pickarood
 await mongoose.connect(mongoUri);
 console.log('✅ MongoDB (pickaroodb) conectado.');
 await Promise.all(models.map(m => m.syncIndexes().catch(err => console.warn(`Índices de ${m.modelName}:`, err.message))));
+// Migraciones de datos (idempotentes), antes del seed. También: npm run migrate.
+await runMigrations().catch(err => console.error('⚠️  Migración de datos fallida:', err.message));
 
 // ------------------------------------------------------------
 // Infraestructura: Redis (caché de lectura + sesiones JWT)
@@ -133,9 +143,117 @@ function ordersFilter(me, { userId, storeId }) {
   return { userId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) };
 }
 
-// Evento de catálogo con el documento afectado como objetivo.
+// Evento de catálogo con el documento afectado como objetivo. Productos y
+// paquetes llevan su sucursal en metadata (las categorías son globales).
 function catalogEvent(ctx, type, targetType, doc, reason, metadata = {}) {
-  emitEvent({ type, category: CATEGORIES.CATALOG, targetType, targetId: doc._id, reason, metadata }, ctx);
+  const store = doc.storeId != null ? { storeId: String(doc.storeId) } : {};
+  emitEvent({ type, category: CATEGORIES.CATALOG, targetType, targetId: doc._id, reason, metadata: { ...store, ...metadata } }, ctx);
+}
+
+// ---------- Marketplace: alcance por sucursal ----------
+// FORBIDDEN a partir de una denegación de domain/access.js ({ reason, permission? | storeId? }).
+function deny(denial) {
+  if (denial.reason === 'STORE_NOT_ASSIGNED') throw forbidden('Esa sucursal no está asignada a tu usuario.', 'STORE_NOT_ASSIGNED', { storeId: denial.storeId });
+  throw forbidden(`Se requiere el permiso "${denial.permission}".`, 'PERMISSION_REQUIRED', { permission: denial.permission });
+}
+
+// catalog:manage o stock:manage sobre los artículos de la sucursal `storeId`.
+function requireStoreItemPermission(ctx, permission, storeId) {
+  const me = requireAuth(ctx);
+  const denial = storeItemDenial(me, permission, storeId);
+  if (denial) deny(denial);
+  return me;
+}
+
+// Alta de un producto o paquete: la sucursal del input debe estar en el alcance y existir.
+async function requireCatalogStore(ctx, storeId) {
+  requireStoreItemPermission(ctx, PERMISSIONS.CATALOG_MANAGE, storeId);
+  if (!mongoose.isValidObjectId(storeId) || !(await Store.exists({ _id: oid(storeId) }))) throw notFound('STORE', storeId);
+}
+
+// Producto o paquete que se va a editar: primero el permiso, luego que exista
+// y por último que su sucursal esté en el alcance.
+async function managedItem(ctx, permission, Model, entity, id) {
+  requirePermission(ctx, permission);
+  const doc = mongoose.isValidObjectId(id) ? await Model.findById(id) : null;
+  if (!doc) throw notFound(entity, id);
+  requireStoreItemPermission(ctx, permission, doc.storeId);
+  return doc;
+}
+const managedProduct = (ctx, permission, id) => managedItem(ctx, permission, Product, 'PRODUCT', id);
+const managedPackage = (ctx, id) => managedItem(ctx, PERMISSIONS.CATALOG_MANAGE, Package, 'PACKAGE', id);
+
+// Los artículos de una sucursal inactiva no se listan al público; quien
+// administra su catálogo o su inventario sí los ve.
+const activeStoreIds = () => Store.find({ isActive: true }).distinct('_id');
+const storeVisible = (ctx, store) => store.isActive || seesStoreItems(ctx.currentUser, store._id);
+
+// Un producto o paquete que se resuelve por id para mostrarlo: null si es de
+// una sucursal inactiva (o sin sucursal) y quien consulta no administra sus
+// artículos ni tiene scope:all_stores. Igual que los listados.
+async function visibleItem(ctx, doc) {
+  if (!doc) return null;
+  const store = doc.storeId != null && mongoose.isValidObjectId(doc.storeId) ? await Store.findById(doc.storeId).select('isActive') : null;
+  return store?.isActive || seesStoreItems(ctx.currentUser, doc.storeId) ? doc : null;
+}
+
+// Filtro de los listados de productos y paquetes (null = nada que listar).
+// activeOnly: false solo se respeta en las sucursales cuyos artículos ve quien
+// consulta; para los demás se trata como true, sin error. Sin storeId: todas
+// las sucursales activas (búsqueda del marketplace).
+async function listingFilter(ctx, storeId, activeOnly) {
+  const me = ctx.currentUser;
+  if (storeId == null) {
+    const base = { storeId: { $in: await activeStoreIds() } };
+    if (activeOnly || hasPermission(me, PERMISSIONS.ALL_STORES)) return activeOnly ? { ...base, isActive: true } : base;
+    const managed = (me?.storeIds ?? []).filter(id => mongoose.isValidObjectId(id) && managesStoreItems(me, id)).map(oid);
+    return managed.length ? { ...base, $or: [{ isActive: true }, { storeId: { $in: managed } }] } : { ...base, isActive: true };
+  }
+  const store = mongoose.isValidObjectId(storeId) ? await Store.findById(storeId).select('isActive') : null;
+  return storeFilterOf(ctx, store, activeOnly);
+}
+
+// Lo mismo para una sucursal ya cargada (Store.products / Store.packages).
+function storeFilterOf(ctx, store, activeOnly) {
+  if (!store || !storeVisible(ctx, store)) return null;
+  const onlyActive = activeOnly || !seesStoreItems(ctx.currentUser, store._id);
+  return { storeId: store._id, ...(onlyActive ? { isActive: true } : {}) };
+}
+
+function listProducts(filter, { categoryId, search, limit, offset }) {
+  if (!filter) return [];
+  const q = { ...filter };
+  if (categoryId) q.categoryId = oid(categoryId);
+  if (search) q.$text = { $search: search };
+  return Product.find(q).sort({ name: 1 }).skip(offset).limit(Math.min(limit, 100)).exec();
+}
+
+function listPackages(filter) {
+  if (!filter) return [];
+  return Package.find(filter).sort({ name: 1 }).exec();
+}
+
+// Productos del contenido de un paquete: deben existir y ser de su sucursal.
+async function assertPackageProducts(storeId, items) {
+  const ids = uniq(items.map(i => i.productId));
+  const docs = ids.every(id => mongoose.isValidObjectId(id)) ? await Product.find({ _id: { $in: ids.map(oid) } }).select('storeId') : [];
+  if (docs.length !== ids.length) throw new DomainError('Algún producto del paquete no existe en el catálogo.', 'PACKAGE_PRODUCT_NOT_FOUND');
+  assertPackageSameStore(storeId, docs);
+}
+
+// Reportes: $match de las sucursales del alcance (ADMIN: todas; personal: sus WORKS_AT).
+function reportStoreMatch(ctx, storeId) {
+  const me = requirePermission(ctx, PERMISSIONS.REPORTS_VIEW);
+  const scope = reportStoreScope(me, storeId);
+  if (scope.denied) deny(scope.denied);
+  if (scope.storeIds == null) return {};
+  return { storeId: { $in: scope.storeIds.filter(id => mongoose.isValidObjectId(id)).map(oid) } };
+}
+
+async function storeNames(ids) {
+  const valid = uniq(ids.filter(Boolean));
+  const docs = valid.length ? await Store.find({ _id: { $in: valid.map(oid) } }).select('name') : [];
+  return new Map(docs.map(d => [String(d._id), d.name]));
 }
 
 // Refleja la sucursal en Neo4j (el alcance del personal se define con WORKS_AT).
@@ -166,11 +284,6 @@ const packageEntities = new WeakMap();
 function packageEntity(doc) {
   if (!packageEntities.has(doc)) packageEntities.set(doc, toDomainPackages([doc]).then(m => m.get(String(doc._id))));
   return packageEntities.get(doc);
-}
-
-async function assertProductsExist(ids) {
-  const found = await Product.countDocuments({ _id: { $in: uniq(ids).map(oid) } });
-  if (found !== uniq(ids).length) throw new DomainError('Algún producto del paquete no existe en el catálogo.', 'PACKAGE_PRODUCT_NOT_FOUND');
 }
 
 // Carga el catálogo actual (Mongo, nunca el caché) para unas partidas.
@@ -251,12 +364,10 @@ async function placeOrder({ userId, mode, storeId, address, addressId, items, no
   if (!user) throw notFound('USER', userId);
   if (!user.isActive) throw new DomainError('El usuario está desactivado.', 'USER_INACTIVE');
 
-  const store = await resolveStore(storeId);
-  if (!store) throw new DomainError('No hay ninguna sucursal activa configurada.', 'NO_ACTIVE_STORE');
-
-  // Precios y stock salen siempre de Mongo, nunca del caché.
-  const deliveryAddress = mode === 'DELIVERY' ? resolveDeliveryAddress(address, addressId, user) : null;
+  // Precios y stock salen siempre de Mongo, nunca del caché. La sucursal es la de los artículos.
   const lines = await buildLines(items);
+  const store = await purchaseStore(lines, storeId);
+  const deliveryAddress = mode === 'DELIVERY' ? resolveDeliveryAddress(address, addressId, user) : null;
   const priced = priceOrder({ mode, store, deliveryAddress, lines, requireAddress: true });
   if (quoteId) await assertMatchesQuote(quoteId, { mode, store }, priced);
 
@@ -296,16 +407,19 @@ async function placeOrder({ userId, mode, storeId, address, addressId, items, no
 
 // ---------- Carrito (Redis) ----------
 // Lee el carrito, lo contrasta con el catálogo actual y cotiza lo disponible.
-async function buildCart(userId, { mode = 'PICKUP', storeId } = {}) {
+// La sucursal del carrito es la de sus partidas (`storeId` es solo una pista);
+// las de otra sucursal (carritos anteriores al marketplace) quedan como OTHER_STORE.
+async function buildCart(userId, { mode = 'PICKUP', storeId: hintStoreId } = {}) {
   const lines = await loadLines(await cartStore.getCart(userId));
-  const { available, unavailable } = reconcileCart(lines);
+  const storeId = cartStoreId(lines, hintStoreId);
+  const { available, unavailable } = reconcileCart(lines, { storeId });
   const unavailableKeys = new Set(unavailable.map(u => u.productId ?? u.packageId));
 
   let quote = null;
   let quoteError = null;
   if (available.length) {
     try {
-      const store = await resolveStore(storeId);
+      const store = await purchaseStore(available);
       quote = await issueQuote({ mode, store }, priceOrder({ mode, store, lines: available }));
     } catch (err) {
       if (!(err instanceof DomainError)) throw err;
@@ -314,6 +428,7 @@ async function buildCart(userId, { mode = 'PICKUP', storeId } = {}) {
   }
 
   return {
+    storeId,
     items: lines.map(l => ({
       productId: l.productId ?? null, packageId: l.packageId ?? null, quantity: l.quantity,
       available: !unavailableKeys.has(l.productId ?? l.packageId),
@@ -329,17 +444,24 @@ async function buildCart(userId, { mode = 'PICKUP', storeId } = {}) {
   };
 }
 
-// Valida la referencia antes de guardarla en el carrito: debe existir y estar activa.
-async function assertPurchasableRef(ref) {
+// Valida la referencia antes de guardarla en el carrito: debe existir, estar
+// activa, tener sucursal y ser de la sucursal que ya tiene el carrito
+// (CART_STORE_MISMATCH: el cliente ofrece vaciarlo y agregar).
+async function assertCartAcceptsRef(userId, ref) {
   const id = ref.productId ?? ref.packageId;
   const Model = ref.productId ? Product : Package;
   const what = ref.productId ? 'PRODUCT' : 'PACKAGE';
   if (!mongoose.isValidObjectId(id)) throw notFound(what, id);
-  const doc = await Model.findById(id).select('name isActive');
+  const doc = await Model.findById(id).select('name isActive storeId');
   if (!doc) throw notFound(what, id);
+  const store = doc.storeId ? await Store.findById(doc.storeId).select('name isActive') : null;
+  if (store && !store.isActive) throw new DomainError(`La sucursal "${store.name}" no está activa.`, 'STORE_INACTIVE', { storeId: String(store._id), name: store.name });
   if (!doc.isActive) {
-    throw new DomainError(`"${doc.name}" no está disponible.`, 'ITEM_UNAVAILABLE', { itemType: ref.productId ? 'PRODUCT' : 'PACKAGE', id: String(id), name: doc.name });
+    throw new DomainError(`"${doc.name}" no está disponible.`, 'ITEM_UNAVAILABLE', { itemType: what, id: String(id), name: doc.name });
   }
+  if (!doc.storeId) throw new DomainError(`"${doc.name}" no pertenece a ninguna sucursal.`, 'ITEM_WITHOUT_STORE', { itemType: what, id: String(id), name: doc.name });
+  const lines = await loadLines(await cartStore.getCart(userId));
+  assertCartAccepts(cartStoreId(lines), doc.storeId);
 }
 
 // Descuenta stock solo si alcanza (condición atómica por producto). Si algún
@@ -370,12 +492,13 @@ async function releaseStock(demand) {
   await invalidateProducts(demand.map(d => d.productId));
 }
 
-async function resolveStore(storeId) {
-  let store = storeId ? await Store.findById(storeId) : null;
-  if (storeId && !store) throw notFound('STORE', storeId);
-  if (store && !store.isActive) throw new DomainError(`La sucursal "${store.name}" no está activa.`, 'STORE_INACTIVE', { storeId: String(store._id), name: store.name });
-  // Sin sucursal indicada se usa la primera activa (setup de un solo restaurante).
-  if (!store) store = await Store.findOne({ isActive: true }).sort({ createdAt: 1 });
+// Sucursal de una compra: la de sus partidas, que debe existir y estar activa.
+// `hintStoreId` (el storeId del cliente) solo se valida: si difiere, STORE_MISMATCH.
+async function purchaseStore(lines, hintStoreId = null) {
+  const storeId = linesStoreId(lines, hintStoreId);
+  const store = storeId ? await Store.findById(storeId) : null;
+  if (!store) throw notFound('STORE', storeId);
+  if (!store.isActive) throw new DomainError(`La sucursal "${store.name}" no está activa.`, 'STORE_INACTIVE', { storeId: String(store._id), name: store.name });
   return store;
 }
 
@@ -437,7 +560,8 @@ const resolvers = {
 
   Category: {
     __resolveReference: ref => Category.findById(ref.id).exec(),
-    products: cat => Product.find({ categoryId: cat._id, isActive: true }).sort({ name: 1 }).exec(),
+    // Categoría global: sus productos activos de todas las sucursales activas.
+    products: async cat => Product.find({ categoryId: cat._id, isActive: true, storeId: { $in: await activeStoreIds() } }).sort({ name: 1 }).exec(),
   },
 
   ProductDiscount: {
@@ -446,14 +570,19 @@ const resolvers = {
 
   Product: {
     __resolveReference: ref => getProduct(ref.id),
+    store: p => Store.findById(p.storeId).exec(),
     category: p => Category.findById(p.categoryId).exec(),
     activeDiscountPercent: p => bestDiscountPercent(p.discounts),
     effectivePrice: p => applyDiscount(p.price, bestDiscountPercent(p.discounts)),
-    packages: p => Package.find({ 'items.productId': p.id, isActive: true }).sort({ name: 1 }).exec(),
+    packages: async (p, _, ctx) => {
+      const docs = await Package.find({ 'items.productId': p.id, isActive: true }).sort({ name: 1 }).exec();
+      return (await Promise.all(docs.map(d => visibleItem(ctx, d)))).filter(Boolean);
+    },
   },
 
   Package: {
     __resolveReference: ref => Package.findById(ref.id).exec(),
+    store: doc => Store.findById(doc.storeId).exec(),
     availableStock: async doc => (await packageEntity(doc)).availableStock(),
     alaCarteTotal: async doc => (await packageEntity(doc)).alaCarteTotal(),
     savings: async doc => (await packageEntity(doc)).savings(),
@@ -463,8 +592,17 @@ const resolvers = {
     product: i => getProduct(i.productId),
   },
 
+  // Catálogo de la sucursal (marketplace). Si está inactiva solo lo ve quien lo administra.
   Store: {
     __resolveReference: ref => Store.findById(ref.id).exec(),
+    products: (store, args, ctx) => listProducts(storeFilterOf(ctx, store, args.activeOnly), args),
+    packages: (store, { activeOnly }, ctx) => listPackages(storeFilterOf(ctx, store, activeOnly)),
+    // Categorías (globales) con al menos un producto activo en esta sucursal.
+    categories: async (store, _, ctx) => {
+      if (!storeVisible(ctx, store)) return [];
+      const ids = await Product.distinct('categoryId', { storeId: store._id, isActive: true });
+      return Category.find({ _id: { $in: ids } }).sort({ sortOrder: 1, name: 1 }).exec();
+    },
   },
 
   OrderItem: {
@@ -485,8 +623,8 @@ const resolvers = {
 
   ShoppingListItem: {
     type: itemType,
-    product: i => getProduct(i.productId),
-    package: i => (i.packageId ? Package.findById(i.packageId).exec() : null),
+    product: async (i, _, ctx) => visibleItem(ctx, await getProduct(i.productId)),
+    package: async (i, _, ctx) => (i.packageId ? visibleItem(ctx, await Package.findById(i.packageId).exec()) : null),
   },
 
   ShoppingList: {
@@ -503,23 +641,22 @@ const resolvers = {
     type: itemType,
   },
 
+  Cart: {
+    store: c => (c.storeId ? Store.findById(c.storeId).exec() : null),
+  },
+
   Query: {
     ...authResolvers.Query,
 
     categories: () => Category.find().sort({ sortOrder: 1, name: 1 }).exec(),
     category: (_, { id }) => Category.findById(id).exec(),
 
-    products: (_, { categoryId, search, activeOnly, limit, offset }) => {
-      const q = {};
-      if (categoryId) q.categoryId = oid(categoryId);
-      if (activeOnly) q.isActive = true;
-      if (search) q.$text = { $search: search };
-      return Product.find(q).sort({ name: 1 }).skip(offset).limit(Math.min(limit, 100)).exec();
-    },
-    product: (_, { id }) => getProduct(id),
+    // Sin storeId: el marketplace completo (todas las sucursales activas).
+    products: async (_, { storeId, ...args }, ctx) => listProducts(await listingFilter(ctx, storeId, args.activeOnly), args),
+    product: async (_, { id }, ctx) => visibleItem(ctx, await getProduct(id)),
 
-    packages: (_, { activeOnly }) => Package.find(activeOnly ? { isActive: true } : {}).sort({ name: 1 }).exec(),
-    package: (_, { id }) => Package.findById(id).exec(),
+    packages: async (_, { storeId, activeOnly }, ctx) => listPackages(await listingFilter(ctx, storeId, activeOnly)),
+    package: async (_, { id }, ctx) => visibleItem(ctx, await Package.findById(id).exec()),
 
     stores: (_, { activeOnly }) => Store.find(activeOnly ? { isActive: true } : {}).sort({ name: 1 }).exec(),
     store: (_, { id }) => Store.findById(id).exec(),
@@ -550,10 +687,11 @@ const resolvers = {
     shoppingList: async (_, { id }, ctx) => ownedOrNull(ctx, await ShoppingList.findById(id).exec()),
 
     // Cotiza y guarda la cotización 15 min; su quoteId se manda al comprar.
+    // La sucursal (y su tarifa de envío) es la de los artículos.
     quoteOrder: async (_, { input }) => {
       const { mode, storeId, items } = input;
-      const store = await resolveStore(storeId);
       const lines = await buildLines(items);
+      const store = await purchaseStore(lines, storeId);
       return issueQuote({ mode, store }, priceOrder({ mode, store, lines }));
     },
 
@@ -573,14 +711,14 @@ const resolvers = {
       return docs;
     },
 
-    // Pipeline de agregación #1: ventas consolidadas por producto y por paquete.
-    salesReport: async (_, { from, to }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.REPORTS_VIEW);
+    // Pipeline de agregación #1: ventas consolidadas por sucursal y por producto o paquete.
+    salesReport: async (_, { from, to, storeId }, ctx) => {
+      const stores = reportStoreMatch(ctx, storeId);
       const rows = await Order.aggregate([
-        { $match: { status: 'DELIVERED', createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
+        { $match: { status: 'DELIVERED', createdAt: { $gte: new Date(from), $lte: new Date(to) }, ...stores } },
         { $unwind: '$items' },
         { $group: {
-          _id: { productId: '$items.productId', packageId: '$items.packageId' },
+          _id: { storeId: '$storeId', productId: '$items.productId', packageId: '$items.packageId' },
           name: { $first: '$items.name' },
           quantity: { $sum: '$items.quantity' },
           revenue: { $sum: '$items.lineTotal' },
@@ -588,7 +726,10 @@ const resolvers = {
         } },
         { $sort: { revenue: -1 } },
       ]);
+      const names = await storeNames(rows.map(r => r._id.storeId));
       return rows.map(r => ({
+        storeId: String(r._id.storeId),
+        storeName: names.get(String(r._id.storeId)) ?? 'N/D',
         type: r._id.packageId ? 'PACKAGE' : 'PRODUCT',
         itemId: r._id.packageId ?? r._id.productId,
         name: r.name,
@@ -600,26 +741,29 @@ const resolvers = {
 
     // Pipeline de agregación #2: explota los paquetes vendidos en sus productos
     // ($match → $unwind items → $match paquetes → $unwind contents →
-    //  $group por producto → $lookup nombre → $sort). Sirve para saber cuánta
+    //  $group por sucursal y producto → $lookup nombre → $sort). Sirve para saber cuánta
     // arrachera / chorizo / carbón comprar para surtir los combos del periodo.
-    packageComponentDemand: async (_, { from, to }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.REPORTS_VIEW);
+    packageComponentDemand: async (_, { from, to, storeId }, ctx) => {
+      const stores = reportStoreMatch(ctx, storeId);
       const rows = await Order.aggregate([
-        { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: new Date(from), $lte: new Date(to) } } },
+        { $match: { status: { $ne: 'CANCELLED' }, createdAt: { $gte: new Date(from), $lte: new Date(to) }, ...stores } },
         { $unwind: '$items' },
         { $match: { 'items.packageId': { $ne: null } } },
         { $unwind: '$items.contents' },
         { $group: {
-          _id: '$items.contents.productId',
+          _id: { storeId: '$storeId', productId: '$items.contents.productId' },
           quantityNeeded: { $sum: { $multiply: ['$items.contents.quantity', '$items.quantity'] } },
           packagesSold: { $sum: '$items.quantity' },
           inPackages: { $addToSet: '$items.packageId' },
         } },
-        { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'product' } },
+        { $lookup: { from: 'products', localField: '_id.productId', foreignField: '_id', as: 'product' } },
         { $sort: { quantityNeeded: -1 } },
       ]);
+      const names = await storeNames(rows.map(r => r._id.storeId));
       return rows.map(r => ({
-        productId: r._id,
+        storeId: String(r._id.storeId),
+        storeName: names.get(String(r._id.storeId)) ?? 'N/D',
+        productId: r._id.productId,
         name: r.product?.[0]?.name ?? 'N/D',
         quantityNeeded: r.quantityNeeded,
         packagesSold: r.packagesSold,
@@ -685,24 +829,27 @@ const resolvers = {
     },
 
     // ---------- Catálogo (catalog:manage; inventario: stock:manage) ----------
+    // Marketplace: los dos permisos aplican solo a los artículos de las
+    // sucursales del alcance (WORKS_AT; ADMIN: todas). Las categorías son
+    // globales: crearlas exige además scope:all_stores.
     createCategory: async (_, { input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      const denial = categoryDenial(requireAuth(ctx));
+      if (denial) deny(denial);
       const category = await Category.create(input);
       catalogEvent(ctx, 'CATEGORY_CREATED', 'Category', category, category.name);
       return category;
     },
 
     createProduct: async (_, { input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      await requireCatalogStore(ctx, input.storeId);
       if (!(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('CATEGORY', input.categoryId);
       const product = await Product.create(input);
       catalogEvent(ctx, 'PRODUCT_CREATED', 'Product', product, product.name, { price: product.price, stock: product.stock, unit: product.unit });
       return product;
     },
+    // La sucursal no cambia: ProductUpdateInput no la trae y el campo es inmutable.
     updateProduct: async (_, { id, input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
-      const product = await Product.findById(id);
-      if (!product) throw notFound('PRODUCT', id);
+      const product = await managedProduct(ctx, PERMISSIONS.CATALOG_MANAGE, id);
       if (input.categoryId && !(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('CATEGORY', input.categoryId);
       const changes = diff(product.toObject(), input);
       Object.assign(product, input);
@@ -717,7 +864,7 @@ const resolvers = {
     // Desactivar un producto deja sin disponibilidad a los paquetes que lo
     // contienen automáticamente (su stock es derivado): no hay que tocarlos.
     setProductActive: async (_, { id, active }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      await managedProduct(ctx, PERMISSIONS.CATALOG_MANAGE, id);
       const before = await Product.findByIdAndUpdate(id, { isActive: active }, { new: false });
       if (!before) throw notFound('PRODUCT', id);
       await invalidateProducts(id);
@@ -726,9 +873,11 @@ const resolvers = {
       }
       return Product.findById(id).exec();
     },
+    // El stock es de la sucursal del producto.
     setProductStock: async (_, { id, stock }, ctx) => {
       requirePermission(ctx, PERMISSIONS.STOCK_MANAGE);
       if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero >= 0.', 'INVALID_STOCK');
+      await managedProduct(ctx, PERMISSIONS.STOCK_MANAGE, id);
       const before = await Product.findByIdAndUpdate(id, { stock }, { new: false });
       if (!before) throw notFound('PRODUCT', id);
       await invalidateProducts(id);
@@ -736,9 +885,7 @@ const resolvers = {
       return Product.findById(id).exec();
     },
     addProductDiscount: async (_, { productId, input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
-      const product = await Product.findById(productId);
-      if (!product) throw notFound('PRODUCT', productId);
+      const product = await managedProduct(ctx, PERMISSIONS.CATALOG_MANAGE, productId);
       product.discounts.push(input);
       await product.save();
       await invalidateProducts(productId);
@@ -749,9 +896,7 @@ const resolvers = {
       return product;
     },
     removeProductDiscount: async (_, { productId, discountId }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
-      const product = await Product.findById(productId);
-      if (!product) throw notFound('PRODUCT', productId);
+      const product = await managedProduct(ctx, PERMISSIONS.CATALOG_MANAGE, productId);
       const discount = product.discounts.id(discountId);
       if (!discount) throw notFound('DISCOUNT', discountId);
       const { percent, label } = discount;
@@ -763,21 +908,20 @@ const resolvers = {
     },
 
     // ---------- Paquetes (catalog:manage) ----------
+    // Un paquete solo contiene productos de su propia sucursal (PACKAGE_STORE_MISMATCH).
     createPackage: async (_, { input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      await requireCatalogStore(ctx, input.storeId);
       assertPackagePersistable(input); // valida la composición antes de tocar la BD
-      await assertProductsExist(input.items.map(i => i.productId));
+      await assertPackageProducts(input.storeId, input.items);
       const pkg = await Package.create(input);
       catalogEvent(ctx, 'PACKAGE_CREATED', 'Package', pkg, pkg.name, { price: pkg.price, items: pkg.items.length });
       return pkg;
     },
     updatePackage: async (_, { id, input }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
-      const pkg = await Package.findById(id);
-      if (!pkg) throw notFound('PACKAGE', id);
+      const pkg = await managedPackage(ctx, id);
       if (input.items) {
         assertPackagePersistable({ ...pkg.toObject(), ...input });
-        await assertProductsExist(input.items.map(i => i.productId));
+        await assertPackageProducts(pkg.storeId, input.items);
       }
       const { items, ...fields } = input;
       const changes = diff(pkg.toObject(), fields);
@@ -788,7 +932,7 @@ const resolvers = {
       return pkg;
     },
     setPackageActive: async (_, { id, active }, ctx) => {
-      requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
+      await managedPackage(ctx, id);
       const before = await Package.findByIdAndUpdate(id, { isActive: active }, { new: false });
       if (!before) throw notFound('PACKAGE', id);
       if (before.isActive !== active) {
@@ -826,14 +970,14 @@ const resolvers = {
     addToCart: async (_, { productId, packageId, quantity }, ctx) => {
       const me = requireAuth(ctx);
       const ref = itemRef({ productId, packageId });
-      await assertPurchasableRef(ref);
+      await assertCartAcceptsRef(me.id, ref);
       await cartStore.addToCart(me.id, ref, quantity);
       return buildCart(me.id);
     },
     setCartItemQuantity: async (_, { productId, packageId, quantity }, ctx) => {
       const me = requireAuth(ctx);
       const ref = itemRef({ productId, packageId });
-      if (quantity > 0) await assertPurchasableRef(ref);
+      if (quantity > 0) await assertCartAcceptsRef(me.id, ref);
       await cartStore.setCartQuantity(me.id, ref, quantity);
       return buildCart(me.id);
     },
@@ -859,7 +1003,8 @@ const resolvers = {
 
       const refs = await cartStore.getCart(me.id);
       if (!refs.length) throw new DomainError('El carrito está vacío.', 'CART_EMPTY');
-      const { unavailable } = reconcileCart(await loadLines(refs));
+      const lines = await loadLines(refs);
+      const { unavailable } = reconcileCart(lines, { storeId: cartStoreId(lines, input.storeId) });
       if (unavailable.length) {
         const names = unavailable.map(u => (u.package ?? u.product)?.name ?? 'producto eliminado').join(', ');
         throw new DomainError(`Hay partidas no disponibles en el carrito: ${names}.`, 'CART_HAS_UNAVAILABLE_ITEMS', {

@@ -54,12 +54,17 @@ type User @key(fields: "id") {
 
 # ------------------------------------------------------------
 # Catálogo: categorías, productos y paquetes
+#
+# Marketplace: cada sucursal es un negocio con su propio catálogo y stock.
+# Productos y paquetes pertenecen a una sucursal; las categorías son globales.
 # ------------------------------------------------------------
+"Categoría global, compartida por todas las sucursales."
 type Category @key(fields: "id") {
   id: ID!
   name: String!
   icon: String
   sortOrder: Int!
+  "Productos activos de la categoría en todas las sucursales activas."
   products: [Product!]!
 }
 
@@ -75,11 +80,14 @@ type ProductDiscount {
 
 type Product @key(fields: "id") {
   id: ID!
+  "Sucursal dueña del producto y de su stock. No cambia después del alta."
+  store: Store!
   name: String!
   description: String
   price: Float!
   imageUrl: String
   unit: Unit!
+  "Stock de la sucursal del producto."
   stock: Int!
   isActive: Boolean!
   category: Category!
@@ -100,9 +108,11 @@ type PackageItem {
   quantity: Int!
 }
 
-"Combo de productos (p. ej. paquete para carne asada). Precio fijo; su stock se deriva del de sus productos."
+"Combo de productos de una misma sucursal (p. ej. paquete para carne asada). Precio fijo; su stock se deriva del de sus productos."
 type Package @key(fields: "id") {
   id: ID!
+  "Sucursal del paquete; todos sus productos son de ella. No cambia después del alta."
+  store: Store!
   name: String!
   description: String
   price: Float!
@@ -133,6 +143,11 @@ type Store @key(fields: "id") {
   deliveryFee: Float!
   "Subtotal a partir del cual el reparto es gratis (null = nunca gratis)."
   freeDeliveryThreshold: Float
+  "Catálogo de la sucursal. Si está desactivada, vacío salvo para quien administra su catálogo o inventario."
+  products(categoryId: ID, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
+  packages(activeOnly: Boolean = true): [Package!]!
+  "Categorías con al menos un producto activo en esta sucursal."
+  categories: [Category!]!
 }
 
 # ------------------------------------------------------------
@@ -192,8 +207,8 @@ type OrderQuote {
 # ------------------------------------------------------------
 # Carrito (vive en Redis: solo referencias y cantidades)
 # ------------------------------------------------------------
-"Por qué una partida del carrito no se puede comprar ahora."
-enum UnavailableReason { DELETED INACTIVE OUT_OF_STOCK INSUFFICIENT_STOCK }
+"Por qué una partida del carrito no se puede comprar ahora. OTHER_STORE: es de otra sucursal que la del carrito (carritos anteriores al marketplace)."
+enum UnavailableReason { DELETED INACTIVE OUT_OF_STOCK INSUFFICIENT_STOCK OTHER_STORE }
 
 type CartLine {
   type: ItemType!
@@ -215,8 +230,10 @@ type UnavailableCartLine {
   availableQuantity: Int!
 }
 
-"El precio no se guarda en el carrito: se calcula al leerlo contra el catálogo actual."
+"El precio no se guarda en el carrito: se calcula al leerlo contra el catálogo actual. Un carrito es de una sola sucursal."
 type Cart {
+  "Sucursal del carrito, la de sus partidas (null si está vacío). Agregar un artículo de otra falla con CART_STORE_MISMATCH."
+  store: Store
   items: [CartLine!]!
   unavailable: [UnavailableCartLine!]!
   itemCount: Int!
@@ -249,6 +266,8 @@ type ShoppingList {
 # Reportes
 # ------------------------------------------------------------
 type SalesRow {
+  storeId: ID!
+  storeName: String!
   type: ItemType!
   itemId: ID!
   name: String!
@@ -259,6 +278,8 @@ type SalesRow {
 
 "Cuánto producto se necesita para surtir los paquetes vendidos en un periodo (para las compras del restaurante)."
 type ComponentDemandRow {
+  storeId: ID!
+  storeName: String!
   productId: ID!
   name: String!
   "Unidades del producto requeridas por los paquetes vendidos."
@@ -365,6 +386,8 @@ input CategoryInput {
 }
 
 input ProductInput {
+  "Sucursal dueña del producto; debe estar en el alcance de quien lo da de alta."
+  storeId: ID!
   categoryId: ID!
   name: String!
   description: String
@@ -390,8 +413,10 @@ input PackageItemInput {
   quantity: Int!
 }
 
-"Alta de un paquete. Debe incluir al menos 2 productos distintos."
+"Alta de un paquete. Debe incluir al menos 2 productos distintos, todos de su sucursal."
 input PackageInput {
+  "Sucursal del paquete; debe estar en el alcance de quien lo da de alta."
+  storeId: ID!
   name: String!
   description: String
   price: Float!
@@ -444,6 +469,7 @@ input CartItemInput {
 
 input QuoteInput {
   mode: OrderMode!
+  "Pista opcional: la sucursal es la de los artículos. Si difiere, STORE_MISMATCH."
   storeId: ID
   items: [CartItemInput!]!
 }
@@ -451,6 +477,7 @@ input QuoteInput {
 input CreateOrderInput {
   userId: ID!
   mode: OrderMode!
+  "Pista opcional: la sucursal es la de los artículos. Si difiere, STORE_MISMATCH."
   storeId: ID
   "Dirección para DELIVERY. Si se omite se usa addressId o la predeterminada del usuario."
   address: LocationInput
@@ -466,6 +493,7 @@ input CreateOrderInput {
 "Compra el carrito del usuario autenticado (las partidas salen de Redis)."
 input CheckoutCartInput {
   mode: OrderMode!
+  "Pista opcional: la sucursal es la del carrito. Si difiere, STORE_MISMATCH."
   storeId: ID
   address: LocationInput
   addressId: ID
@@ -496,10 +524,12 @@ type Query {
   categories: [Category!]!
   category(id: ID!): Category
 
-  products(categoryId: ID, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
+  "Sin storeId: el marketplace completo (productos de todas las sucursales activas)."
+  products(storeId: ID, categoryId: ID, search: String, activeOnly: Boolean = true, limit: Int = 20, offset: Int = 0): [Product!]!
   product(id: ID!): Product
 
-  packages(activeOnly: Boolean = true): [Package!]!
+  "Sin storeId: los paquetes de todas las sucursales activas."
+  packages(storeId: ID, activeOnly: Boolean = true): [Package!]!
   package(id: ID!): Package
 
   stores(activeOnly: Boolean = true): [Store!]!
@@ -519,16 +549,16 @@ type Query {
   "Cotiza un carrito (precios, descuentos y costo de envío) sin crear la orden."
   quoteOrder(input: QuoteInput!): OrderQuote!
 
-  "Carrito del usuario autenticado, contrastado con el catálogo actual y cotizado."
+  "Carrito del usuario autenticado, contrastado con el catálogo actual y cotizado. storeId es una pista: si difiere de la sucursal del carrito, STORE_MISMATCH."
   cart(mode: OrderMode = PICKUP, storeId: ID): Cart!
   "Últimas 20 órdenes del usuario autenticado (ids en Redis, datos desde Mongo)."
   recentOrders: [Order!]!
 
-  "Pipeline de agregación: ventas por producto y paquete en un periodo ($match → $unwind → $group → $sort)."
-  salesReport(from: DateTime!, to: DateTime!): [SalesRow!]!
+  "Pipeline de agregación: ventas por sucursal, producto y paquete en un periodo ($match → $unwind → $group → $sort). Sin storeId: las sucursales del alcance (ADMIN: todas)."
+  salesReport(from: DateTime!, to: DateTime!, storeId: ID): [SalesRow!]!
 
-  "Pipeline de agregación anidada: explota los paquetes vendidos en sus productos para planear compras."
-  packageComponentDemand(from: DateTime!, to: DateTime!): [ComponentDemandRow!]!
+  "Pipeline de agregación anidada: explota los paquetes vendidos en sus productos para planear compras. Sin storeId: las sucursales del alcance (ADMIN: todas)."
+  packageComponentDemand(from: DateTime!, to: DateTime!, storeId: ID): [ComponentDemandRow!]!
 }
 
 type Mutation {
@@ -565,7 +595,7 @@ type Mutation {
 
   createOrder(input: CreateOrderInput!): Order!
 
-  "Agrega (o suma cantidad a) un producto O un paquete al carrito del usuario autenticado."
+  "Agrega (o suma cantidad a) un producto O un paquete al carrito del usuario autenticado. Debe ser de la sucursal del carrito (CART_STORE_MISMATCH)."
   addToCart(productId: ID, packageId: ID, quantity: Int = 1): Cart!
   "Fija la cantidad exacta; 0 quita la partida."
   setCartItemQuantity(productId: ID, packageId: ID, quantity: Int!): Cart!

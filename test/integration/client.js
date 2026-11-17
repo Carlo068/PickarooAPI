@@ -17,6 +17,9 @@ export const SEED_USERS = {
   STAFF: { email: 'empleado@carnyfrut.mx', password: 'Staff1234' },
   DELIVERY: { email: 'repartidor@carnyfrut.mx', password: 'Delivery1234' },
   CUSTOMER: { email: 'cliente@demo.mx', password: 'Cliente1234' },
+  // Frutería La Huerta: segundo negocio del seed (marketplace).
+  HUERTA_MANAGER: { email: 'gerente@lahuerta.mx', password: 'Manager1234' },
+  HUERTA_STAFF: { email: 'empleado@lahuerta.mx', password: 'Staff1234' },
 };
 
 export const uid = () => randomBytes(4).toString('hex');
@@ -116,24 +119,27 @@ export async function newUser(role) {
 }
 
 // ---------- Catálogo propio de cada prueba ----------
+// Marketplace: cada producto y paquete es de una sucursal. Por omisión, la del
+// seed (CARNYFRUT Centro), donde trabaja el personal del seed; `storeId` para
+// otra (p. ej. una de newStore()).
 let categoryId = null;
 async function abarrotes() {
   if (!categoryId) categoryId = (await ok('{ categories { id name } }')).categories.find(c => c.name === 'Abarrotes').id;
   return categoryId;
 }
 
-export const PRODUCT_FIELDS = 'id name price stock isActive effectivePrice activeDiscountPercent';
+export const PRODUCT_FIELDS = 'id name price stock isActive effectivePrice activeDiscountPercent store { id }';
 
-export async function newProduct({ price = 100, stock = 10, unit = 'UNIDAD' } = {}) {
+export async function newProduct({ price = 100, stock = 10, unit = 'UNIDAD', storeId, name = `Producto IT ${uid()}` } = {}) {
   const { createProduct } = await ok(`mutation($input: ProductInput!) { createProduct(input: $input) { ${PRODUCT_FIELDS} } }`, {
-    input: { categoryId: await abarrotes(), name: `Producto IT ${uid()}`, price, stock, unit },
+    input: { storeId: storeId ?? (await seedStore()).id, categoryId: await abarrotes(), name, price, stock, unit },
   }, await tokenOf('ADMIN'));
   return createProduct;
 }
 
-export async function newPackage(items, price = 150) {
-  const { createPackage } = await ok(`mutation($input: PackageInput!) { createPackage(input: $input) { id name price availableStock } }`, {
-    input: { name: `Paquete IT ${uid()}`, price, items },
+export async function newPackage(items, price = 150, { storeId } = {}) {
+  const { createPackage } = await ok(`mutation($input: PackageInput!) { createPackage(input: $input) { id name price availableStock store { id } } }`, {
+    input: { storeId: storeId ?? (await seedStore()).id, name: `Paquete IT ${uid()}`, price, items },
   }, await tokenOf('ADMIN'));
   return createPackage;
 }
@@ -142,10 +148,30 @@ export async function stockOf(productId) {
   return (await ok('query($id: ID!) { product(id: $id) { stock } }', { id: productId })).product.stock;
 }
 
+const findStore = async name => (await ok('{ stores { id name deliveryFee freeDeliveryThreshold } }')).stores.find(s => s.name === name);
+
 let centro = null;
 export async function seedStore() {
-  if (!centro) centro = (await ok('{ stores { id name deliveryFee freeDeliveryThreshold } }')).stores.find(s => s.name === 'CARNYFRUT Centro');
+  if (!centro) centro = await findStore('CARNYFRUT Centro');
   return centro;
+}
+
+let huerta = null;
+export async function huertaStore() {
+  if (!huerta) huerta = await findStore('Frutería La Huerta');
+  return huerta;
+}
+
+// Sucursal propia de una prueba (otro negocio del marketplace), creada por el administrador.
+export async function newStore({ deliveryFee = 0, freeDeliveryThreshold = null } = {}) {
+  const { createStore } = await ok('mutation($input: StoreInput!) { createStore(input: $input) { id name deliveryFee freeDeliveryThreshold isActive } }', {
+    input: { name: `Tienda IT ${uid()}`, address: ADDRESS, deliveryFee, freeDeliveryThreshold },
+  }, await tokenOf('ADMIN'));
+  return createStore;
+}
+
+export async function setStoreActive(storeId, isActive) {
+  await ok('mutation($id: ID!, $input: StoreUpdateInput!) { updateStore(id: $id, input: $input) { id isActive } }', { id: storeId, input: { isActive } }, await tokenOf('ADMIN'));
 }
 
 // ---------- Órdenes ----------
@@ -153,10 +179,11 @@ export const ORDER_FIELDS = 'id number status mode total deliveryFee subtotal st
 
 export const ADDRESS = { street: 'Calle de Prueba 1', city: 'Chihuahua', state: 'Chihuahua', zipCode: '31000' };
 
+// La sucursal sale de los artículos; `storeId` es una pista opcional.
 export async function createOrder(customer, { items, mode = 'PICKUP', storeId, idempotencyKey, address } = {}) {
   const input = {
     userId: customer.id, mode, items,
-    storeId: storeId ?? (await seedStore()).id,
+    ...(storeId ? { storeId } : {}),
     ...(idempotencyKey ? { idempotencyKey } : {}),
     ...(mode === 'DELIVERY' ? { address: address ?? ADDRESS } : {}),
   };

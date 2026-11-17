@@ -25,6 +25,7 @@ const date = v => (v ? new Date(v) : null);
 export function productView(d) {
   return {
     id: String(d._id ?? d.id),
+    storeId: str(d.storeId),
     categoryId: str(d.categoryId),
     name: d.name,
     description: d.description ?? null,
@@ -73,13 +74,13 @@ export function userView(d) {
 
 // ---------- Vista ⇄ entidad Redis OM ----------
 const productToCache = v => ({
-  mongoId: v.id, categoryId: v.categoryId, name: v.name, description: v.description, price: v.price,
+  mongoId: v.id, storeId: v.storeId, categoryId: v.categoryId, name: v.name, description: v.description, price: v.price,
   imageUrl: v.imageUrl, unit: v.unit, stock: v.stock, isActive: v.isActive,
   discountsJson: JSON.stringify(v.discounts), createdAt: v.createdAt, updatedAt: v.updatedAt,
 });
 
 const productFromCache = e => ({
-  id: e.mongoId, categoryId: e.categoryId, name: e.name, description: e.description ?? null, price: e.price,
+  id: e.mongoId, storeId: e.storeId ?? null, categoryId: e.categoryId, name: e.name, description: e.description ?? null, price: e.price,
   imageUrl: e.imageUrl ?? null, unit: e.unit, stock: e.stock, isActive: e.isActive,
   discounts: JSON.parse(e.discountsJson || '[]').map(x => ({ ...x, startsAt: date(x.startsAt), endsAt: date(x.endsAt) })),
   createdAt: e.createdAt, updatedAt: e.updatedAt,

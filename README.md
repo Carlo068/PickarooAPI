@@ -1,6 +1,6 @@
 # PickarooAPI
 
-Backend GraphQL de Pickaroo para administrar un catálogo comercial, paquetes de productos, sucursales, usuarios, listas de compra y pedidos con recogida o entrega a domicilio. La implementación incluye datos de demostración de CARNYFRUT, orientados a productos para carne asada y parrilladas.
+Backend GraphQL de Pickaroo, un **marketplace**: cada sucursal (`Store`) es un negocio independiente con su propio catálogo de productos y paquetes, su stock y su política de reparto; las categorías son globales y las comparten todas. La API administra el catálogo de cada sucursal, usuarios, listas de compra y pedidos con recogida o entrega a domicilio, siempre de una sola sucursal por carrito y por pedido. La implementación incluye datos de demostración de dos negocios: CARNYFRUT Centro (productos para carne asada y parrilladas) y Frutería La Huerta.
 
 El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, **Redis Stack** guarda las sesiones de inicio de sesión (JWT), el carrito y una copia de lectura de productos y usuarios. **Neo4j** guarda el grafo de roles, permisos, sucursales del personal y menús (RBAC). Cada acción relevante se publica en **RabbitMQ** y **`services/auditAPI`** la persiste en **ScyllaDB** como bitácora de auditoría inmutable.
 
@@ -74,14 +74,17 @@ PickarooAPI/
         ├── .env.example
         └── src/
             ├── index.js
+            ├── migrate.js        npm run migrate (migraciones sin arrancar la API)
             ├── auth.js
             ├── schema.graphql
             ├── domain/
             │   ├── entities.js
             │   ├── errors.js     catálogo de códigos de error y DomainError
-            │   └── access.js     roles, permisos, menús y reglas de acceso
+            │   ├── access.js     roles, permisos, menús y reglas de acceso
+            │   └── migrations.js decisiones puras de las migraciones de datos
             └── infrastructure/
                 ├── neo4j.js
+                ├── migrations.js migraciones de datos (MongoDB)
                 ├── rbac-graph.js consultas Cypher del RBAC
                 ├── events.js     productor de eventos de auditoría
                 ├── format-error.js  errores de dominio/Mongoose → extensions.code
@@ -126,19 +129,22 @@ Los importes se exponen como `Float` en **pesos mexicanos**, no como centavos en
 
 ### Dominio: `src/domain/entities.js`
 
-La capa de dominio no importa Mongoose ni Apollo. Sus clases `Product` y `Package` y sus funciones centralizan las siguientes reglas:
+La capa de dominio no importa Mongoose ni Apollo. Sus clases `Product` y `Package` (con el `storeId` de su sucursal) y sus funciones centralizan las siguientes reglas:
 
 | Elemento | Función |
 |---|---|
 | `assertProductPersistable` | Exigir nombre válido, precio positivo y stock entero no negativo. |
 | `assertPackagePersistable` | Exigir nombre, precio positivo y entre 2 y 40 productos distintos con cantidades enteras positivas. |
+| `assertPackageSameStore` | Exigir que todos los productos de un paquete sean de su sucursal (`PACKAGE_STORE_MISMATCH`). |
+| `linesStoreId` | Obtener la sucursal de una cotización u orden a partir de sus partidas (`MIXED_STORES`, `STORE_MISMATCH`, `ITEM_WITHOUT_STORE`). |
+| `cartStoreId` / `assertCartAccepts` | Obtener la sucursal de un carrito y rechazar artículos de otra (`CART_STORE_MISMATCH`). |
 | `Package.availableStock` | Calcular cuántos paquetes completos alcanzan con el stock de sus productos. |
 | `Package.alaCarteTotal` / `savings` | Comparar el precio fijo del paquete con su contenido comprado por separado. |
 | `stockDemand` | Sumar cuánto de cada producto consume una compra, sea suelto o dentro de paquetes. |
 | `bestDiscountPercent` | Seleccionar el mayor porcentaje entre los descuentos vigentes. |
 | `applyDiscount` | Calcular el precio unitario después del descuento. |
 | `priceOrder` | Construir las partidas históricas, validar stock consolidado y calcular subtotal, descuento, envío y total. |
-| `deliveryFee` | Determinar el costo de entrega según la sucursal y su umbral de envío gratuito. |
+| `deliveryFee` | Determinar el costo de entrega según la sucursal de los artículos y su umbral de envío gratuito. |
 | `assertTransition` | Validar cambios de estado del pedido. |
 | `buildOrderNumber` | Generar un número con formato `PK-AAAAMMDD-SUFIJO`. |
 
@@ -159,11 +165,12 @@ El proceso del servicio realiza estas acciones:
 1. Carga las variables de entorno y lee el SDL desde disco.
 2. Espera la conexión con MongoDB antes de iniciar la API.
 3. Ejecuta `syncIndexes()` para cada modelo. Los errores de índices se registran como advertencias y no detienen por sí mismos el arranque.
-4. Conecta con Redis (espera hasta 3 segundos; si no responde, sigue reintentando en segundo plano).
-5. Conecta con Neo4j y crea/actualiza el catálogo RBAC y las sucursales; si no responde, reintenta cada 10 segundos.
-6. Intenta conectar con RabbitMQ y declarar la cola de eventos.
-7. Construye y publica el subgrafo con Apollo Server; el contexto de cada petición valida el JWT.
-8. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar.
+4. Ejecuta las migraciones de datos (idempotentes, ver "Migración al marketplace" en la sección 3). Un fallo se registra y no detiene el arranque.
+5. Conecta con Redis (espera hasta 3 segundos; si no responde, sigue reintentando en segundo plano).
+6. Conecta con Neo4j y crea/actualiza el catálogo RBAC y las sucursales; si no responde, reintenta cada 10 segundos.
+7. Intenta conectar con RabbitMQ y declarar la cola de eventos.
+8. Construye y publica el subgrafo con Apollo Server; el contexto de cada petición valida el JWT.
+9. Si `SEED=true`, ejecuta la carga de demostración después de que el servidor empieza a escuchar (siempre después de las migraciones).
 
 `syncIndexes()` puede crear o eliminar índices para alinearlos con los esquemas. El inicio del servicio no es, por tanto, una operación estrictamente de solo lectura sobre la base.
 
@@ -177,13 +184,15 @@ MongoDB sigue siendo la fuente de verdad. Redis Stack (RedisJSON + RediSearch) s
 | Índice de sesiones | `user:<userId>:sessions` (SET de `jti`) | igual que la sesión | `auth.js` |
 | Caché de productos (Redis OM, JSON) | `Product:<id>` | 120 s (`CACHE_TTL_PRODUCT`) | `entity-cache.js` |
 | Caché de usuarios (Redis OM, JSON) | `User:<id>` | 3600 s (`CACHE_TTL_USER`) | `entity-cache.js` |
-| Carrito | `cart:<userId>` (HASH `p:<productId>` / `k:<packageId>` → cantidad) | 7 días, se renueva con cada cambio | `cart-store.js` |
+| Carrito | `cart:<userId>` (HASH `p:<productId>` / `k:<packageId>` → cantidad; una sola sucursal, la de sus partidas) | 7 días, se renueva con cada cambio | `cart-store.js` |
 | Cotizaciones | `quote:<uuid>` (JSON con partidas, envío y total) | 15 min | `quote-store.js` |
 | Pedidos recientes | `user:<userId>:orders:recent` (LIST de ids, máx. 20) | 24 h | `recent-orders.js` |
 
 #### Carrito y cotizaciones: precios que cambian y productos que desaparecen
 
-- **El carrito no guarda precios**, solo ids y cantidades. Cada lectura (`cart`) lo contrasta con el catálogo actual de MongoDB (`reconcileCart` en el dominio). Un cambio de precio se ve al instante, y lo que ya no se puede comprar aparece en `unavailable` con su motivo (`DELETED`, `INACTIVE`, `OUT_OF_STOCK`, `INSUFFICIENT_STOCK`) en lugar de cobrarse. Desactivar o borrar un producto no exige recorrer los carritos.
+- **El carrito no guarda precios**, solo ids y cantidades. Cada lectura (`cart`) lo contrasta con el catálogo actual de MongoDB (`reconcileCart` en el dominio). Un cambio de precio se ve al instante, y lo que ya no se puede comprar aparece en `unavailable` con su motivo (`DELETED`, `INACTIVE`, `OUT_OF_STOCK`, `INSUFFICIENT_STOCK`, `OTHER_STORE`) en lugar de cobrarse. Desactivar o borrar un producto no exige recorrer los carritos.
+- **Un carrito es de una sola sucursal.** No se guarda aparte: es la de sus partidas (`Cart.store`, null si está vacío). `addToCart` (y `setCartItemQuantity` con una partida nueva) rechaza un artículo de otra sucursal con `CART_STORE_MISMATCH` (`cartStoreId`, `itemStoreId`); el cliente ofrece "vaciar el carrito y agregar" (`clearCart` y de nuevo `addToCart`). El argumento `storeId` de `cart` es solo una pista: si no es la sucursal del carrito, `STORE_MISMATCH`. Un carrito que ya mezclaba sucursales (anterior al marketplace) se queda con la sucursal de la pista o, sin pista, con la que tiene más partidas; las demás aparecen en `unavailable` con `OTHER_STORE`. La comprobación al agregar no es atómica entre dos peticiones simultáneas; si se colara una mezcla, la lectura la reporta como `OTHER_STORE`.
+- **Una cotización y una orden son de una sola sucursal**: la de sus artículos. `QuoteInput.storeId`, `CreateOrderInput.storeId` y `CheckoutCartInput.storeId` son pistas opcionales: si no coinciden, `STORE_MISMATCH` (`expectedStoreId`, `itemsStoreId`); artículos de varias sucursales, `MIXED_STORES` (`storeIds`). El costo de envío y el umbral de envío gratis son los de esa sucursal.
 - **Una cotización no congela el precio**: es el total que el cliente vio. `quoteOrder` y `cart` devuelven `quoteId`. Si se manda en `createOrder` o `checkoutCart`, la compra se recalcula contra MongoDB y se compara (`assertQuoteStillValid`):
   - precios, descuentos, envío o total distintos → `PRICE_CHANGED`;
   - otros productos, cantidades, sucursal o modo → `QUOTE_MISMATCH`;
@@ -226,9 +235,9 @@ Correo inexistente, contraseña incorrecta y cuenta desactivada devuelven el mis
 | Rol | Hereda de | Para quién | Permisos propios |
 |---|---|---|---|
 | `CUSTOMER` | — | Cliente | ninguno (lo suyo se controla por dueño) |
-| `STAFF` | CUSTOMER | Empleado de mostrador | `orders:prepare`, `stock:manage` |
+| `STAFF` | CUSTOMER | Empleado de mostrador | `orders:prepare`, `stock:manage` (en sus sucursales) |
 | `DELIVERY` | CUSTOMER | Repartidor | `orders:deliver` |
-| `MANAGER` | STAFF | Gerente de sucursal | `catalog:manage`, `reports:view` |
+| `MANAGER` | STAFF | Gerente de sucursal | `catalog:manage`, `reports:view` (en sus sucursales) |
 | `ADMIN` | MANAGER | Dueño / sistemas | `orders:deliver`, `stores:manage`, `users:manage`, `audit:view`, `scope:all_stores` |
 
 Los permisos efectivos son los del rol más los de todos los roles que hereda (`[:INHERITS*0..]`). Los `id` de `User` y `Store` en Neo4j son los `_id` de MongoDB.
@@ -236,7 +245,8 @@ Los permisos efectivos son los del rol más los de todos los roles que hereda (`
 - **Fuente de verdad:** Neo4j. `users.role` en MongoDB es un espejo: se actualiza con `assignRole` y se corrige solo en el login si difiere.
 - **Catálogo:** roles, permisos, herencia y menú se definen en `domain/access.js` y se crean/actualizan en Neo4j en cada arranque (y al reconectar).
 - **Auto-reparación:** un usuario que aún no está en el grafo se crea en su primer login con el rol espejo de MongoDB.
-- **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT`; `scope:all_stores` (ADMIN) ve todas.
+- **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT`; `scope:all_stores` (ADMIN) ve todas. Lo mismo vale para el catálogo y el inventario: `catalog:manage` (alta y edición de productos y paquetes, descuentos, activar/desactivar) y `stock:manage` (`setProductStock`) solo aplican a artículos de una sucursal del alcance, y los reportes solo cubren esas sucursales. Fuera del alcance: `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED` y `storeId`. La regla es `storeItemDenial` en `domain/access.js` (reportes: `reportStoreScope`).
+- **Categorías globales:** las comparten todas las sucursales, así que crearlas exige `catalog:manage` **y** `scope:all_stores` (solo ADMIN). A un MANAGER le falta el segundo: `FORBIDDEN`, `reason: PERMISSION_REQUIRED`, `permission: scope:all_stores`.
 - **Cambios de acceso inmediatos:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan todas las sesiones del usuario (`user:<id>:sessions`); al volver a entrar recibe los permisos nuevos.
 - **Neo4j caído:** el login funciona con permisos vacíos (`access.degraded = true`) y se registra `RBAC_UNAVAILABLE`. Nadie gana privilegios sin el grafo; los clientes compran normalmente.
 
@@ -257,9 +267,10 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
 | Dueño o `users:manage` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal: las de sus sucursales; repartidor: solo DELIVERY), `cancelOrder`, `updateOrderStatus` (según la tabla anterior) |
-| `stock:manage` | `setProductStock` |
-| `catalog:manage` | `createCategory`, `createProduct`, `updateProduct`, `setProductActive`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive` |
-| `reports:view` | `salesReport`, `packageComponentDemand` |
+| `stock:manage` en la sucursal del producto | `setProductStock` |
+| `catalog:manage` en la sucursal del artículo (alta: la `storeId` del input) | `createProduct`, `updateProduct`, `setProductActive`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive` |
+| `catalog:manage` + `scope:all_stores` | `createCategory` |
+| `reports:view` (sucursales del alcance) | `salesReport`, `packageComponentDemand` |
 | `stores:manage` | `createStore`, `updateStore` |
 | `users:manage` | `users`, `roles`, `userAccess`, `assignRole`, `assignUserToStore`, `removeUserFromStore`, `createUser` con un rol distinto de `CUSTOMER` |
 | `audit:view` | `auditEvents`, `auditByActor`, `auditByTarget`, `auditSummary` (subgrafo auditoria) |
@@ -304,6 +315,7 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `INVALID_PACKAGE_ITEM` | Un producto del paquete no trae productId. | — |
 | `DUPLICATE_PACKAGE_PRODUCT` | El paquete repite un producto. | — |
 | `PACKAGE_PRODUCT_NOT_FOUND` | Algún producto del paquete no existe en el catálogo. | — |
+| `PACKAGE_STORE_MISMATCH` | Un paquete solo puede contener productos de su propia sucursal (`storeId`); `productIds` son los de otra. | `storeId`, `productIds` |
 
 **Disponibilidad e inventario**
 
@@ -311,6 +323,7 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 |---|---|---|
 | `ITEM_UNAVAILABLE` | El producto o paquete está desactivado (o, en un paquete, alguno de sus productos lo está). | `itemType`, `id?`, `name`, `componentId?`, `componentName?` |
 | `INSUFFICIENT_STOCK` | No alcanza el stock de un producto para la cantidad pedida. | `productId`, `name`, `requested`, `available` |
+| `ITEM_WITHOUT_STORE` | El producto o paquete no pertenece a ninguna sucursal (dato anterior al marketplace sin migrar); no se puede comprar. | `itemType`, `id`, `name` |
 
 **Carrito**
 
@@ -320,6 +333,7 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `CART_FULL` | El carrito ya tiene el máximo de partidas. | `maxLines` |
 | `CART_EMPTY` | El carrito está vacío. | — |
 | `CART_HAS_UNAVAILABLE_ITEMS` | Hay partidas del carrito que ya no se pueden comprar. | `unavailable` |
+| `CART_STORE_MISMATCH` | El carrito ya tiene artículos de otra sucursal (`cartStoreId`); para agregar este (de `itemStoreId`) hay que vaciarlo primero. | `cartStoreId`, `itemStoreId` |
 
 **Cotización y compra**
 
@@ -333,8 +347,9 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `STORE_REQUIRED` | Una orden de recogida necesita sucursal. | — |
 | `DELIVERY_ADDRESS_REQUIRED` | Una orden a domicilio necesita dirección de entrega. | — |
 | `USER_INACTIVE` | El usuario que compra está desactivado. | — |
-| `NO_ACTIVE_STORE` | No hay ninguna sucursal activa configurada. | — |
-| `STORE_INACTIVE` | La sucursal indicada está desactivada. | `storeId`, `name` |
+| `STORE_INACTIVE` | La sucursal de los artículos está desactivada. | `storeId`, `name` |
+| `STORE_MISMATCH` | La sucursal indicada (`expectedStoreId`) no es la de los artículos (`itemsStoreId`): la compra es de la sucursal de sus artículos. | `expectedStoreId`, `itemsStoreId` |
+| `MIXED_STORES` | La compra tiene artículos de más de una sucursal (`storeIds`, ordenados). | `storeIds` |
 
 **Estados de la orden**
 
@@ -373,7 +388,7 @@ Notas por código:
 | `ORDER_VIEW_DENIED` | No se puede ver esa orden. |
 | `ORDER_STATUS_CHANGE_DENIED` | No se puede pasar la orden al estado `status`. |
 | `ORDER_CANCEL_DENIED` | No se puede cancelar esa orden. |
-| `STORE_NOT_ASSIGNED` | La sucursal `storeId` no está asignada al usuario. |
+| `STORE_NOT_ASSIGNED` | La sucursal `storeId` no está asignada al usuario (órdenes, catálogo, inventario o reportes de otra sucursal). |
 | `OWN_ORDERS_ONLY` | Solo se pueden consultar las órdenes propias. |
 | `CANNOT_CHANGE_OWN_ROLE` | Un usuario no puede cambiar su propio rol. |
 
@@ -381,7 +396,8 @@ Notas por código:
 - `NOT_FOUND.entity` es uno de `USER`, `STORE`, `ADDRESS`, `CATEGORY`, `PRODUCT`, `PACKAGE`, `DISCOUNT`, `ORDER` o `SHOPPING_LIST`; `ITEM_UNAVAILABLE.itemType`, `PRODUCT` o `PACKAGE`; `INVALID_NAME.entity` e `INVALID_PRICE.entity`, `PRODUCT` o `PACKAGE`; `INVALID_QUANTITY.context`, `ORDER_LINE`, `PACKAGE_ITEM` o `CART`; `SERVICE_UNAVAILABLE.service`, `SESSIONS`, `CART`, `RBAC` o `AUDIT_LOG`.
 - `VALIDATION_ERROR` es la validación de Mongoose al guardar. `violations` es `[{ field, rule }]`; `rule` es el código de dominio cuando la regla viene del dominio (p. ej. `INVALID_PRICE`, `INVALID_STOCK`) o el tipo de Mongoose (`required`, `min`, `max`, `enum`, `user defined`…).
 - Una clave única repetida (índice de MongoDB, error E11000) llega como `EMAIL_ALREADY_REGISTERED` si el campo es `email` y como `DUPLICATE_VALUE` con `field` en los demás casos.
-- `QUOTE_EXPIRED`, `QUOTE_MISMATCH` y `PRICE_CHANGED` traen `newQuote` (`quoteId`, `expiresAt`, `subtotal`, `discountTotal`, `deliveryFee`, `total` e `items`) para reconfirmar sin otra consulta. `CART_HAS_UNAVAILABLE_ITEMS.unavailable` es `[{ productId, packageId, reason, availableQuantity }]` con `reason` en `DELETED`, `INACTIVE`, `OUT_OF_STOCK` o `INSUFFICIENT_STOCK`.
+- `QUOTE_EXPIRED`, `QUOTE_MISMATCH` y `PRICE_CHANGED` traen `newQuote` (`quoteId`, `expiresAt`, `subtotal`, `discountTotal`, `deliveryFee`, `total` e `items`) para reconfirmar sin otra consulta. `CART_HAS_UNAVAILABLE_ITEMS.unavailable` es `[{ productId, packageId, reason, availableQuantity }]` con `reason` en `DELETED`, `INACTIVE`, `OUT_OF_STOCK`, `INSUFFICIENT_STOCK` u `OTHER_STORE`.
+- `NO_ACTIVE_STORE` ya no existe: la sucursal de una compra sale de sus artículos, nunca de "la primera sucursal activa".
 - Limitación conocida: el campo `quoteError` del carrito (`Cart.quoteError`) es una cadena en español, no un código; el esquema no cambia en esta etapa.
 
 ## 3. Modelo documental
@@ -391,9 +407,9 @@ La aplicación exporta siete modelos. Cada dato vive en un solo lugar: lo que se
 | Colección | Información principal | Datos incrustados o referencias |
 |---|---|---|
 | `users` | Nombre, correo, rol, estado, avatar y `defaultAddressId`. | `addresses[]`: hasta 25 direcciones con `_id`. |
-| `categories` | Nombre (único, sin distinguir mayúsculas), icono y orden. | Los productos la referencian mediante `categoryId`. |
-| `products` | Nombre, descripción, precio, imagen, unidad, stock y estado. | `discounts[]`: hasta 20 promociones. |
-| `packages` | Nombre, descripción, precio fijo, imagen y estado. **Sin stock propio.** | `items[]`: entre 2 y 40 productos con su cantidad. |
+| `categories` | Nombre (único, sin distinguir mayúsculas), icono y orden. **Globales**, compartidas por todas las sucursales. | Los productos la referencian mediante `categoryId`. |
+| `products` | Sucursal (`storeId`), nombre, descripción, precio, imagen, unidad, stock y estado. | `discounts[]`: hasta 20 promociones. |
+| `packages` | Sucursal (`storeId`), nombre, descripción, precio fijo, imagen y estado. **Sin stock propio.** | `items[]`: entre 2 y 40 productos de su sucursal con su cantidad. |
 | `stores` | Nombre, contacto, horario y política de reparto. | `address`: ubicación incrustada. |
 | `orders` | Número, usuario, sucursal, modalidad, estado, envío, total y notas. | `items[]`: hasta 200 partidas; `deliveryAddress`: copia de la ubicación. |
 | `shopping_lists` | Usuario y nombre de la lista. | `items[]`: hasta 200 partidas de productos o paquetes. |
@@ -410,7 +426,7 @@ Se utiliza cuando la información pertenece al documento principal, está acotad
 
 ### Referenciación
 
-Las relaciones compartidas o sin límite de crecimiento se representan con `ObjectId`: la categoría de un producto, los productos de un paquete, el usuario y la sucursal de un pedido, y el producto **o** paquete de cada partida (`productId` o `packageId`, nunca ambos).
+Las relaciones compartidas o sin límite de crecimiento se representan con `ObjectId`: la sucursal y la categoría de un producto, la sucursal y los productos de un paquete, el usuario y la sucursal de un pedido, y el producto **o** paquete de cada partida (`productId` o `packageId`, nunca ambos). El `storeId` de productos y paquetes es obligatorio e inmutable (`immutable` en Mongoose; los inputs de edición no lo traen).
 
 Los pedidos se conservan en su propia colección para que el historial de un usuario crezca sin quedar incrustado en su documento. Una referencia Mongoose no es una clave foránea que MongoDB verifique automáticamente: la aplicación comprueba la existencia de entidades en distintas operaciones.
 
@@ -419,20 +435,38 @@ Los pedidos se conservan en su propia colección para que el historial de un usu
 - Correo de usuario único y nombre de categoría único (colación `es`, sin distinguir mayúsculas).
 - Número de pedido único.
 - Usuario y clave de idempotencia únicos cuando la clave es una cadena.
-- Categoría y estado activo de productos; índice de texto sobre nombre y descripción.
-- `packages.items.productId`, para saber qué paquetes contienen un producto.
+- Categoría y estado activo de productos, y sucursal + categoría + estado activo (catálogo de una sucursal); índice de texto sobre nombre y descripción.
+- Sucursal y estado activo de paquetes; `packages.items.productId`, para saber qué paquetes contienen un producto.
 - Pedidos por usuario, estado, fecha y sucursal.
 - Listas por usuario y fecha de actualización.
+
+### Migración al marketplace
+
+Antes del marketplace los productos y paquetes no tenían sucursal. La migración `backfillCatalogStores` (`infrastructure/migrations.js`; la decisión pura es `planCatalogStoreBackfill` en `domain/migrations.js`) asigna todo producto y paquete sin `storeId` a la **sucursal activa más antigua por `createdAt`** y registra cuántos cambió (`🧭 Migración storeId: productos N, paquetes M → "Sucursal"`).
+
+- Corre en cada arranque de mongoAPI, después de `syncIndexes()` y antes del seed, y también sola con `npm run migrate` (usa el `MONGODB_URI` del `.env` de mongoAPI; no arranca la API).
+- Es idempotente: una segunda corrida cambia 0 documentos.
+- Si hay sucursales pero ninguna está activa, usa la más antigua y registra una advertencia: sus artículos quedan ocultos al público hasta reactivar esa sucursal.
+- Si hay artículos sin sucursal y no existe ninguna sucursal, registra una advertencia y los deja así: no se listan (`products` y `packages` solo muestran artículos de sucursales activas) y no se pueden comprar (`ITEM_WITHOUT_STORE`) hasta crear una sucursal y volver a correrla.
+- Las categorías no se migran: siguen siendo globales, incluidas las creadas a mano.
 
 ## 4. Productos y paquetes
 
 ### Producto
 
-Es una unidad vendible del catálogo, con precio, unidad (`UNIDAD`, `KG` o `LITRO`) y stock propios. `createProduct` comprueba que exista la categoría y persiste el documento validado.
+Es una unidad vendible del catálogo **de una sucursal**, con precio, unidad (`UNIDAD`, `KG` o `LITRO`) y stock propios; como el stock vive en el producto, es de esa sucursal. `createProduct` exige `storeId` (una sucursal del alcance de quien lo da de alta), comprueba que exista la categoría y persiste el documento validado. `Product.store` devuelve la sucursal; `updateProduct` no la cambia.
+
+### Catálogo por sucursal
+
+- `products(storeId, categoryId, search, activeOnly, limit, offset)` y `packages(storeId, activeOnly)`: con `storeId`, el catálogo de esa sucursal; sin él, el de todas las sucursales activas (búsqueda del marketplace).
+- `Store.products(categoryId, search, activeOnly, limit, offset)`, `Store.packages(activeOnly)` y `Store.categories` (categorías con al menos un producto activo en la sucursal) exponen el catálogo desde la sucursal.
+- Los artículos de una sucursal desactivada nunca se listan al público (tampoco en `Category.products`); quien administra su catálogo o su inventario (`catalog:manage` o `stock:manage` en esa sucursal, o ADMIN) sí los ve con `storeId` o desde `Store`, igual que quien tiene `scope:all_stores`. Por id pasa lo mismo: `product(id)`, `package(id)`, `Product.packages` y los artículos de las listas guardadas dan `null` si son de una sucursal inactiva y quien consulta no la administra. Dentro de una orden ya hecha (`OrderItem.product`, `OrderItem.package` y su contenido) el artículo se sigue mostrando aunque la sucursal cierre, para no romper el historial.
+- `activeOnly: false` (artículos desactivados, con su stock y precio) solo se respeta en las sucursales que quien consulta administra (`catalog:manage` o `stock:manage` en ellas) o en todas con `scope:all_stores`. Para cualquiera más se trata como `true`, en silencio y sin error. Sin `storeId`, quien administra solo algunas sucursales ve los artículos desactivados únicamente de esas.
+- `addToCart` y `setCartItemQuantity` rechazan de inmediato un artículo de una sucursal inactiva con `STORE_INACTIVE`, sin esperar a la compra.
 
 ### Paquete
 
-Un paquete (por ejemplo, el combo para carne asada) vive en su propia colección `packages`. Se crea con `createPackage`, indicando nombre, precio y contenido; se edita con `updatePackage` y se activa o desactiva con `setPackageActive`.
+Un paquete (por ejemplo, el combo para carne asada) vive en su propia colección `packages` y es de una sucursal. Se crea con `createPackage`, indicando sucursal, nombre, precio y contenido; se edita con `updatePackage` (sin cambiar la sucursal) y se activa o desactiva con `setPackageActive`.
 
 ```javascript
 items: [
@@ -442,6 +476,7 @@ items: [
 ```
 
 - Entre 2 y 40 productos distintos, con cantidades enteras positivas. Como el contenido solo puede referenciar `products`, un paquete no puede contener otro paquete ni a sí mismo.
+- Todos sus productos son de la sucursal del paquete; si no, `PACKAGE_STORE_MISMATCH` con los `productIds` ajenos (también al cambiar el contenido con `updatePackage` y, por si hubiera datos inconsistentes, al cotizar o comprar el paquete: nunca se descuenta stock de otra sucursal).
 - **Precio fijo** definido por el administrador. Los campos `alaCarteTotal` y `savings` lo comparan contra el precio efectivo actual de su contenido; `savings` puede ser negativo.
 - **Sin stock propio.** `availableStock` es el número de paquetes completos que alcanzan con el stock de sus productos (por ejemplo, 2 kg de arrachera por paquete y 50 kg en stock permiten 25). Si alguno de sus productos está desactivado, el paquete no está disponible.
 - Los paquetes no tienen descuentos propios; su precio fijo ya es la oferta.
@@ -473,7 +508,7 @@ El esquema admite 100%, por lo que el importe final puede ser cero aunque el pre
 
 ### Cotizar sin guardar
 
-`quoteOrder` recibe modalidad, sucursal opcional y partidas; cada partida indica `productId` **o** `packageId`. Carga el catálogo, comprueba disponibilidad y calcula importes sin crear un pedido ni descontar stock.
+`quoteOrder` recibe modalidad, partidas y una sucursal opcional (pista); cada partida indica `productId` **o** `packageId`. Carga el catálogo, obtiene la sucursal de los artículos (todas las partidas deben ser de la misma: `MIXED_STORES`; la pista debe coincidir: `STORE_MISMATCH`), comprueba disponibilidad y calcula importes sin crear un pedido ni descontar stock.
 
 El cálculo utiliza:
 
@@ -490,15 +525,15 @@ Un paquete se cobra a su precio fijo, sin porcentaje. La disponibilidad se valid
 ### Política de entrega
 
 - `PICKUP`: el envío cuesta cero.
-- `DELIVERY`: utiliza `deliveryFee` de la sucursal.
-- Si el subtotal después de descuentos alcanza `freeDeliveryThreshold`, el envío cuesta cero.
-- Si no se indica sucursal, la operación busca la primera sucursal activa. Una sucursal indicada que esté inactiva se rechaza.
+- `DELIVERY`: utiliza `deliveryFee` de la sucursal de los artículos.
+- Si el subtotal después de descuentos alcanza `freeDeliveryThreshold` de esa sucursal, el envío cuesta cero.
+- La sucursal siempre es la de los artículos; si está inactiva, la compra se rechaza con `STORE_INACTIVE`.
 
 Al crear una orden de entrega, la ubicación se obtiene, en este orden, de una ubicación enviada explícitamente, un `addressId` del usuario, su dirección predeterminada o la primera disponible. Se exige dirección al crear la orden de entrega, pero no al cotizar.
 
 ### Crear y conservar el historial
 
-`createOrder` verifica que el usuario exista y esté activo, resuelve la sucursal, vuelve a calcular precios, **aparta el stock**, guarda el pedido con estado inicial `PENDING` y publica `ORDER_CREATED`.
+`createOrder` verifica que el usuario exista y esté activo, obtiene la sucursal de los artículos, vuelve a calcular precios, **aparta el stock**, guarda el pedido con estado inicial `PENDING` y publica `ORDER_CREATED`. `checkoutCart` hace lo mismo con las partidas del carrito.
 
 La orden es un recibo inmutable. Cada partida guarda solo lo cobrado: referencia (`productId` o `packageId`), nombre, unidad, cantidad, precio de lista, porcentaje aplicado e importe. Si se compró un paquete, copia su contenido (`contents`). La orden guarda además `deliveryFee` y `total` (lo cobrado al cliente). El descuento en pesos de cada partida, el `subtotal` y el `discountTotal` **se derivan** de las partidas y GraphQL los calcula al consultarlos. La ubicación de entrega también se copia; editar luego la dirección del usuario no modifica el pedido.
 
@@ -520,7 +555,7 @@ La clave opcional `idempotencyKey` evita crear otra orden para el mismo usuario 
 
 ### Inventario
 
-El stock vive **solo** en `products.stock`; no se separa por sucursal. Los paquetes no tienen stock: vender un paquete descuenta cada producto de su contenido multiplicado por la cantidad comprada.
+El stock vive **solo** en `products.stock`. Como cada producto es de una sucursal, el stock es por sucursal por construcción: dos negocios que venden "lo mismo" tienen productos distintos. Los paquetes no tienen stock: vender un paquete descuenta cada producto de su contenido multiplicado por la cantidad comprada.
 
 Al crear una orden, cada producto se descuenta con un `updateOne` condicionado a `stock >= cantidad`. Si algún producto no alcanza, se devuelve lo ya descontado y la compra se rechaza; si falla el guardado de la orden, también se devuelve el stock. Esto evita la sobreventa entre compras concurrentes, aunque no es una transacción multidocumento. Al cancelar se guarda el estado y luego se repone el stock consumido, incluido el contenido de los paquetes.
 
@@ -542,32 +577,34 @@ El SDL es la referencia completa de argumentos y tipos. Las operaciones se organ
 | Listas | `shoppingLists`, `shoppingList` | `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Analítica | `salesReport`, `packageComponentDemand` | — |
 
-`products` admite filtros por categoría, búsqueda de texto y estado activo. Productos, usuarios y pedidos usan `limit` y `offset`; el código limita el máximo de `limit` a 100, pero no implementa una validación completa de límites inferiores. Otros listados no están paginados.
+`products` admite filtros por sucursal, categoría, búsqueda de texto y estado activo; `packages`, por sucursal y estado activo. `Store` expone `products`, `packages` y `categories`. Los reportes aceptan `storeId`. Productos, usuarios y pedidos usan `limit` y `offset`; el código limita el máximo de `limit` a 100, pero no implementa una validación completa de límites inferiores. Otros listados no están paginados.
 
 GraphQL permite seleccionar campos de respuesta. Sin embargo, los resolvers actuales no implementan DataLoader ni derivan proyecciones MongoDB de la selección del cliente; una consulta con muchas relaciones puede ejecutar lecturas adicionales por cada elemento.
 
 ## 8. Consultas analíticas en MongoDB
 
-### `salesReport(from, to)`
+Los dos reportes son **por sucursal**. Sin `storeId` cubren todas las sucursales del alcance de quien consulta (ADMIN: todas; MANAGER: sus `WORKS_AT`); con `storeId`, esa sucursal, que debe estar en el alcance (si no, `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED`). Cada fila trae `storeId` y `storeName`.
+
+### `salesReport(from, to, storeId)`
 
 Consolida las ventas de pedidos `DELIVERED` cuya **fecha de creación** está dentro del rango, con ambos extremos inclusivos.
 
 ```text
-$match → $unwind(items) → $group(productId, packageId) → $sort(revenue)
+$match(sucursales del alcance) → $unwind(items) → $group(storeId, productId, packageId) → $sort(revenue)
 ```
 
-Devuelve tipo (`PRODUCT` o `PACKAGE`), identificador, nombre, cantidad, ingresos netos de partidas y número de pedidos distintos. Los ingresos no incluyen la tarifa de envío ni distribuyen el ingreso de un paquete entre su contenido.
+Devuelve sucursal, tipo (`PRODUCT` o `PACKAGE`), identificador, nombre, cantidad, ingresos netos de partidas y número de pedidos distintos. Los ingresos no incluyen la tarifa de envío ni distribuyen el ingreso de un paquete entre su contenido.
 
-### `packageComponentDemand(from, to)`
+### `packageComponentDemand(from, to, storeId)`
 
 Calcula los productos necesarios para surtir paquetes de pedidos no cancelados. Incluye pedidos pendientes; no representa exclusivamente ventas entregadas.
 
 ```text
-$match(pedidos)
+$match(pedidos de las sucursales del alcance)
 → $unwind(items)
 → $match(items.packageId existe)
 → $unwind(items.contents)
-→ $group(productId)
+→ $group(storeId, productId)
 → $lookup(products)
 → $sort(quantityNeeded)
 ```
@@ -591,7 +628,9 @@ mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `
 | `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (con el motivo real), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE` |
 | `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED`, `STORE_CREATED`, `STORE_UPDATED` |
 | `CATALOG` | `CATEGORY_CREATED`, `PRODUCT_CREATED`, `PRODUCT_UPDATED` (cambios `{ from, to }`, p. ej. precio), `PRODUCT_ACTIVE_CHANGED`, `STOCK_SET`, `DISCOUNT_ADDED`, `DISCOUNT_REMOVED`, `PACKAGE_CREATED`, `PACKAGE_UPDATED`, `PACKAGE_ACTIVE_CHANGED` |
-| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, stock insuficiente) |
+| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, `MIXED_STORES`, `STORE_MISMATCH`, stock insuficiente) |
+
+Los eventos de productos, paquetes, descuentos y stock (`CATALOG`) y los de órdenes `ORDER_CREATED` y `ORDER_STATUS_CHANGED` llevan la sucursal en `metadata.storeId`. `CATEGORY_CREATED` no la lleva (las categorías son globales) y `ORDER_REJECTED` tampoco (la compra no llegó a tener sucursal).
 
 `ACCESS_DENIED` y `ORDER_REJECTED` se registran en un solo lugar: un plugin de Apollo (`auditPlugin` en `infrastructure/events.js`) que revisa los errores de cada operación. Nunca se registran contraseñas ni tokens.
 
@@ -678,6 +717,8 @@ NEO4J_PASSWORD=pickaroo123
 ```
 
 Opcionales: `CACHE_TTL_PRODUCT` (120), `CACHE_TTL_USER` (3600) y `CACHE_DEBUG=true`.
+
+`npm run migrate` (desde la raíz) aplica las migraciones de datos con este mismo `MONGODB_URI`, sin arrancar la API. No hace falta en el uso normal: mongoAPI las corre al arrancar.
 
 ### Variables de auditAPI
 
@@ -768,7 +809,7 @@ Con el Compose arriba (`docker compose up -d`), desde la raíz:
 npm run test:integration
 ```
 
-Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos y bitácora. Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de medio minuto.
+Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de medio minuto.
 
 - **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
 - **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
@@ -798,26 +839,31 @@ docker compose down
 
 Para habilitar el seed, establecer `SEED=true` en el `.env` de mongoAPI y reiniciar ese proceso. La carga se ejecuta después de iniciar el servidor, por lo que debe esperarse al mensaje `Seed OK` antes de consultar los ejemplos.
 
-En una base vacía crea:
+En una base vacía crea dos negocios independientes del marketplace:
 
-- Una sucursal `CARNYFRUT Centro`, con tarifa de reparto de $35 y envío gratuito desde $400 después de descuentos.
-- Cinco usuarios de demostración (contraseñas solo de desarrollo). El seed asigna la contraseña también a usuarios demo ya existentes que no tengan una.
+- La sucursal `CARNYFRUT Centro`, con tarifa de reparto de $35 y envío gratuito desde $400 después de descuentos.
+- La sucursal `Frutería La Huerta` (Calle Libertad 450, Col. Obrera), con tarifa de reparto de $25 y envío gratuito desde $250.
+- Siete usuarios de demostración (contraseñas solo de desarrollo). El seed asigna la contraseña también a usuarios demo ya existentes que no tengan una.
 
-  | Correo | Rol | Contraseña | Variable para cambiarla |
-  |---|---|---|---|
-  | `admin@carnyfrut.mx` | ADMIN | `Admin1234` | `SEED_ADMIN_PASSWORD` |
-  | `gerente@carnyfrut.mx` | MANAGER | `Manager1234` | `SEED_MANAGER_PASSWORD` |
-  | `empleado@carnyfrut.mx` | STAFF | `Staff1234` | `SEED_STAFF_PASSWORD` |
-  | `repartidor@carnyfrut.mx` | DELIVERY | `Delivery1234` | `SEED_DELIVERY_PASSWORD` |
-  | `cliente@demo.mx` | CUSTOMER (con dirección predeterminada) | `Cliente1234` | `SEED_CUSTOMER_PASSWORD` |
+  | Correo | Rol | Sucursal (`WORKS_AT`) | Contraseña | Variable para cambiarla |
+  |---|---|---|---|---|
+  | `admin@carnyfrut.mx` | ADMIN | todas (`scope:all_stores`) | `Admin1234` | `SEED_ADMIN_PASSWORD` |
+  | `gerente@carnyfrut.mx` | MANAGER | CARNYFRUT Centro | `Manager1234` | `SEED_MANAGER_PASSWORD` |
+  | `empleado@carnyfrut.mx` | STAFF | CARNYFRUT Centro | `Staff1234` | `SEED_STAFF_PASSWORD` |
+  | `repartidor@carnyfrut.mx` | DELIVERY | CARNYFRUT Centro | `Delivery1234` | `SEED_DELIVERY_PASSWORD` |
+  | `gerente@lahuerta.mx` | MANAGER | Frutería La Huerta | `Manager1234` | `SEED_HUERTA_MANAGER_PASSWORD` |
+  | `empleado@lahuerta.mx` | STAFF | Frutería La Huerta | `Staff1234` | `SEED_HUERTA_STAFF_PASSWORD` |
+  | `cliente@demo.mx` | CUSTOMER (con dirección predeterminada) | — | `Cliente1234` | `SEED_CUSTOMER_PASSWORD` |
 
-- En Neo4j, los cinco usuarios con su rol; gerente, empleado y repartidor asignados a `CARNYFRUT Centro` (`WORKS_AT`). Un rol ya existente en el grafo no se cambia. Si Neo4j no está arriba durante el seed, el personal queda sin sucursal hasta volver a ejecutarlo.
-- Cuatro categorías: Carnes, Frutas, Verduras y Abarrotes.
-- Once productos y, en la colección `packages`, un paquete familiar para carne asada con ocho productos.
-- Una promoción del 15% incrustada en el producto Plátano.
+- En Neo4j, los siete usuarios con su rol y el personal asignado a su sucursal (`WORKS_AT`). Un rol ya existente en el grafo no se cambia. Si Neo4j no está arriba durante el seed, el personal queda sin sucursal hasta volver a ejecutarlo.
+- Cuatro categorías globales: Carnes, Frutas, Verduras y Abarrotes.
+- En CARNYFRUT Centro: once productos y un paquete familiar para carne asada con ocho productos; una promoción del 15% incrustada en el producto Plátano.
+- En Frutería La Huerta: seis productos de Frutas y Verduras (manzana, naranja, aguacate, jitomate, chile jalapeño y papa) y el paquete "Canasta para guacamole y salsa" con tres de ellos.
 
-El seed no crea pedidos ni listas de compra. Busca registros existentes por nombre o correo y no sobrescribe sus datos comerciales. Esta estrategia evita duplicados en ejecuciones secuenciales normales, pero los nombres de producto, paquete y sucursal no tienen un índice único que garantice lo mismo ante ejecuciones concurrentes.
+El seed no crea pedidos ni listas de compra. Busca registros existentes por nombre o correo (productos y paquetes, por nombre dentro de su sucursal) y no sobrescribe sus datos comerciales. Esta estrategia evita duplicados en ejecuciones secuenciales normales, pero los nombres de producto, paquete y sucursal no tienen un índice único que garantice lo mismo ante ejecuciones concurrentes.
 
+> **Bases creadas antes del marketplace:** los productos y paquetes sin `storeId` se asignan solos a la sucursal activa más antigua al arrancar (sección 3, "Migración al marketplace").
+>
 > **Bases creadas antes de este modelo:** los documentos con `slug`, `kind`, `components`, `discountPercentage` o la dirección de sucursal como texto no son compatibles. En desarrollo, vaciar la base (`docker compose exec mongodb mongosh -u admin -p --authenticationDatabase admin pickaroodb --eval "db.dropDatabase()"`) y volver a cargar el seed.
 
 Los datos, precios y cantidades del seed son demostrativos. No equivalen a los 14 productos y seis portafolios preparados en HITO1. Después de cargar los ejemplos puede establecerse `SEED=false` para evitar repetir el proceso en cada arranque.
@@ -850,7 +896,7 @@ Las demás consultas de este apartado se ejecutan con ese encabezado; el catálo
 
 ```graphql
 query Catalogo {
-  products(limit: 20, offset: 0) {
+  products(limit: 20, offset: 0) {      # todas las sucursales activas; storeId: "ID_SUCURSAL" para una
     id
     name
     unit
@@ -859,6 +905,7 @@ query Catalogo {
     activeDiscountPercent
     imageUrl
     stock
+    store { id name }
     category { id name }
   }
   packages {
@@ -868,12 +915,17 @@ query Catalogo {
     availableStock
     alaCarteTotal
     savings
+    store { id name }
     items {
       quantity
       product { id name unit }
     }
   }
-  stores { id name address { street city } deliveryFee freeDeliveryThreshold }
+  stores {
+    id name address { street city } deliveryFee freeDeliveryThreshold
+    categories { id name }
+    products(limit: 5) { id name price }
+  }
   users(limit: 10) { id name addresses { id label street isDefault } } # solo ADMIN
 }
 ```
@@ -893,7 +945,7 @@ query Cotizar($input: QuoteInput!) {
 }
 ```
 
-Variables (cada partida lleva `productId` **o** `packageId`):
+Variables (cada partida lleva `productId` **o** `packageId`, todas de la misma sucursal; `storeId` es opcional y, si se manda, debe ser la de los artículos):
 
 ```json
 {
@@ -989,12 +1041,12 @@ Enviar en `input` un objeto con `imageUrl` igual a la URL pública real de la im
 ### Reportes
 
 ```graphql
-query Analitica($from: DateTime!, $to: DateTime!) {
-  salesReport(from: $from, to: $to) {
-    type itemId name quantity revenue orderCount
+query Analitica($from: DateTime!, $to: DateTime!, $storeId: ID) {
+  salesReport(from: $from, to: $to, storeId: $storeId) {
+    storeId storeName type itemId name quantity revenue orderCount
   }
-  packageComponentDemand(from: $from, to: $to) {
-    productId name quantityNeeded packagesSold inPackages
+  packageComponentDemand(from: $from, to: $to, storeId: $storeId) {
+    storeId storeName productId name quantityNeeded packagesSold inPackages
   }
 }
 ```
@@ -1008,7 +1060,7 @@ Variables:
 }
 ```
 
-Los reportes pueden devolver arreglos vacíos si no existen pedidos en los estados y fechas correspondientes.
+`storeId` es opcional: sin él, las sucursales del alcance de quien consulta. Los reportes pueden devolver arreglos vacíos si no existen pedidos en los estados y fechas correspondientes.
 
 ## 13. Clientes: esquema y conexión
 
@@ -1042,12 +1094,13 @@ Aspectos relevantes al continuar el desarrollo:
 
 - La autenticación es JWT + sesión en Redis. No hay limitación de intentos de `login`, recuperación ni cambio de contraseña, ni una operación para desactivar usuarios. Los intentos fallidos sí quedan en la bitácora (`LOGIN_FAILED`).
 - Los roles viven en Neo4j; MongoDB guarda un espejo. Si se edita el grafo a mano (sin `assignRole`), el cambio aplica en el siguiente login del usuario, no en sus sesiones abiertas.
-- Los reportes (`salesReport`, `packageComponentDemand`) y el catálogo no se filtran por sucursal: el stock es global.
+- Cada sucursal es un negocio con su propio catálogo y stock; todavía no hay un rol de dueño de sucursal (OWNER) ni una relación `OWNS`: el alcance del personal sale solo de `WORKS_AT`.
 - La bitácora es de "al menos una vez": si RabbitMQ no está disponible cuando mongoAPI publica, ese evento se pierde (no hay outbox). auditAPI no expone borrado ni edición de eventos.
 - Las contraseñas se guardan con `scrypt` y sal aleatoria (`scrypt$sal$hash`). Con el registro abierto (`createUser` sin sesión) cualquiera puede crear cuentas `CUSTOMER`.
 - Sin Redis nadie puede iniciar sesión ni usar un token existente (falla cerrado); el catálogo público sigue disponible.
 - El caché es de lectura. Las copias de producto pueden mostrar datos de hasta `CACHE_TTL_PRODUCT` segundos de antigüedad si MongoDB se modifica por fuera de la API; las compras siempre usan MongoDB. El caché y las sesiones asumen un solo proceso de mongoAPI.
-- El stock es global por producto (no por sucursal). El descuento de stock al comprar es atómico por producto pero no es una transacción multidocumento junto con la orden.
+- El stock es de cada producto y, por lo tanto, de su sucursal. El descuento de stock al comprar es atómico por producto pero no es una transacción multidocumento junto con la orden.
+- Las listas guardadas (`shoppingLists`) pueden mezclar artículos de varias sucursales; si el cliente agrega sus artículos al carrito, el carrito rechaza los de otra sucursal (`CART_STORE_MISMATCH`).
 - La idempotencia no compara el contenido de solicitudes repetidas.
 - Las cantidades son enteras: no se puede pedir medio kilo de un producto vendido por `KG`.
 - La selección de campos GraphQL no evita por sí sola consultas repetidas al resolver relaciones.
