@@ -5,6 +5,8 @@ Backend GraphQL de Pickaroo, un **marketplace**: cada sucursal (`Store`) es un n
 El componente principal es **`services/mongoAPI`**: contiene las reglas de negocio, los modelos documentales de MongoDB y las operaciones de la API. **Apollo Gateway** publica un punto de entrada unificado, **Redis Stack** guarda las sesiones de inicio de sesión (JWT), el carrito, la última ubicación del repartidor (`driver-location`) y una copia de lectura de productos y usuarios. **Neo4j** guarda el grafo de roles, permisos, sucursales del personal y menús (RBAC). Cada acción relevante se publica en **RabbitMQ** y **`services/auditAPI`** la persiste en **ScyllaDB** como bitácora de auditoría inmutable.
 
 
+> **¿Vas a tomar el relevo del proyecto?** Empieza por [docs/handover/HANDOVER.md](docs/handover/HANDOVER.md): cómo levantar los tres repositorios (API, dashboard y app Android), las reglas de trabajo, el estado de cada tarea, lo que sigue y los problemas conocidos. El plan entre repositorios está en [docs/handover/WORKSPACE-PLAN.md](docs/handover/WORKSPACE-PLAN.md).
+
 ## 1. Arquitectura y componentes
 
 ```mermaid
