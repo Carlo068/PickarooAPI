@@ -74,19 +74,37 @@ function recordJti(token) {
   if (process.env.IT_JTI_FILE) fs.appendFileSync(process.env.IT_JTI_FILE, `${decodeJwt(token).jti}\n`);
 }
 
-const LOGIN = `mutation Login($input: LoginInput!) {
-  login(input: $input) {
+const AUTH_PAYLOAD = `
     token
+    expiresIn
+    refreshToken
+    refreshExpiresIn
     user { id email role }
     access { role permissions degraded stores { id name } }
-    menu { id children { id } }
-  }
-}`;
+    menu { id children { id } }`;
+
+const LOGIN = `mutation Login($input: LoginInput!) { login(input: $input) { ${AUTH_PAYLOAD} } }`;
 
 export async function login(email, password) {
   const { login: payload } = await ok(LOGIN, { input: { email, password } });
   recordJti(payload.token);
   return payload;
+}
+
+export const REFRESH = `mutation Refresh($token: String!) { refreshToken(token: $token) { ${AUTH_PAYLOAD} } }`;
+
+// Respuesta cruda (data o errors) de canjear un refresh token; registra el jti de la sesión nueva.
+export async function refreshRaw(refreshToken) {
+  const res = await gql(REFRESH, { token: refreshToken });
+  if (res.data?.refreshToken) recordJti(res.data.refreshToken.token);
+  return res;
+}
+
+// El canje debe salir bien: devuelve el AuthPayload nuevo.
+export async function refresh(refreshToken) {
+  const res = await refreshRaw(refreshToken);
+  if (res.errors?.length) throw new Error(`Unexpected GraphQL error: ${JSON.stringify(res.errors)}`);
+  return res.data.refreshToken;
 }
 
 const roleSessions = new Map();

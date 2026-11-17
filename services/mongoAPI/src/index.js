@@ -773,7 +773,7 @@ const resolvers = {
   },
 
   Mutation: {
-    ...authResolvers.Mutation, // login, logout
+    ...authResolvers.Mutation, // login, refreshToken, logout, logoutAllDevices
 
     // ---------- Usuarios ----------
     // Registro abierto: siempre CUSTOMER. Otro rol solo con users:manage.
