@@ -104,7 +104,7 @@ try {
   const code = await new Promise(resolve => {
     testRun = spawn(process.execPath, ['--test', '--test-concurrency=1', '--test-reporter=spec', ...files], {
       stdio: 'inherit',
-      env: { ...process.env, IT_GATEWAY_URL: config.gatewayUrl, IT_JWT_SECRET: config.jwtSecret, IT_JTI_FILE: config.jtiFile, IT_MONGO_URI: config.mongoUri(config.db), IT_REDIS_URL: config.redisUrl },
+      env: { ...process.env, IT_GATEWAY_URL: config.gatewayUrl, IT_JWT_SECRET: config.jwtSecret, IT_JTI_FILE: config.jtiFile, IT_MONGO_URI: config.mongoUri(config.db), IT_REDIS_URL: config.redisUrl, IT_DRIVER_LOCATION_TTL: String(config.driverLocationTtlSeconds) },
     });
     testRun.on('exit', c => resolve(c ?? 1));
   });

@@ -204,6 +204,18 @@ export function releaseDeliveryDenial(access, order) {
   return { reason: order.driverId == null ? 'NO_DRIVER_ASSIGNED' : 'NOT_ASSIGNED_DRIVER' };
 }
 
+// Reportar la ubicación (reportDriverLocation): solo su repartidor asignado, mientras
+// siga teniendo orders:deliver. Otro repartidor de la sucursal o ADMIN: NOT_ASSIGNED_DRIVER,
+// o NO_DRIVER_ASSIGNED si nadie la ha aceptado. Quien no es de la sucursal no se entera de
+// la asignación (STORE_NOT_ASSIGNED). Esto va antes que el estado de la orden: la app se
+// detiene ante "no es tuya" y también ante "ya no está en reparto".
+export function reportLocationDenial(access, order) {
+  if (!hasPermission(access, P.ORDERS_DELIVER)) return { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER };
+  if (isAssignedDriver(access, order)) return null;
+  if (!inStoreScope(access, order.storeId)) return { reason: 'STORE_NOT_ASSIGNED', storeId: order.storeId == null ? null : String(order.storeId) };
+  return { reason: order.driverId == null ? 'NO_DRIVER_ASSIGNED' : 'NOT_ASSIGNED_DRIVER' };
+}
+
 // Quién ve una orden: su cliente, su repartidor asignado (mientras siga siendo
 // repartidor, de la sucursal que sea), el personal de mostrador de la sucursal,
 // ADMIN, y el resto de repartidores de la sucursal solo mientras está libre para aceptarla.

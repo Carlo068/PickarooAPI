@@ -195,6 +195,16 @@ type OrderDriver {
   name: String!
 }
 
+"Última posición conocida del repartidor de una orden en camino: solo coordenadas y tiempos, nunca quién es ni su recorrido."
+type DriverLocation {
+  lat: Float!
+  lng: Float!
+  "Cuándo la recibió el servidor."
+  updatedAt: DateTime!
+  "Segundos que han pasado desde updatedAt (0 o más): la app puede marcar la posición como vieja."
+  ageSeconds: Int!
+}
+
 type Order @key(fields: "id") {
   id: ID!
   number: String!
@@ -207,6 +217,8 @@ type Order @key(fields: "id") {
   driver: OrderDriver
   "Cuándo la aceptó su repartidor actual."
   assignedAt: DateTime
+  "Última posición del repartidor (mismas reglas que la consulta driverLocation): null si la orden no está IN_DELIVERY o no hay punto vigente. Si Redis falla a mitad de la consulta, SERVICE_UNAVAILABLE (service LOCATION)."
+  driverLocation: DriverLocation
   "Cambios de estado, del más antiguo al más reciente. Lo lee quien puede ver la orden."
   statusHistory: [OrderStatusChange!]!
   items: [OrderItem!]!
@@ -584,6 +596,8 @@ type Query {
   myDeliveries(active: Boolean = false, limit: Int = 20, offset: Int = 0): [Order!]!
   "La entrega activa del repartidor autenticado, o null (orders:deliver)."
   currentDelivery: Order
+  "Última posición del repartidor de una orden en camino, para quien puede ver la orden (su cliente, el personal de la sucursal, su repartidor asignado, ADMIN; si no, FORBIDDEN ORDER_VIEW_DENIED). Null si la orden no existe, no es DELIVERY en IN_DELIVERY, o no hay punto vigente (aún no se reportó o venció su TTL). Solo coordenadas y tiempos. Si Redis falla a mitad de la consulta, SERVICE_UNAVAILABLE (service LOCATION); con Redis caído por completo la sesión no se puede verificar y llega UNAUTHENTICATED."
+  driverLocation(orderId: ID!): DriverLocation
 
   shoppingLists(userId: ID!): [ShoppingList!]!
   shoppingList(id: ID!): ShoppingList
@@ -655,6 +669,8 @@ type Mutation {
   acceptDelivery(orderId: ID!): Order!
   "Devuelve a la lista de disponibles una orden aceptada que sigue en READY: su repartidor, el personal de mostrador de la sucursal (orders:prepare) o ADMIN."
   releaseDelivery(orderId: ID!): Order!
+  "El repartidor asignado reporta su posición mientras lleva la orden (orders:deliver; DELIVERY en IN_DELIVERY). Devuelve true también cuando el punto se ignora por llegar a menos de 1 s del anterior de esa orden. La hora del punto es la de recepción en el servidor: tras una reconexión no se encolan ni se reenvían puntos viejos, se manda la posición actual. Errores: FORBIDDEN (NOT_ASSIGNED_DRIVER, NO_DRIVER_ASSIGNED, STORE_NOT_ASSIGNED, PERMISSION_REQUIRED), NOT_FOUND, INVALID_ORDER_STATE (status, mode), INVALID_LOCATION (field) y SERVICE_UNAVAILABLE (service LOCATION), este último solo si Redis falla a mitad de la operación. Con Redis caído por completo la sesión no se puede verificar y llega UNAUTHENTICATED (que tampoco se registra en la bitácora para esta operación): no cerrar la sesión, renovarla con el refresh token y reintentar con espera creciente. La app deja de reportar solo ante FORBIDDEN, NOT_FOUND o INVALID_ORDER_STATE."
+  reportDriverLocation(orderId: ID!, lat: Float!, lng: Float!): Boolean!
 
   createShoppingList(input: ShoppingListInput!): ShoppingList!
   "Agrega (o suma cantidad a) un producto O un paquete."

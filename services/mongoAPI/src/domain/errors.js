@@ -28,7 +28,7 @@ export const ERROR_CODES = {
     fields: [],
   },
   SERVICE_UNAVAILABLE: {
-    description: 'Un servicio de apoyo no responde (sesiones, carrito, roles o bitácora); conviene reintentar.',
+    description: 'Un servicio de apoyo no responde (sesiones, carrito, roles, ubicación del repartidor o bitácora); conviene reintentar.',
     fields: ['service?'],
   },
 
@@ -116,6 +116,15 @@ export const ERROR_CODES = {
     fields: ['activeOrderId'],
   },
 
+  INVALID_ORDER_STATE: {
+    description: 'La operación no aplica al estado o modalidad actuales de la orden (p. ej. reportar la ubicación de una orden que no es DELIVERY en IN_DELIVERY). No es INVALID_ORDER_STATUS (ese estado no existe) ni INVALID_STATUS_TRANSITION (un cambio de estado no permitido).',
+    fields: ['status', 'mode'],
+  },
+  INVALID_LOCATION: {
+    description: 'Las coordenadas no son válidas: no son números finitos, `lat` está fuera de [-90, 90], `lng` fuera de [-180, 180], o ambas son exactamente 0 (valor centinela de "sin posición"). `field`: lat, lng o location (el par).',
+    fields: ['field'],
+  },
+
   // ---------- Roles y sucursales de usuarios ----------
   UNKNOWN_ROLE: { description: 'El rol indicado no existe.', fields: ['role'] },
   ROLE_GRAPH_NODE_NOT_FOUND: { description: 'El usuario o la sucursal no existen en el grafo de roles (Neo4j).', fields: ['userId', 'storeId?'] },
@@ -139,7 +148,7 @@ export const FORBIDDEN_REASONS = {
   STORE_NOT_ASSIGNED: 'La sucursal `storeId` no está asignada al usuario.',
   OWN_ORDERS_ONLY: 'Solo se pueden consultar las órdenes propias.',
   CANNOT_CHANGE_OWN_ROLE: 'Un usuario no puede cambiar su propio rol.',
-  NOT_ASSIGNED_DRIVER: 'La orden a domicilio tiene otro repartidor asignado: solo él (o ADMIN) la recoge y la entrega; liberarla pueden él, el personal de mostrador de la sucursal (orders:prepare) o ADMIN.',
+  NOT_ASSIGNED_DRIVER: 'La orden a domicilio tiene otro repartidor asignado: solo él (o ADMIN) la recoge y la entrega, y solo él reporta su ubicación; liberarla pueden él, el personal de mostrador de la sucursal (orders:prepare) o ADMIN.',
   NO_DRIVER_ASSIGNED: 'La orden a domicilio no tiene repartidor asignado: primero hay que aceptarla (acceptDelivery). Al reintentar releaseDelivery significa que ya se liberó.',
   OWN_ORDER: 'Un repartidor no puede aceptar el reparto de una orden suya.',
 };
