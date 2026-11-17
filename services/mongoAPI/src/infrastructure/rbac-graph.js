@@ -10,12 +10,12 @@
 // El id de User y Store es el _id de MongoDB, así los dos almacenes se cruzan.
 // ============================================================
 
-import { DomainError } from '../domain/entities.js';
+import { DomainError } from '../domain/errors.js';
 import { ROLE_CATALOG, PERMISSION_CATALOG, MENU_CATALOG, isRole } from '../domain/access.js';
 import { readQuery, writeQuery, toNumber, isNeo4jReady } from './neo4j.js';
 
 function assertReady() {
-  if (!isNeo4jReady()) throw new DomainError('El servicio de roles (Neo4j) no está disponible. Intenta de nuevo.', 'SERVICE_UNAVAILABLE');
+  if (!isNeo4jReady()) throw new DomainError('El servicio de roles (Neo4j) no está disponible. Intenta de nuevo.', 'SERVICE_UNAVAILABLE', { service: 'RBAC' });
 }
 
 // ---------- Catálogo (idempotente: se ejecuta en cada arranque) ----------
@@ -154,7 +154,7 @@ export async function getMenu(userId) {
 // ---------- Administración ----------
 export async function setRole(userId, roleName) {
   assertReady();
-  if (!isRole(roleName)) throw new DomainError(`El rol "${roleName}" no existe.`);
+  if (!isRole(roleName)) throw new DomainError(`El rol "${roleName}" no existe.`, 'UNKNOWN_ROLE', { role: String(roleName) });
   const [row] = await writeQuery(
     `MATCH (u:User {id: $userId})
      MATCH (r:Role {name: $role})
@@ -165,7 +165,7 @@ export async function setRole(userId, roleName) {
      RETURN previous`,
     { userId: String(userId), role: roleName },
   );
-  if (!row) throw new DomainError('El usuario no existe en el grafo de roles.');
+  if (!row) throw new DomainError('El usuario no existe en el grafo de roles.', 'ROLE_GRAPH_NODE_NOT_FOUND', { userId: String(userId) });
   return row.previous ?? null;
 }
 
@@ -177,7 +177,7 @@ export async function assignStore(userId, storeId) {
      RETURN s.name AS store`,
     { userId: String(userId), storeId: String(storeId) },
   );
-  if (!row) throw new DomainError('El usuario o la sucursal no existen en el grafo de roles.');
+  if (!row) throw new DomainError('El usuario o la sucursal no existen en el grafo de roles.', 'ROLE_GRAPH_NODE_NOT_FOUND', { userId: String(userId), storeId: String(storeId) });
   return row.store;
 }
 

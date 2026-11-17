@@ -76,11 +76,13 @@ PickarooAPI/
             ├── schema.graphql
             ├── domain/
             │   ├── entities.js
+            │   ├── errors.js     catálogo de códigos de error y DomainError
             │   └── access.js     roles, permisos, menús y reglas de acceso
             └── infrastructure/
                 ├── neo4j.js
                 ├── rbac-graph.js consultas Cypher del RBAC
                 ├── events.js     productor de eventos de auditoría
+                ├── format-error.js  errores de dominio/Mongoose → extensions.code
                 ├── redis-om.js
                 ├── entity-cache.js
                 ├── cart-store.js
@@ -115,7 +117,7 @@ El cliente puede solicitar los campos que necesita, incluyendo relaciones como l
 - `ItemType`: `PRODUCT` y `PACKAGE`; indica qué referencia una partida. Se calcula, no se guarda.
 - `Unit`: `UNIDAD`, `KG` y `LITRO`.
 - `OrderMode`: `PICKUP` y `DELIVERY`.
-- `UserRole`: `CUSTOMER` y `ADMIN`.
+- `UserRole`: `CUSTOMER`, `STAFF`, `DELIVERY`, `MANAGER` y `ADMIN`.
 - `OrderStatus`: estados del ciclo de vida del pedido.
 
 Los importes se exponen como `Float` en **pesos mexicanos**, no como centavos enteros. Las cantidades de carrito, paquete y stock son enteros; por ejemplo, `quantity: 2` de un producto con `unit: KG` representa dos kilogramos. El contrato actual no admite `quantity: 0.5`.
@@ -261,6 +263,124 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | `audit:view` | `auditEvents`, `auditByActor`, `auditByTarget`, `auditSummary` (subgrafo auditoria) |
 
 La interfaz **Neo4j Browser** (`http://localhost:7474`, usuario `neo4j`) permite ver el grafo, por ejemplo con `MATCH (u:User)-[r]->(n) RETURN u, r, n`.
+
+### Códigos de error y contrato de traducción
+
+Los clientes (Android y dashboard, en español e inglés) **traducen por `extensions.code`** y por los datos estructurados de `extensions`; nunca muestran el `message`. El `message` va en español y sirve para la bitácora de auditoría y para Apollo Sandbox, no es parte del contrato. Cada código nombra una regla (no una redacción) y no cambia de nombre; las reglas nuevas añaden códigos nuevos. El catálogo vive en `services/mongoAPI/src/domain/errors.js` y una prueba estática (`test/domain/error-guard.test.js`) impide lanzar errores sin código o con un código fuera del catálogo.
+
+Los campos de `extensions` están en camelCase y los marcados con `?` son opcionales. Ejemplo: `INSUFFICIENT_STOCK` llega con `{ code, productId, name, requested, available }`, con lo que el cliente arma la frase en su idioma.
+
+**Sesión y permisos**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `UNAUTHENTICATED` | La operación requiere una sesión iniciada (falta el token o ya no es válido). | — |
+| `FORBIDDEN` | Hay sesión, pero no permiso para la operación o el recurso. `reason` indica cuál regla (ver FORBIDDEN_REASONS). | `reason`, `permission?`, `storeId?`, `status?` |
+| `INVALID_CREDENTIALS` | Correo o contraseña incorrectos, o cuenta desactivada (no se distingue a propósito). | — |
+| `SERVICE_UNAVAILABLE` | Un servicio de apoyo no responde (sesiones, carrito, roles o bitácora); conviene reintentar. | `service?` |
+
+**Validación y datos**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `VALIDATION_ERROR` | Falló la validación del modelo (Mongoose). `field` es el primer campo con error y `violations` los lista todos como [{ field, rule }]. | `field?`, `violations` |
+| `NOT_FOUND` | La entidad referenciada no existe. | `entity`, `id` |
+| `DUPLICATE_VALUE` | Ya existe un registro con ese valor único. | `field?` |
+| `EMAIL_ALREADY_REGISTERED` | Ya hay un usuario registrado con ese correo. | `field` |
+| `PASSWORD_TOO_SHORT` | La contraseña es más corta que el mínimo. | `minLength` |
+| `INVALID_NAME` | El nombre del producto o paquete tiene menos del mínimo de caracteres. | `entity`, `minLength` |
+| `INVALID_PRICE` | El precio del producto o paquete no es un número positivo. | `entity` |
+| `INVALID_STOCK` | El stock no es un entero no negativo. | — |
+| `INVALID_QUANTITY` | La cantidad no es un entero positivo (o excede el máximo del carrito). `context` indica dónde. | `context`, `min?`, `max?` |
+| `INVALID_DAY_FORMAT` | El día de la consulta de auditoría no tiene el formato YYYY-MM-DD. | `field` |
+
+**Paquetes**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `PACKAGE_SIZE_OUT_OF_RANGE` | El paquete tiene menos productos que el mínimo o más que el máximo. | `count`, `min`, `max` |
+| `INVALID_PACKAGE_ITEM` | Un producto del paquete no trae productId. | — |
+| `DUPLICATE_PACKAGE_PRODUCT` | El paquete repite un producto. | — |
+| `PACKAGE_PRODUCT_NOT_FOUND` | Algún producto del paquete no existe en el catálogo. | — |
+
+**Disponibilidad e inventario**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `ITEM_UNAVAILABLE` | El producto o paquete está desactivado (o, en un paquete, alguno de sus productos lo está). | `itemType`, `id?`, `name`, `componentId?`, `componentName?` |
+| `INSUFFICIENT_STOCK` | No alcanza el stock de un producto para la cantidad pedida. | `productId`, `name`, `requested`, `available` |
+
+**Carrito**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `INVALID_CART_LINE` | Una partida debe indicar productId o packageId, uno solo. | — |
+| `CART_FULL` | El carrito ya tiene el máximo de partidas. | `maxLines` |
+| `CART_EMPTY` | El carrito está vacío. | — |
+| `CART_HAS_UNAVAILABLE_ITEMS` | Hay partidas del carrito que ya no se pueden comprar. | `unavailable` |
+
+**Cotización y compra**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `QUOTE_EXPIRED` | La cotización expiró o no existe; hay que reconfirmar. | `newQuote` |
+| `QUOTE_MISMATCH` | La compra ya no coincide con la cotización (productos, cantidades, sucursal o modo). | `newQuote` |
+| `PRICE_CHANGED` | Los precios cambiaron desde la cotización; hay que confirmar el total nuevo. | `newQuote` |
+| `INVALID_ORDER_MODE` | El modo de la orden no es PICKUP ni DELIVERY. | `mode` |
+| `EMPTY_ORDER` | La orden no tiene productos. | — |
+| `STORE_REQUIRED` | Una orden de recogida necesita sucursal. | — |
+| `DELIVERY_ADDRESS_REQUIRED` | Una orden a domicilio necesita dirección de entrega. | — |
+| `USER_INACTIVE` | El usuario que compra está desactivado. | — |
+| `NO_ACTIVE_STORE` | No hay ninguna sucursal activa configurada. | — |
+| `STORE_INACTIVE` | La sucursal indicada está desactivada. | `storeId`, `name` |
+
+**Estados de la orden**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `INVALID_ORDER_STATUS` | El estado indicado no existe. | `status` |
+| `ORDER_ALREADY_IN_STATUS` | La orden ya está en el estado pedido. | `status` |
+| `INVALID_STATUS_TRANSITION` | La transición de estado no está permitida. | `from`, `to` |
+| `PICKUP_CANNOT_BE_DELIVERED` | Una orden de recogida (PICKUP) no puede salir a reparto. | — |
+
+**Roles y sucursales de usuarios**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `UNKNOWN_ROLE` | El rol indicado no existe. | `role` |
+| `ROLE_GRAPH_NODE_NOT_FOUND` | El usuario o la sucursal no existen en el grafo de roles (Neo4j). | `userId`, `storeId?` |
+| `USER_NOT_ASSIGNED_TO_STORE` | El usuario no está asignado a esa sucursal. | `userId`, `storeId` |
+
+**Generados por Apollo Server**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `INTERNAL_SERVER_ERROR` | Error inesperado del servidor (no es una regla de negocio). | — |
+| `BAD_USER_INPUT` | Una variable o argumento no tiene un valor válido para su tipo (p. ej. un DateTime mal formado). | — |
+| `GRAPHQL_VALIDATION_FAILED` | La consulta no valida contra el esquema. | — |
+| `GRAPHQL_PARSE_FAILED` | La consulta no se puede interpretar como GraphQL. | — |
+
+Notas por código:
+
+- `FORBIDDEN` conserva su código para todas las denegaciones porque el plugin de auditoría registra los accesos denegados (`ACCESS_DENIED`) por `UNAUTHENTICATED` y `FORBIDDEN`; la regla concreta va en `extensions.reason`:
+
+| `reason` | Significado |
+|---|---|
+| `PERMISSION_REQUIRED` | Falta el permiso `permission` para la operación. |
+| `NOT_RESOURCE_OWNER` | El recurso es de otro usuario y no se tiene users:manage. |
+| `ORDER_VIEW_DENIED` | No se puede ver esa orden. |
+| `ORDER_STATUS_CHANGE_DENIED` | No se puede pasar la orden al estado `status`. |
+| `ORDER_CANCEL_DENIED` | No se puede cancelar esa orden. |
+| `STORE_NOT_ASSIGNED` | La sucursal `storeId` no está asignada al usuario. |
+| `OWN_ORDERS_ONLY` | Solo se pueden consultar las órdenes propias. |
+| `CANNOT_CHANGE_OWN_ROLE` | Un usuario no puede cambiar su propio rol. |
+
+- `INVALID_CREDENTIALS` cubre correo inexistente, contraseña incorrecta y cuenta desactivada con el mismo código a propósito. `UNAUTHENTICATED` queda para "no hay sesión válida" (el cliente va al login).
+- `NOT_FOUND.entity` es uno de `USER`, `STORE`, `ADDRESS`, `CATEGORY`, `PRODUCT`, `PACKAGE`, `DISCOUNT`, `ORDER` o `SHOPPING_LIST`; `ITEM_UNAVAILABLE.itemType`, `PRODUCT` o `PACKAGE`; `INVALID_NAME.entity` e `INVALID_PRICE.entity`, `PRODUCT` o `PACKAGE`; `INVALID_QUANTITY.context`, `ORDER_LINE`, `PACKAGE_ITEM` o `CART`; `SERVICE_UNAVAILABLE.service`, `SESSIONS`, `CART`, `RBAC` o `AUDIT_LOG`.
+- `VALIDATION_ERROR` es la validación de Mongoose al guardar. `violations` es `[{ field, rule }]`; `rule` es el código de dominio cuando la regla viene del dominio (p. ej. `INVALID_PRICE`, `INVALID_STOCK`) o el tipo de Mongoose (`required`, `min`, `max`, `enum`, `user defined`…).
+- Una clave única repetida (índice de MongoDB, error E11000) llega como `EMAIL_ALREADY_REGISTERED` si el campo es `email` y como `DUPLICATE_VALUE` con `field` en los demás casos.
+- `QUOTE_EXPIRED`, `QUOTE_MISMATCH` y `PRICE_CHANGED` traen `newQuote` (`quoteId`, `expiresAt`, `subtotal`, `discountTotal`, `deliveryFee`, `total` e `items`) para reconfirmar sin otra consulta. `CART_HAS_UNAVAILABLE_ITEMS.unavailable` es `[{ productId, packageId, reason, availableQuantity }]` con `reason` en `DELETED`, `INACTIVE`, `OUT_OF_STOCK` o `INSUFFICIENT_STOCK`.
+- Limitación conocida: el campo `quoteError` del carrito (`Cart.quoteError`) es una cadena en español, no un código; el esquema no cambia en esta etapa.
 
 ## 3. Modelo documental
 
@@ -620,7 +740,7 @@ Desde la raíz, sin levantar Docker:
 npm test
 ```
 
-Ejecuta las pruebas unitarias del dominio (`services/mongoAPI/test/`, con el ejecutor integrado de Node) y `npm run schema:check`, de modo que un `schema/api.graphql` desactualizado también hace fallar el comando. Termina con código distinto de cero si algo falla.
+Ejecuta las pruebas unitarias del dominio y del contrato de errores (`services/mongoAPI/test/`, con el ejecutor integrado de Node; incluye una guardia estática que revisa el código de ambos subgrafos) y `npm run schema:check`, de modo que un `schema/api.graphql` desactualizado también hace fallar el comando. Termina con código distinto de cero si algo falla.
 
 | Servicio | Dirección local |
 |---|---|
@@ -880,6 +1000,8 @@ Los reportes pueden devolver arreglos vacíos si no existen pedidos en los estad
 npm run schema:build   # compone los schema.graphql de los subgrafos y escribe schema/api.graphql
 npm run schema:check   # falla si el archivo está desactualizado; no lo modifica
 ```
+
+Los errores se traducen por `extensions.code` (catálogo completo en la sección 2, "Códigos de error y contrato de traducción"); el `message` es solo para logs.
 
 Todo cambio en un `schema.graphql` de un subgrafo debe ir acompañado, **en el mismo commit**, del `schema/api.graphql` regenerado.
 

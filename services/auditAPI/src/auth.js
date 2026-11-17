@@ -51,6 +51,6 @@ export async function authContext({ req }) {
 export function requireAuditView(ctx) {
   if (!ctx.currentUser) throw new GraphQLError('Debes iniciar sesión.', { extensions: { code: 'UNAUTHENTICATED' } });
   if (!ctx.currentUser.permissions.includes(AUDIT_VIEW)) {
-    throw new GraphQLError(`Se requiere el permiso "${AUDIT_VIEW}".`, { extensions: { code: 'FORBIDDEN' } });
+    throw new GraphQLError(`Se requiere el permiso "${AUDIT_VIEW}".`, { extensions: { code: 'FORBIDDEN', reason: 'PERMISSION_REQUIRED', permission: AUDIT_VIEW } });
   }
 }

@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import { ApolloServer } from '@apollo/server';
 import { startStandaloneServer } from '@apollo/server/standalone';
 import { buildSubgraphSchema } from '@apollo/subgraph';
-import { parse } from 'graphql';
+import { GraphQLError, parse } from 'graphql';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,7 +35,7 @@ const clampLimit = limit => Math.min(Math.max(limit ?? 50, 1), 500);
 
 function assertDay(day) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(new Date(`${day}T00:00:00Z`).getTime())) {
-    throw new Error('El día debe tener el formato YYYY-MM-DD.');
+    throw new GraphQLError('El día debe tener el formato YYYY-MM-DD.', { extensions: { code: 'INVALID_DAY_FORMAT', field: 'day' } });
   }
   return day;
 }
@@ -97,7 +97,7 @@ const server = new ApolloServer({
   formatError: formatted => {
     const authFailure = ['UNAUTHENTICATED', 'FORBIDDEN'].includes(formatted.extensions?.code);
     if (!isScyllaReady() && formatted.path && !authFailure) {
-      return { ...formatted, message: 'La bitácora (ScyllaDB) aún no está disponible.', extensions: { code: 'SERVICE_UNAVAILABLE' } };
+      return { ...formatted, message: 'La bitácora (ScyllaDB) aún no está disponible.', extensions: { code: 'SERVICE_UNAVAILABLE', service: 'AUDIT_LOG' } };
     }
     return formatted;
   },

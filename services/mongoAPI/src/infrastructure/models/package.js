@@ -20,7 +20,7 @@ const pkg = main({
   items: array(packageItem, PACKAGE_MAX_ITEMS),
 });
 pkg.pre('validate', function () {
-  try { assertPackagePersistable(this); } catch (err) { this.invalidate('items', err.message); }
+  try { assertPackagePersistable(this); } catch (err) { this.invalidate('items', err.message, undefined, err.extensions?.code); }
 });
 pkg.index({ isActive: 1 });
 pkg.index({ 'items.productId': 1 }); // "¿qué paquetes contienen este producto?"

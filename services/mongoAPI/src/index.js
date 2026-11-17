@@ -10,7 +10,6 @@ import mongoose from 'mongoose';
 
 import { User, Category, Product, Package, Store, Order, ShoppingList, models } from './infrastructure/models/index.js';
 import {
-  DomainError,
   Product as ProductEntity,
   Package as PackageEntity,
   priceOrder,
@@ -28,6 +27,8 @@ import {
   buildOrderNumber,
   round2,
 } from './domain/entities.js';
+import { DomainError, notFoundError } from './domain/errors.js';
+import { formatApiError } from './infrastructure/format-error.js';
 import { redisClient, initRedis } from './infrastructure/redis-om.js';
 import { getProduct, invalidateProducts, getUser, cacheUser, userView } from './infrastructure/entity-cache.js';
 import { hashPassword } from './infrastructure/passwords.js';
@@ -66,14 +67,14 @@ await initEvents();
 // ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
-const notFound = (what, id) => new DomainError(`${what} no encontrado${id ? ` (${id})` : ''}.`);
+const notFound = notFoundError; // (ENTITY, id) -> NOT_FOUND { entity, id }
 const oid = v => new mongoose.Types.ObjectId(String(v));
 const uniq = xs => [...new Set(xs.map(String))];
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 
 // Una partida referencia un producto O un paquete.
 function itemRef({ productId, packageId }) {
-  if (Boolean(productId) === Boolean(packageId)) throw new DomainError('Cada partida debe indicar productId o packageId (solo uno).');
+  if (Boolean(productId) === Boolean(packageId)) throw new DomainError('Cada partida debe indicar productId o packageId (solo uno).', 'INVALID_CART_LINE');
   return productId ? { productId: String(productId) } : { packageId: String(packageId) };
 }
 const itemType = i => (i.packageId ? 'PACKAGE' : 'PRODUCT');
@@ -88,7 +89,7 @@ function resolveDeliveryAddress(input, addressId, user) {
   if (input) return locationFrom(input);
   const id = addressId ?? user.defaultAddressId;
   const found = id ? user.addresses.id(id) : user.addresses[0];
-  if (addressId && !found) throw notFound('Dirección', addressId);
+  if (addressId && !found) throw notFound('ADDRESS', addressId);
   return found ? locationFrom(found) : null;
 }
 
@@ -104,7 +105,7 @@ function ownedOrNull(ctx, doc) {
 function viewableOrder(ctx, order) {
   const me = requireAuth(ctx);
   if (!order) return null;
-  if (!canViewOrder(me, order)) throw forbidden('No tienes permiso para ver esta orden.');
+  if (!canViewOrder(me, order)) throw forbidden('No tienes permiso para ver esta orden.', 'ORDER_VIEW_DENIED');
   return order;
 }
 
@@ -120,7 +121,7 @@ function ordersFilter(me, { userId, storeId }) {
   const prepares = hasPermission(me, PERMISSIONS.ORDERS_PREPARE);
   const delivers = hasPermission(me, PERMISSIONS.ORDERS_DELIVER);
   if (prepares || delivers) {
-    if (storeId && !inStoreScope(me, storeId)) throw forbidden('Esa sucursal no está asignada a tu usuario.');
+    if (storeId && !inStoreScope(me, storeId)) throw forbidden('Esa sucursal no está asignada a tu usuario.', 'STORE_NOT_ASSIGNED', { storeId: String(storeId) });
     return {
       storeId: storeId ? oid(storeId) : { $in: me.storeIds.map(oid) },
       ...(userId ? { userId: oid(userId) } : {}),
@@ -128,7 +129,7 @@ function ordersFilter(me, { userId, storeId }) {
     };
   }
 
-  if (userId) throw forbidden('Solo puedes ver tus propias órdenes.');
+  if (userId) throw forbidden('Solo puedes ver tus propias órdenes.', 'OWN_ORDERS_ONLY');
   return { userId: oid(me.id), ...(storeId ? { storeId: oid(storeId) } : {}) };
 }
 
@@ -169,7 +170,7 @@ function packageEntity(doc) {
 
 async function assertProductsExist(ids) {
   const found = await Product.countDocuments({ _id: { $in: uniq(ids).map(oid) } });
-  if (found !== uniq(ids).length) throw new DomainError('Algún producto del paquete no existe en el catálogo.');
+  if (found !== uniq(ids).length) throw new DomainError('Algún producto del paquete no existe en el catálogo.', 'PACKAGE_PRODUCT_NOT_FOUND');
 }
 
 // Carga el catálogo actual (Mongo, nunca el caché) para unas partidas.
@@ -191,8 +192,8 @@ async function buildLines(items) {
   if (!items?.length) throw new DomainError('El carrito está vacío.', 'CART_EMPTY');
   const lines = await loadLines(items.map(i => ({ ...itemRef(i), quantity: i.quantity })));
   for (const l of lines) {
-    if (l.packageId && !l.package) throw notFound('Paquete', l.packageId);
-    if (l.productId && !l.product) throw notFound('Producto', l.productId);
+    if (l.packageId && !l.package) throw notFound('PACKAGE', l.packageId);
+    if (l.productId && !l.product) throw notFound('PRODUCT', l.productId);
   }
   return lines;
 }
@@ -247,11 +248,11 @@ async function placeOrder({ userId, mode, storeId, address, addressId, items, no
   }
 
   const user = await User.findById(userId);
-  if (!user) throw notFound('Usuario', userId);
-  if (!user.isActive) throw new DomainError('El usuario está desactivado.');
+  if (!user) throw notFound('USER', userId);
+  if (!user.isActive) throw new DomainError('El usuario está desactivado.', 'USER_INACTIVE');
 
   const store = await resolveStore(storeId);
-  if (!store) throw new DomainError('No hay ninguna sucursal activa configurada.');
+  if (!store) throw new DomainError('No hay ninguna sucursal activa configurada.', 'NO_ACTIVE_STORE');
 
   // Precios y stock salen siempre de Mongo, nunca del caché.
   const deliveryAddress = mode === 'DELIVERY' ? resolveDeliveryAddress(address, addressId, user) : null;
@@ -332,11 +333,13 @@ async function buildCart(userId, { mode = 'PICKUP', storeId } = {}) {
 async function assertPurchasableRef(ref) {
   const id = ref.productId ?? ref.packageId;
   const Model = ref.productId ? Product : Package;
-  const what = ref.productId ? 'Producto' : 'Paquete';
+  const what = ref.productId ? 'PRODUCT' : 'PACKAGE';
   if (!mongoose.isValidObjectId(id)) throw notFound(what, id);
   const doc = await Model.findById(id).select('name isActive');
   if (!doc) throw notFound(what, id);
-  if (!doc.isActive) throw new DomainError(`"${doc.name}" no está disponible.`);
+  if (!doc.isActive) {
+    throw new DomainError(`"${doc.name}" no está disponible.`, 'ITEM_UNAVAILABLE', { itemType: ref.productId ? 'PRODUCT' : 'PACKAGE', id: String(id), name: doc.name });
+  }
 }
 
 // Descuenta stock solo si alcanza (condición atómica por producto). Si algún
@@ -349,7 +352,9 @@ async function takeStock(demand) {
       if (res.modifiedCount !== 1) {
         await releaseStock(taken);
         const p = await Product.findById(productId).select('name stock');
-        throw new DomainError(`Sin stock suficiente de "${p?.name ?? productId}" (disponible: ${p?.stock ?? 0}).`);
+        throw new DomainError(`Sin stock suficiente de "${p?.name ?? productId}" (disponible: ${p?.stock ?? 0}).`, 'INSUFFICIENT_STOCK', {
+          productId: String(productId), name: p?.name ?? String(productId), requested: quantity, available: p?.stock ?? 0,
+        });
       }
       taken.push({ productId, quantity });
     }
@@ -367,8 +372,8 @@ async function releaseStock(demand) {
 
 async function resolveStore(storeId) {
   let store = storeId ? await Store.findById(storeId) : null;
-  if (storeId && !store) throw notFound('Sucursal', storeId);
-  if (store && !store.isActive) throw new DomainError(`La sucursal "${store.name}" no está activa.`);
+  if (storeId && !store) throw notFound('STORE', storeId);
+  if (store && !store.isActive) throw new DomainError(`La sucursal "${store.name}" no está activa.`, 'STORE_INACTIVE', { storeId: String(store._id), name: store.name });
   // Sin sucursal indicada se usa la primera activa (setup de un solo restaurante).
   if (!store) store = await Store.findOne({ isActive: true }).sort({ createdAt: 1 });
   return store;
@@ -631,7 +636,7 @@ const resolvers = {
     createUser: async (_, { input }, ctx) => {
       const { password, role = DEFAULT_ROLE, ...rest } = input;
       if (role !== DEFAULT_ROLE) requirePermission(ctx, PERMISSIONS.USERS_MANAGE);
-      if (password.length < 8) throw new DomainError('La contraseña debe tener al menos 8 caracteres.');
+      if (password.length < 8) throw new DomainError('La contraseña debe tener al menos 8 caracteres.', 'PASSWORD_TOO_SHORT', { minLength: 8 });
       const user = await User.create({ ...rest, role, passwordHash: hashPassword(password) });
       // El nodo en Neo4j se crea ya; si el grafo no responde, se crea en su primer login.
       if (isNeo4jReady()) {
@@ -650,7 +655,7 @@ const resolvers = {
     addUserAddress: async (_, { userId, address }, ctx) => {
       requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
-      if (!user) throw notFound('Usuario', userId);
+      if (!user) throw notFound('USER', userId);
       const { isDefault, ...data } = address;
       user.addresses.push(data);
       const added = user.addresses[user.addresses.length - 1];
@@ -661,8 +666,8 @@ const resolvers = {
     setDefaultAddress: async (_, { userId, addressId }, ctx) => {
       requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
-      if (!user) throw notFound('Usuario', userId);
-      if (!user.addresses.id(addressId)) throw notFound('Dirección', addressId);
+      if (!user) throw notFound('USER', userId);
+      if (!user.addresses.id(addressId)) throw notFound('ADDRESS', addressId);
       user.defaultAddressId = addressId;
       await user.save();
       return cacheUser(user);
@@ -670,9 +675,9 @@ const resolvers = {
     removeUserAddress: async (_, { userId, addressId }, ctx) => {
       requireSelfOrPermission(ctx, userId);
       const user = await User.findById(userId);
-      if (!user) throw notFound('Usuario', userId);
+      if (!user) throw notFound('USER', userId);
       const address = user.addresses.id(addressId);
-      if (!address) throw notFound('Dirección', addressId);
+      if (!address) throw notFound('ADDRESS', addressId);
       address.deleteOne();
       if (sameId(user.defaultAddressId, addressId)) user.defaultAddressId = user.addresses[0]?._id ?? null;
       await user.save();
@@ -689,7 +694,7 @@ const resolvers = {
 
     createProduct: async (_, { input }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
-      if (!(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
+      if (!(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('CATEGORY', input.categoryId);
       const product = await Product.create(input);
       catalogEvent(ctx, 'PRODUCT_CREATED', 'Product', product, product.name, { price: product.price, stock: product.stock, unit: product.unit });
       return product;
@@ -697,8 +702,8 @@ const resolvers = {
     updateProduct: async (_, { id, input }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(id);
-      if (!product) throw notFound('Producto', id);
-      if (input.categoryId && !(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('Categoría', input.categoryId);
+      if (!product) throw notFound('PRODUCT', id);
+      if (input.categoryId && !(await Category.exists({ _id: oid(input.categoryId) }))) throw notFound('CATEGORY', input.categoryId);
       const changes = diff(product.toObject(), input);
       Object.assign(product, input);
       await product.save();
@@ -714,7 +719,7 @@ const resolvers = {
     setProductActive: async (_, { id, active }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const before = await Product.findByIdAndUpdate(id, { isActive: active }, { new: false });
-      if (!before) throw notFound('Producto', id);
+      if (!before) throw notFound('PRODUCT', id);
       await invalidateProducts(id);
       if (before.isActive !== active) {
         catalogEvent(ctx, 'PRODUCT_ACTIVE_CHANGED', 'Product', before, active ? 'Activado' : 'Desactivado', { name: before.name, from: before.isActive, to: active });
@@ -723,9 +728,9 @@ const resolvers = {
     },
     setProductStock: async (_, { id, stock }, ctx) => {
       requirePermission(ctx, PERMISSIONS.STOCK_MANAGE);
-      if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero >= 0.');
+      if (!Number.isInteger(stock) || stock < 0) throw new DomainError('El stock debe ser un entero >= 0.', 'INVALID_STOCK');
       const before = await Product.findByIdAndUpdate(id, { stock }, { new: false });
-      if (!before) throw notFound('Producto', id);
+      if (!before) throw notFound('PRODUCT', id);
       await invalidateProducts(id);
       catalogEvent(ctx, 'STOCK_SET', 'Product', before, `Stock ${before.stock} → ${stock}`, { name: before.name, from: before.stock, to: stock });
       return Product.findById(id).exec();
@@ -733,7 +738,7 @@ const resolvers = {
     addProductDiscount: async (_, { productId, input }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(productId);
-      if (!product) throw notFound('Producto', productId);
+      if (!product) throw notFound('PRODUCT', productId);
       product.discounts.push(input);
       await product.save();
       await invalidateProducts(productId);
@@ -746,9 +751,9 @@ const resolvers = {
     removeProductDiscount: async (_, { productId, discountId }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const product = await Product.findById(productId);
-      if (!product) throw notFound('Producto', productId);
+      if (!product) throw notFound('PRODUCT', productId);
       const discount = product.discounts.id(discountId);
-      if (!discount) throw notFound('Descuento', discountId);
+      if (!discount) throw notFound('DISCOUNT', discountId);
       const { percent, label } = discount;
       discount.deleteOne();
       await product.save();
@@ -769,7 +774,7 @@ const resolvers = {
     updatePackage: async (_, { id, input }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const pkg = await Package.findById(id);
-      if (!pkg) throw notFound('Paquete', id);
+      if (!pkg) throw notFound('PACKAGE', id);
       if (input.items) {
         assertPackagePersistable({ ...pkg.toObject(), ...input });
         await assertProductsExist(input.items.map(i => i.productId));
@@ -785,7 +790,7 @@ const resolvers = {
     setPackageActive: async (_, { id, active }, ctx) => {
       requirePermission(ctx, PERMISSIONS.CATALOG_MANAGE);
       const before = await Package.findByIdAndUpdate(id, { isActive: active }, { new: false });
-      if (!before) throw notFound('Paquete', id);
+      if (!before) throw notFound('PACKAGE', id);
       if (before.isActive !== active) {
         catalogEvent(ctx, 'PACKAGE_ACTIVE_CHANGED', 'Package', before, active ? 'Activado' : 'Desactivado', { name: before.name, from: before.isActive, to: active });
       }
@@ -803,7 +808,7 @@ const resolvers = {
     updateStore: async (_, { id, input }, ctx) => {
       requirePermission(ctx, PERMISSIONS.STORES_MANAGE);
       const before = await Store.findById(id);
-      if (!before) throw notFound('Sucursal', id);
+      if (!before) throw notFound('STORE', id);
       const changes = diff(before.toObject(), input);
       const store = await Store.findByIdAndUpdate(id, input, { new: true, runValidators: true });
       await syncStoreNode(store);
@@ -872,8 +877,8 @@ const resolvers = {
     updateOrderStatus: async (_, { id, status }, ctx) => {
       const me = requireAuth(ctx);
       const order = await Order.findById(id);
-      if (!order) throw notFound('Orden', id);
-      if (!canChangeOrderStatus(me, order, status)) throw forbidden(`No tienes permiso para pasar esta orden a ${status}.`);
+      if (!order) throw notFound('ORDER', id);
+      if (!canChangeOrderStatus(me, order, status)) throw forbidden(`No tienes permiso para pasar esta orden a ${status}.`, 'ORDER_STATUS_CHANGE_DENIED', { status });
       return changeOrderStatus(order, status, ctx);
     },
 
@@ -881,26 +886,26 @@ const resolvers = {
     cancelOrder: async (_, { id }, ctx) => {
       const me = requireAuth(ctx);
       const order = await Order.findById(id);
-      if (!order) throw notFound('Orden', id);
-      if (!canChangeOrderStatus(me, order, 'CANCELLED')) throw forbidden('No tienes permiso para cancelar esta orden.');
+      if (!order) throw notFound('ORDER', id);
+      if (!canChangeOrderStatus(me, order, 'CANCELLED')) throw forbidden('No tienes permiso para cancelar esta orden.', 'ORDER_CANCEL_DENIED');
       return changeOrderStatus(order, 'CANCELLED', ctx);
     },
 
     // ---------- Listas guardadas ----------
     createShoppingList: async (_, { input }, ctx) => {
       requireSelfOrPermission(ctx, input.userId);
-      if (!(await User.exists({ _id: oid(input.userId) }))) throw notFound('Usuario', input.userId);
+      if (!(await User.exists({ _id: oid(input.userId) }))) throw notFound('USER', input.userId);
       return ShoppingList.create(input);
     },
     addItemToShoppingList: async (_, { listId, productId, packageId, quantity }, ctx) => {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
-      if (!list) throw notFound('Lista', listId);
+      if (!list) throw notFound('SHOPPING_LIST', listId);
       requireSelfOrPermission(ctx, list.userId);
       const exists = ref.productId
         ? await Product.exists({ _id: oid(ref.productId) })
         : await Package.exists({ _id: oid(ref.packageId) });
-      if (!exists) throw notFound(ref.productId ? 'Producto' : 'Paquete', ref.productId ?? ref.packageId);
+      if (!exists) throw notFound(ref.productId ? 'PRODUCT' : 'PACKAGE', ref.productId ?? ref.packageId);
       const item = list.items.find(i => sameId(i.productId, ref.productId) || sameId(i.packageId, ref.packageId));
       if (item) item.quantity += quantity;
       else list.items.push({ ...ref, quantity });
@@ -910,7 +915,7 @@ const resolvers = {
     removeItemFromShoppingList: async (_, { listId, productId, packageId }, ctx) => {
       const ref = itemRef({ productId, packageId });
       const list = await ShoppingList.findById(listId);
-      if (!list) throw notFound('Lista', listId);
+      if (!list) throw notFound('SHOPPING_LIST', listId);
       requireSelfOrPermission(ctx, list.userId);
       list.items = list.items.filter(i => !(sameId(i.productId, ref.productId) || sameId(i.packageId, ref.packageId)));
       await list.save();
@@ -933,19 +938,8 @@ const resolvers = {
 const server = new ApolloServer({
   schema: buildSubgraphSchema([{ typeDefs, resolvers }]),
   plugins: [auditPlugin], // ACCESS_DENIED y ORDER_REJECTED → bitácora
-  // Traduce errores de dominio / validación de Mongoose a mensajes limpios.
-  formatError: (formatted, error) => {
-    const original = error?.originalError ?? error;
-    if (original instanceof DomainError) {
-      // extensions lleva el código (PRICE_CHANGED, CART_EMPTY…) y sus detalles (newQuote, unavailable…).
-      return { message: original.message, path: formatted.path, extensions: original.extensions };
-    }
-    if (original?.name === 'ValidationError') {
-      const detail = Object.values(original.errors ?? {}).map(e => e.message).join(' ') || original.message;
-      return { message: detail, path: formatted.path, extensions: { code: 'VALIDATION_ERROR' } };
-    }
-    return formatted;
-  },
+  // Errores de dominio, validación de Mongoose y claves duplicadas -> extensions.code estable.
+  formatError: formatApiError,
 });
 
 const port = parseInt(process.env.PORT_CAMPAMENTOS) || 4001;
