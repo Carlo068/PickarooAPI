@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ok, tokenOf, newProduct, newPackage, PRODUCT_FIELDS } from './client.js';
+import { ok, tokenOf, newProduct, newPackage, seedStore, PRODUCT_FIELDS } from './client.js';
 
 const SEED_PRODUCTS = [
   'Arrachera marinada', 'Chorizo argentino', 'Costilla de cerdo', 'Bistec de res', 'Pechuga de pollo', 'Limón con sal',
@@ -11,7 +11,9 @@ const SEED_PRODUCTS = [
 ];
 
 test('products list the seed catalog with effectivePrice (15% on Plátano)', async () => {
-  const { products } = await ok(`{ products(limit: 100) { ${PRODUCT_FIELDS} } }`);
+  const centro = await seedStore();
+  const { products } = await ok(`query($s: ID) { products(storeId: $s, limit: 100) { ${PRODUCT_FIELDS} } }`, { s: centro.id });
+  assert.ok(products.every(p => p.store.id === centro.id));
   const byName = new Map(products.map(p => [p.name, p]));
   for (const name of SEED_PRODUCTS) assert.ok(byName.has(name), `missing seed product ${name}`);
 

@@ -5,7 +5,8 @@
 // 2. Toma la "foto" de aislamiento del dev (gateway :4000, conteos de
 //    pickaroodb, sucursales en Neo4j) y limpia restos de una corrida anterior.
 // 3. Arranca su propia API (stack.js), corre los *.test.js de esta carpeta
-//    con node:test a través del gateway de pruebas y, pase lo que pase
+//    con node:test a través del gateway de pruebas (IT_MONGO_URI apunta a
+//    pickaroodb_it para la prueba de migración) y, pase lo que pase
 //    (fallo, excepción o Ctrl+C), mata a sus hijos y limpia.
 // 4. Compara la foto de aislamiento: si el dev cambió, la corrida falla.
 // ============================================================
@@ -103,7 +104,7 @@ try {
   const code = await new Promise(resolve => {
     testRun = spawn(process.execPath, ['--test', '--test-concurrency=1', '--test-reporter=spec', ...files], {
       stdio: 'inherit',
-      env: { ...process.env, IT_GATEWAY_URL: config.gatewayUrl, IT_JWT_SECRET: config.jwtSecret, IT_JTI_FILE: config.jtiFile },
+      env: { ...process.env, IT_GATEWAY_URL: config.gatewayUrl, IT_JWT_SECRET: config.jwtSecret, IT_JTI_FILE: config.jtiFile, IT_MONGO_URI: config.mongoUri(config.db), IT_REDIS_URL: config.redisUrl },
     });
     testRun.on('exit', c => resolve(c ?? 1));
   });

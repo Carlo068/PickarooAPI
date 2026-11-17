@@ -7,6 +7,7 @@ import { ERROR_CODES, FORBIDDEN_REASONS, DomainError, notFoundError, isErrorCode
 import {
   assertProductPersistable, assertPackagePersistable, Product, Package, assertModeConsistency, priceOrder,
   assertQuoteStillValid, assertTransition, PACKAGE_MIN_ITEMS, PACKAGE_MAX_ITEMS,
+  assertPackageSameStore, linesStoreId, cartStoreId, assertCartAccepts,
 } from '../../src/domain/entities.js';
 import * as access from '../../src/domain/access.js';
 
@@ -207,5 +208,44 @@ describe('access.js: las reglas de acceso no lanzan, devuelven booleano', () => 
     assert.equal(access.canViewOrder(nobody, order), false);
     assert.equal(access.inStoreScope(nobody, 'S1'), false);
     assert.equal(access.hasPermission(undefined, 'orders:prepare'), false);
+  });
+});
+
+describe('marketplace: una sucursal por paquete, carrito, cotización y orden', () => {
+  const inStore = (id, storeId) => new Product(prod(id, { storeId }));
+  const line = product => ({ productId: product.id, quantity: 1, product });
+
+  test('los códigos nuevos están en el catálogo con sus campos', () => {
+    assert.deepEqual(ERROR_CODES.PACKAGE_STORE_MISMATCH.fields, ['storeId', 'productIds']);
+    assert.deepEqual(ERROR_CODES.STORE_MISMATCH.fields, ['expectedStoreId', 'itemsStoreId']);
+    assert.deepEqual(ERROR_CODES.MIXED_STORES.fields, ['storeIds']);
+    assert.deepEqual(ERROR_CODES.CART_STORE_MISMATCH.fields, ['cartStoreId', 'itemStoreId']);
+    assert.deepEqual(ERROR_CODES.ITEM_WITHOUT_STORE.fields, ['itemType', 'id', 'name']);
+  });
+  test('NO_ACTIVE_STORE ya no existe: sin la "primera sucursal activa" la sucursal sale de los artículos', () => {
+    assert.equal(isErrorCode('NO_ACTIVE_STORE'), false);
+    assert.ok(isErrorCode('STORE_INACTIVE'));
+  });
+  test('PACKAGE_STORE_MISMATCH', () => {
+    expectError(() => assertPackageSameStore('S1', [{ id: 'A', storeId: 'S1' }, { id: 'B', storeId: 'S2' }]), 'PACKAGE_STORE_MISMATCH', { storeId: 'S1', productIds: ['B'] });
+  });
+  test('MIXED_STORES', () => {
+    expectError(() => linesStoreId([line(inStore('A', 'S2')), line(inStore('B', 'S1'))]), 'MIXED_STORES', { storeIds: ['S1', 'S2'] });
+  });
+  test('STORE_MISMATCH (cotización/orden y carrito)', () => {
+    expectError(() => linesStoreId([line(inStore('A', 'S1'))], 'S2'), 'STORE_MISMATCH', { expectedStoreId: 'S2', itemsStoreId: 'S1' });
+    expectError(() => cartStoreId([line(inStore('A', 'S1'))], 'S2'), 'STORE_MISMATCH', { expectedStoreId: 'S2', itemsStoreId: 'S1' });
+  });
+  test('CART_STORE_MISMATCH', () => {
+    expectError(() => assertCartAccepts('S1', 'S2'), 'CART_STORE_MISMATCH', { cartStoreId: 'S1', itemStoreId: 'S2' });
+  });
+  test('ITEM_WITHOUT_STORE', () => {
+    expectError(() => linesStoreId([line(new Product(prod('Z')))]), 'ITEM_WITHOUT_STORE', { itemType: 'PRODUCT', id: 'Z', name: 'Producto Z' });
+  });
+  test('las denegaciones por sucursal usan razones de FORBIDDEN_REASONS', () => {
+    const staff = { id: 'u', permissions: ['stock:manage'], storeIds: ['S1'] };
+    assert.ok(Object.hasOwn(FORBIDDEN_REASONS, access.storeItemDenial(staff, 'stock:manage', 'S2').reason));
+    assert.ok(Object.hasOwn(FORBIDDEN_REASONS, access.categoryDenial(staff).reason));
+    assert.ok(Object.hasOwn(FORBIDDEN_REASONS, access.reportStoreScope(staff, 'S2').denied.reason));
   });
 });

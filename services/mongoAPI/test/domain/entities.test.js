@@ -10,6 +10,7 @@ import {
   Product, Package,
   deliveryFee, assertModeConsistency, stockDemand, priceOrder,
   cartLineStatus, reconcileCart, assertQuoteStillValid,
+  assertPackageSameStore, linesStoreId, cartStoreId, assertCartAccepts,
   lineDiscount, orderSubtotal, orderDiscountTotal,
   canTransition, assertTransition, buildOrderNumber,
 } from '../../src/domain/entities.js';
@@ -33,7 +34,7 @@ describe('constantes', () => {
     assert.deepEqual(USER_ROLES, ['CUSTOMER', 'STAFF', 'DELIVERY', 'MANAGER', 'ADMIN']);
     assert.equal(PACKAGE_MIN_ITEMS, 2);
     assert.equal(PACKAGE_MAX_ITEMS, 40);
-    assert.deepEqual(UNAVAILABLE_REASONS, ['DELETED', 'INACTIVE', 'OUT_OF_STOCK', 'INSUFFICIENT_STOCK']);
+    assert.deepEqual(UNAVAILABLE_REASONS, ['DELETED', 'INACTIVE', 'OUT_OF_STOCK', 'INSUFFICIENT_STOCK', 'OTHER_STORE']);
   });
 });
 
@@ -789,5 +790,137 @@ describe('buildOrderNumber', () => {
   test('números sin sufijo explícito casi siempre difieren', () => {
     const set = new Set(Array.from({ length: 50 }, () => buildOrderNumber(AT)));
     assert.ok(set.size > 40);
+  });
+});
+
+describe('marketplace: una sucursal por paquete, compra y carrito', () => {
+  const inStore = (id, storeId, over = {}) => new Product(prod(id, { storeId, ...over }));
+  const A1 = inStore('A1', 'S1');
+  const A2 = inStore('A2', 'S1');
+  const B1 = inStore('B1', 'S2');
+  const pkgS1 = new Package({ id: 'K1', storeId: 'S1', name: 'Combo S1', price: 150 }, [{ product: A1, quantity: 1 }, { product: A2, quantity: 1 }]);
+  const line = (item, quantity = 1) => (item instanceof Package ? { packageId: item.id, quantity, package: item } : { productId: item.id, quantity, product: item });
+  const expectExt = (fn, extensions) => assert.throws(fn, e => {
+    assert.ok(e instanceof DomainError, 'debe ser DomainError');
+    assert.deepEqual(e.extensions, extensions);
+    return true;
+  });
+
+  test('las entidades conservan su storeId como cadena (null si no tiene)', () => {
+    assert.equal(new Product(prod('X', { storeId: { toString: () => 'S9' } })).storeId, 'S9');
+    assert.equal(new Product(prod('X')).storeId, null);
+    assert.equal(pkgS1.storeId, 'S1');
+  });
+
+  describe('assertPackageSameStore', () => {
+    test('todos los productos de la sucursal del paquete: pasa', () => {
+      assert.equal(assertPackageSameStore('S1', [{ _id: 'A1', storeId: 'S1' }, { id: 'A2', storeId: 'S1' }]), true);
+    });
+    test('compara ids como cadena (ObjectId vs string)', () => {
+      assert.equal(assertPackageSameStore({ toString: () => 'S1' }, [{ id: 'A1', storeId: 'S1' }]), true);
+    });
+    test('PACKAGE_STORE_MISMATCH con la sucursal y los productos ajenos (también los sin sucursal)', () => {
+      expectExt(() => assertPackageSameStore('S1', [{ id: 'A1', storeId: 'S1' }, { id: 'B1', storeId: 'S2' }, { _id: 'Z', storeId: null }]),
+        { code: 'PACKAGE_STORE_MISMATCH', storeId: 'S1', productIds: ['B1', 'Z'] });
+    });
+  });
+
+  describe('linesStoreId (cotización y orden)', () => {
+    test('una sola sucursal: la de los artículos, productos y paquetes', () => {
+      assert.equal(linesStoreId([line(A1), line(pkgS1, 2)]), 'S1');
+    });
+    test('la pista que coincide se acepta; sin pista también', () => {
+      assert.equal(linesStoreId([line(A1)], 'S1'), 'S1');
+      assert.equal(linesStoreId([line(A1)], null), 'S1');
+      assert.equal(linesStoreId([line(A1)], undefined), 'S1');
+    });
+    test('MIXED_STORES con las sucursales ordenadas', () => {
+      expectExt(() => linesStoreId([line(B1), line(A1)]), { code: 'MIXED_STORES', storeIds: ['S1', 'S2'] });
+      throwsDomain(() => linesStoreId([line(pkgS1), line(B1)], 'S1'), 'MIXED_STORES');
+    });
+    test('STORE_MISMATCH cuando la pista no es la sucursal de los artículos', () => {
+      expectExt(() => linesStoreId([line(A1), line(A2)], 'S2'), { code: 'STORE_MISMATCH', expectedStoreId: 'S2', itemsStoreId: 'S1' });
+    });
+    test('ITEM_WITHOUT_STORE si un artículo no tiene sucursal (dato sin migrar)', () => {
+      expectExt(() => linesStoreId([line(A1), line(new Product(prod('Z')))]), { code: 'ITEM_WITHOUT_STORE', itemType: 'PRODUCT', id: 'Z', name: 'Producto Z' });
+    });
+    test('sin partidas: null', () => {
+      assert.equal(linesStoreId([]), null);
+    });
+    test('PACKAGE_STORE_MISMATCH si el contenido del paquete es de otra sucursal (no se toca su stock)', () => {
+      const split = new Package({ id: 'K2', storeId: 'S1', name: 'Combo partido', price: 150 }, [{ product: A1, quantity: 1 }, { product: B1, quantity: 1 }]);
+      expectExt(() => linesStoreId([line(split)]), { code: 'PACKAGE_STORE_MISMATCH', storeId: 'S1', productIds: ['B1'] });
+      throwsDomain(() => linesStoreId([line(split)], 'S1'), 'PACKAGE_STORE_MISMATCH');
+      const orphan = new Package({ id: 'K3', storeId: 'S1', name: 'Combo con huérfano', price: 150 }, [{ product: A1, quantity: 1 }, { product: new Product(prod('Z')), quantity: 1 }]);
+      throwsDomain(() => linesStoreId([line(orphan)]), 'PACKAGE_STORE_MISMATCH');
+    });
+    test('un producto borrado en el paquete no cambia el error: lo atiende la disponibilidad', () => {
+      const deleted = new Product({ _id: 'GONE', name: 'Producto eliminado', price: 0, stock: 0, isActive: false });
+      const pkg = new Package({ id: 'K4', storeId: 'S1', name: 'Combo roto', price: 150 }, [{ product: A1, quantity: 1 }, { product: deleted, quantity: 1 }]);
+      assert.equal(linesStoreId([line(pkg)]), 'S1');
+    });
+  });
+
+  describe('cartStoreId', () => {
+    test('la sucursal de sus partidas; las borradas no cuentan', () => {
+      assert.equal(cartStoreId([line(A1), { productId: 'G', quantity: 1, product: null }]), 'S1');
+    });
+    test('vacío, solo borradas o solo sin sucursal: null', () => {
+      assert.equal(cartStoreId([]), null);
+      assert.equal(cartStoreId([{ productId: 'G', quantity: 1, product: null }]), null);
+      assert.equal(cartStoreId([line(new Product(prod('Z')))]), null);
+    });
+    test('carrito mezclado (datos anteriores): la sucursal con más partidas; empate, el id menor', () => {
+      assert.equal(cartStoreId([line(B1), line(A1), line(A2)]), 'S1');
+      assert.equal(cartStoreId([line(B1), line(A1)]), 'S1');
+    });
+    test('carrito mezclado: la pista elige entre sus sucursales', () => {
+      assert.equal(cartStoreId([line(B1), line(A1), line(A2)], 'S2'), 'S2');
+    });
+    test('STORE_MISMATCH si la pista no es de ninguna partida', () => {
+      expectExt(() => cartStoreId([line(A1)], 'S3'), { code: 'STORE_MISMATCH', expectedStoreId: 'S3', itemsStoreId: 'S1' });
+    });
+    test('carrito vacío con pista: null, sin error', () => {
+      assert.equal(cartStoreId([], 'S1'), null);
+    });
+  });
+
+  describe('assertCartAccepts', () => {
+    test('carrito vacío acepta cualquier sucursal; la misma sucursal también', () => {
+      assert.equal(assertCartAccepts(null, 'S2'), true);
+      assert.equal(assertCartAccepts('S1', { toString: () => 'S1' }), true);
+    });
+    test('CART_STORE_MISMATCH con la sucursal del carrito y la del artículo', () => {
+      expectExt(() => assertCartAccepts('S1', 'S2'), { code: 'CART_STORE_MISMATCH', cartStoreId: 'S1', itemStoreId: 'S2' });
+    });
+  });
+
+  describe('OTHER_STORE en el carrito', () => {
+    test('una partida de otra sucursal que la del carrito no se puede comprar', () => {
+      assert.deepEqual(cartLineStatus(line(B1), 'S1'), { reason: 'OTHER_STORE', available: 0 });
+      assert.deepEqual(cartLineStatus(line(A1), 'S1'), { reason: null, available: 10 });
+    });
+    test('DELETED tiene prioridad; OTHER_STORE antes que INACTIVE', () => {
+      assert.equal(cartLineStatus({ productId: 'G', quantity: 1, product: null }, 'S1').reason, 'DELETED');
+      assert.equal(cartLineStatus(line(inStore('B2', 'S2', { isActive: false })), 'S1').reason, 'OTHER_STORE');
+    });
+    test('sin sucursal indicada no se comprueba (comportamiento anterior)', () => {
+      assert.equal(cartLineStatus(line(B1)).reason, null);
+    });
+    test('reconcileCart con la sucursal del carrito separa las de otra', () => {
+      const lines = [line(B1), line(A1), line(pkgS1)];
+      const { available, unavailable } = reconcileCart(lines, { storeId: cartStoreId(lines) });
+      assert.deepEqual(available.map(l => l.productId ?? l.packageId), ['A1', 'K1']);
+      assert.deepEqual(unavailable.map(u => [u.productId, u.reason, u.available]), [['B1', 'OTHER_STORE', 0]]);
+    });
+  });
+
+  test('priceOrder cobra el envío de la sucursal de los artículos', () => {
+    const s2 = { id: 'S2', deliveryFee: 55, freeDeliveryThreshold: null };
+    const lines = [line(B1)];
+    assert.equal(linesStoreId(lines), s2.id);
+    const priced = priceOrder({ mode: 'DELIVERY', store: s2, lines, at: AT });
+    assert.equal(priced.deliveryFee, 55);
+    assert.equal(priced.total, 155);
   });
 });

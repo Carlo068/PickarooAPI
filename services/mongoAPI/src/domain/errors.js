@@ -47,6 +47,10 @@ export const ERROR_CODES = {
   INVALID_PACKAGE_ITEM: { description: 'Un producto del paquete no trae productId.', fields: [] },
   DUPLICATE_PACKAGE_PRODUCT: { description: 'El paquete repite un producto.', fields: [] },
   PACKAGE_PRODUCT_NOT_FOUND: { description: 'Algún producto del paquete no existe en el catálogo.', fields: [] },
+  PACKAGE_STORE_MISMATCH: {
+    description: 'Un paquete solo puede contener productos de su propia sucursal (`storeId`); `productIds` son los de otra.',
+    fields: ['storeId', 'productIds'],
+  },
 
   // ---------- Disponibilidad e inventario ----------
   ITEM_UNAVAILABLE: {
@@ -54,6 +58,10 @@ export const ERROR_CODES = {
     fields: ['itemType', 'id?', 'name', 'componentId?', 'componentName?'],
   },
   INSUFFICIENT_STOCK: { description: 'No alcanza el stock de un producto para la cantidad pedida.', fields: ['productId', 'name', 'requested', 'available'] },
+  ITEM_WITHOUT_STORE: {
+    description: 'El producto o paquete no pertenece a ninguna sucursal (dato anterior al marketplace sin migrar); no se puede comprar.',
+    fields: ['itemType', 'id', 'name'],
+  },
 
   // ---------- Carrito ----------
   INVALID_CART_LINE: { description: 'Una partida debe indicar productId o packageId, uno solo.', fields: [] },
@@ -62,6 +70,10 @@ export const ERROR_CODES = {
   CART_HAS_UNAVAILABLE_ITEMS: {
     description: 'Hay partidas del carrito que ya no se pueden comprar.',
     fields: ['unavailable'],
+  },
+  CART_STORE_MISMATCH: {
+    description: 'El carrito ya tiene artículos de otra sucursal (`cartStoreId`); para agregar este (de `itemStoreId`) hay que vaciarlo primero.',
+    fields: ['cartStoreId', 'itemStoreId'],
   },
 
   // ---------- Cotización y compra ----------
@@ -73,8 +85,12 @@ export const ERROR_CODES = {
   STORE_REQUIRED: { description: 'Una orden de recogida necesita sucursal.', fields: [] },
   DELIVERY_ADDRESS_REQUIRED: { description: 'Una orden a domicilio necesita dirección de entrega.', fields: [] },
   USER_INACTIVE: { description: 'El usuario que compra está desactivado.', fields: [] },
-  NO_ACTIVE_STORE: { description: 'No hay ninguna sucursal activa configurada.', fields: [] },
-  STORE_INACTIVE: { description: 'La sucursal indicada está desactivada.', fields: ['storeId', 'name'] },
+  STORE_INACTIVE: { description: 'La sucursal de los artículos está desactivada.', fields: ['storeId', 'name'] },
+  STORE_MISMATCH: {
+    description: 'La sucursal indicada (`expectedStoreId`) no es la de los artículos (`itemsStoreId`): la compra es de la sucursal de sus artículos.',
+    fields: ['expectedStoreId', 'itemsStoreId'],
+  },
+  MIXED_STORES: { description: 'La compra tiene artículos de más de una sucursal (`storeIds`, ordenados).', fields: ['storeIds'] },
 
   // ---------- Estados de la orden ----------
   INVALID_ORDER_STATUS: { description: 'El estado indicado no existe.', fields: ['status'] },

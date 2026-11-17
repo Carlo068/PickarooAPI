@@ -20,11 +20,13 @@ test('users:manage: a customer cannot list users, an admin can', async () => {
   assert.ok(users.length > 0);
 });
 
-test('catalog:manage: staff cannot create a category, a manager can', async () => {
+// Marketplace: las categorías son globales; crearlas exige además scope:all_stores (solo ADMIN).
+test('catalog:manage + scope:all_stores: staff and a manager cannot create a category, an admin can', async () => {
   const CREATE = 'mutation($input: CategoryInput!) { createCategory(input: $input) { id name } }';
   await permissionRequired('catalog:manage', CREATE, { input: { name: `Denegada ${uid()}` } }, await tokenOf('STAFF'));
+  await permissionRequired('scope:all_stores', CREATE, { input: { name: `Denegada ${uid()}` } }, await tokenOf('MANAGER'));
   const name = `Categoria IT ${uid()}`;
-  const { createCategory } = await ok(CREATE, { input: { name } }, await tokenOf('MANAGER'));
+  const { createCategory } = await ok(CREATE, { input: { name } }, await tokenOf('ADMIN'));
   assert.equal(createCategory.name, name);
 });
 
@@ -93,7 +95,9 @@ test('store scope: staff of another store cannot see or move orders of CARNYFRUT
   const customer = await newCustomer();
   const product = await newProduct();
   const inCentro = await createOrder(customer, { items: [{ productId: product.id, quantity: 1 }] });
-  const inNorte = await createOrder(customer, { items: [{ productId: product.id, quantity: 1 }], storeId: norte.id });
+  // Marketplace: la sucursal de la orden es la de sus artículos.
+  const fromNorte = await newProduct({ storeId: norte.id });
+  const inNorte = await createOrder(customer, { items: [{ productId: fromNorte.id, quantity: 1 }], storeId: norte.id });
 
   await forbidden('ORDER_STATUS_CHANGE_DENIED', UPDATE_STATUS, { id: inCentro.id, status: 'CONFIRMED' }, token);
   await forbidden('ORDER_VIEW_DENIED', 'query($id: ID!) { order(id: $id) { id } }', { id: inCentro.id }, token);

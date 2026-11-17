@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG,
   isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder,
+  storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from '../../src/domain/access.js';
 import { ORDER_STATUSES, ORDER_MODES } from '../../src/domain/entities.js';
 
@@ -332,5 +333,79 @@ describe('canViewOrder', () => {
     assert.equal(canViewOrder(accessOf('STAFF', { id: 'p' }), o), false);
     assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'cliente' }), o), true);
     assert.equal(canViewOrder(accessOf('ADMIN', { id: 'admin' }), o), true);
+  });
+});
+
+// ---------- Marketplace: catálogo, inventario y reportes por sucursal ----------
+describe('storeItemDenial (catalog:manage y stock:manage por sucursal)', () => {
+  const staffA = accessOf('STAFF', { storeIds: ['A'] });
+  const managerA = accessOf('MANAGER', { storeIds: ['A'] });
+  const admin = accessOf('ADMIN', { storeIds: [] });
+
+  test('en una sucursal asignada (WORKS_AT): permitido', () => {
+    assert.equal(storeItemDenial(staffA, P.STOCK_MANAGE, 'A'), null);
+    assert.equal(storeItemDenial(managerA, P.CATALOG_MANAGE, 'A'), null);
+    assert.equal(storeItemDenial(managerA, P.STOCK_MANAGE, { toString: () => 'A' }), null);
+  });
+  test('en otra sucursal: STORE_NOT_ASSIGNED con su storeId', () => {
+    assert.deepEqual(storeItemDenial(staffA, P.STOCK_MANAGE, 'B'), { reason: 'STORE_NOT_ASSIGNED', storeId: 'B' });
+    assert.deepEqual(storeItemDenial(managerA, P.CATALOG_MANAGE, 'B'), { reason: 'STORE_NOT_ASSIGNED', storeId: 'B' });
+  });
+  test('sin el permiso: PERMISSION_REQUIRED antes que el alcance', () => {
+    assert.deepEqual(storeItemDenial(staffA, P.CATALOG_MANAGE, 'A'), { reason: 'PERMISSION_REQUIRED', permission: P.CATALOG_MANAGE });
+    assert.deepEqual(storeItemDenial(accessOf('DELIVERY', { storeIds: ['A'] }), P.STOCK_MANAGE, 'B'), { reason: 'PERMISSION_REQUIRED', permission: P.STOCK_MANAGE });
+    assert.deepEqual(storeItemDenial(null, P.STOCK_MANAGE, 'A'), { reason: 'PERMISSION_REQUIRED', permission: P.STOCK_MANAGE });
+  });
+  test('scope:all_stores (ADMIN): cualquier sucursal, también un artículo sin sucursal', () => {
+    assert.equal(storeItemDenial(admin, P.CATALOG_MANAGE, 'Z'), null);
+    assert.equal(storeItemDenial(admin, P.STOCK_MANAGE, null), null);
+  });
+  test('artículo sin sucursal (sin migrar): fuera del alcance del personal', () => {
+    assert.deepEqual(storeItemDenial(managerA, P.CATALOG_MANAGE, null), { reason: 'STORE_NOT_ASSIGNED', storeId: null });
+  });
+  test('managesStoreItems: catálogo o inventario en esa sucursal', () => {
+    assert.equal(managesStoreItems(staffA, 'A'), true);
+    assert.equal(managesStoreItems(staffA, 'B'), false);
+    assert.equal(managesStoreItems(admin, 'B'), true);
+    assert.equal(managesStoreItems(accessOf('CUSTOMER'), 'S1'), false);
+    assert.equal(managesStoreItems(null, 'A'), false);
+  });
+  test('seesStoreItems: quien administra la sucursal o tiene scope:all_stores', () => {
+    assert.equal(seesStoreItems(staffA, 'A'), true);
+    assert.equal(seesStoreItems(staffA, 'B'), false);
+    assert.equal(seesStoreItems(admin, 'B'), true);
+    assert.equal(seesStoreItems({ ...accessOf('CUSTOMER'), permissions: [P.ALL_STORES] }, 'B'), true);
+    assert.equal(seesStoreItems(accessOf('CUSTOMER'), 'A'), false);
+    assert.equal(seesStoreItems(null, 'A'), false);
+  });
+});
+
+describe('categoryDenial (categorías globales)', () => {
+  test('ADMIN puede crearlas', () => {
+    assert.equal(categoryDenial(accessOf('ADMIN')), null);
+  });
+  test('MANAGER: tiene catalog:manage pero le falta scope:all_stores', () => {
+    assert.deepEqual(categoryDenial(accessOf('MANAGER')), { reason: 'PERMISSION_REQUIRED', permission: P.ALL_STORES });
+  });
+  test('STAFF y CUSTOMER: les falta catalog:manage', () => {
+    for (const role of ['STAFF', 'CUSTOMER', 'DELIVERY']) {
+      assert.deepEqual(categoryDenial(accessOf(role)), { reason: 'PERMISSION_REQUIRED', permission: P.CATALOG_MANAGE });
+    }
+    assert.deepEqual(categoryDenial(undefined), { reason: 'PERMISSION_REQUIRED', permission: P.CATALOG_MANAGE });
+  });
+});
+
+describe('reportStoreScope (reportes por sucursal)', () => {
+  test('ADMIN sin storeId: todas (storeIds null); con storeId: esa', () => {
+    assert.deepEqual(reportStoreScope(accessOf('ADMIN', { storeIds: [] })), { storeIds: null });
+    assert.deepEqual(reportStoreScope(accessOf('ADMIN', { storeIds: [] }), 'B'), { storeIds: ['B'] });
+  });
+  test('MANAGER sin storeId: sus WORKS_AT (ninguna si no tiene)', () => {
+    assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: ['A', 'C'] })), { storeIds: ['A', 'C'] });
+    assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: [] })), { storeIds: [] });
+  });
+  test('MANAGER con storeId: la suya sí, otra STORE_NOT_ASSIGNED', () => {
+    assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: ['A'] }), 'A'), { storeIds: ['A'] });
+    assert.deepEqual(reportStoreScope(accessOf('MANAGER', { storeIds: ['A'] }), 'B'), { denied: { reason: 'STORE_NOT_ASSIGNED', storeId: 'B' } });
   });
 });
