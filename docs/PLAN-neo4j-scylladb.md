@@ -82,7 +82,7 @@ Permisos efectivos = los del rol + los de todos los roles heredados (`[:INHERITS
 | `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (motivo), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE` |
 | `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED`, `STORE_CREATED`, `STORE_UPDATED` |
 | `CATALOG` | `PRODUCT_CREATED`, `PRODUCT_UPDATED` (precio anterior → nuevo), `PRODUCT_ACTIVE_CHANGED`, `STOCK_SET` (anterior → nuevo), `DISCOUNT_ADDED`, `DISCOUNT_REMOVED`, `PACKAGE_CREATED`, `PACKAGE_UPDATED`, `PACKAGE_ACTIVE_CHANGED`, `CATEGORY_CREATED` |
-| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED`, `ORDER_REJECTED` (PRICE_CHANGED, QUOTE_*, CART_*, stock insuficiente) |
+| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED`, `ORDER_REJECTED` (PRICE_CHANGED, QUOTE_*, CART_*, stock insuficiente), `DELIVERY_ACCEPTED` y `DELIVERY_RELEASED` (objetivo la orden; `storeId` y `driverId` en metadata) |
 
 Nunca se registran contraseñas ni tokens completos.
 

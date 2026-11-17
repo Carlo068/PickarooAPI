@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ok, forbidden, tokenOf, login, uid, today, newCustomer, newUser, newProduct, seedStore, createOrder, moveOrder, UPDATE_STATUS, ADDRESS,
+  newDriver, acceptDelivery, ACCEPT_DELIVERY,
 } from './client.js';
 
 const permissionRequired = async (permission, query, variables, token) => {
@@ -71,13 +72,19 @@ test('orders:prepare: a delivery driver cannot confirm an order, staff can', asy
   await moveOrder(order.id, ['CONFIRMED'], await tokenOf('STAFF'));
 });
 
-test('orders:deliver: staff cannot send an order out for delivery, the delivery driver can', async () => {
+// PIC-76: el repartidor primero acepta la orden; después solo él la saca a reparto
+// (el personal de mostrador recibe NOT_ASSIGNED_DRIVER, ya no ORDER_STATUS_CHANGE_DENIED).
+test('orders:deliver: staff cannot accept or send out a delivery, the driver who accepted it can', async () => {
   const customer = await newCustomer();
   const product = await newProduct();
   const order = await createOrder(customer, { mode: 'DELIVERY', items: [{ productId: product.id, quantity: 1 }] });
-  await moveOrder(order.id, ['CONFIRMED', 'PREPARING', 'READY'], await tokenOf('STAFF'));
-  await forbidden('ORDER_STATUS_CHANGE_DENIED', UPDATE_STATUS, { id: order.id, status: 'IN_DELIVERY' }, await tokenOf('STAFF'));
-  await moveOrder(order.id, ['IN_DELIVERY'], await tokenOf('DELIVERY'));
+  const staff = await tokenOf('STAFF');
+  await moveOrder(order.id, ['CONFIRMED', 'PREPARING', 'READY'], staff);
+  await permissionRequired('orders:deliver', ACCEPT_DELIVERY, { id: order.id }, staff);
+  const driver = await newDriver();
+  await acceptDelivery(order.id, driver.token);
+  await forbidden('NOT_ASSIGNED_DRIVER', UPDATE_STATUS, { id: order.id, status: 'IN_DELIVERY' }, staff);
+  await moveOrder(order.id, ['IN_DELIVERY', 'DELIVERED'], driver.token);
 });
 
 test('store scope: staff of another store cannot see or move orders of CARNYFRUT Centro', async () => {

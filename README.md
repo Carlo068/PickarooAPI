@@ -291,7 +291,7 @@ Los permisos efectivos son los del rol más los de todos los roles que hereda (`
 - **Fuente de verdad:** Neo4j. `users.role` en MongoDB es un espejo: se actualiza con `assignRole` y se corrige solo en el login si difiere.
 - **Catálogo:** roles, permisos, herencia y menú se definen en `domain/access.js` y se crean/actualizan en Neo4j en cada arranque (y al reconectar).
 - **Auto-reparación:** un usuario que aún no está en el grafo se crea en su primer login con el rol espejo de MongoDB.
-- **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT`; `scope:all_stores` (ADMIN) ve todas. Lo mismo vale para el catálogo y el inventario: `catalog:manage` (alta y edición de productos y paquetes, descuentos, activar/desactivar) y `stock:manage` (`setProductStock`) solo aplican a artículos de una sucursal del alcance, y los reportes solo cubren esas sucursales. Fuera del alcance: `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED` y `storeId`. La regla es `storeItemDenial` en `domain/access.js` (reportes: `reportStoreScope`).
+- **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT` (el repartidor, además, solo las disponibles para aceptar y las asignadas a él; ver sección 6, "Reparto"); `scope:all_stores` (ADMIN) ve todas. Lo mismo vale para el catálogo y el inventario: `catalog:manage` (alta y edición de productos y paquetes, descuentos, activar/desactivar) y `stock:manage` (`setProductStock`) solo aplican a artículos de una sucursal del alcance, y los reportes solo cubren esas sucursales. Fuera del alcance: `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED` y `storeId`. La regla es `storeItemDenial` en `domain/access.js` (reportes: `reportStoreScope`).
 - **Categorías globales:** las comparten todas las sucursales, así que crearlas exige `catalog:manage` **y** `scope:all_stores` (solo ADMIN). A un MANAGER le falta el segundo: `FORBIDDEN`, `reason: PERMISSION_REQUIRED`, `permission: scope:all_stores`.
 - **Cambios de acceso inmediatos:** `assignRole`, `assignUserToStore` y `removeUserFromStore` revocan todas las sesiones del usuario (`user:<id>:sessions`) y todos sus refresh tokens (`user:<id>:refresh-families`); al volver a entrar recibe los permisos nuevos. Si Redis no está listo, la operación responde `SERVICE_UNAVAILABLE` (`service: SESSIONS`) **antes** de cambiar nada en Neo4j o MongoDB. Si Redis falla después de aplicar el cambio (entre el cambio y la revocación), la respuesta también es `SERVICE_UNAVAILABLE` (`SESSIONS`), pero el cambio queda hecho y registrado (`ROLE_CHANGED` o `STORE_ASSIGNMENT_CHANGED` se emiten antes de revocar): las sesiones abiertas conservan los permisos anteriores hasta vencer (`JWT_TTL_SECONDS`, una hora), y sus refresh tokens siguen vivos, pero el siguiente canje ya relee el acceso nuevo de Neo4j, así que no revive los permisos anteriores. Para terminar la revocación se repite la operación cuando Redis vuelva (`assignRole` y `assignUserToStore` se pueden repetir; `removeUserFromStore` responde `USER_NOT_ASSIGNED_TO_STORE`, así que en ese caso se usa `assignRole` con el mismo rol).
 - **Neo4j caído:** el login funciona con permisos vacíos (`access.degraded = true`) y se registra `RBAC_UNAVAILABLE`. Nadie gana privilegios sin el grafo; los clientes compran normalmente. `refreshToken`, en cambio, responde `SERVICE_UNAVAILABLE` (`service: RBAC`) sin gastar el token, para que la sesión renovada no quede sin permisos.
@@ -302,8 +302,10 @@ Reglas de órdenes (`canChangeOrderStatus`):
 |---|---|---|
 | → `CONFIRMED`, `PREPARING`, `READY` | `orders:prepare` | sucursal asignada |
 | `READY` → `DELIVERED` (PICKUP) | `orders:prepare` | sucursal asignada |
-| `READY` → `IN_DELIVERY` → `DELIVERED` (DELIVERY) | `orders:deliver` | sucursal asignada; una orden PICKUP nunca sale a reparto |
-| → `CANCELLED` | dueño de la orden, o `orders:prepare` | sucursal asignada |
+| `READY` → `IN_DELIVERY` → `DELIVERED` (DELIVERY) | `orders:deliver` | **ser el repartidor asignado** (`acceptDelivery`), o ADMIN si la orden ya tiene repartidor; una orden PICKUP nunca sale a reparto y una DELIVERY no se salta `IN_DELIVERY` |
+| → `CANCELLED` | dueño de la orden, o `orders:prepare` | sucursal asignada; no depende del repartidor |
+
+En una orden DELIVERY, recogerla (`READY → IN_DELIVERY`) y entregarla (`IN_DELIVERY → DELIVERED`) son pasos **del repartidor asignado** (`order.driverId`), mientras siga teniendo `orders:deliver`; no se le exige la sucursal, así que si lo cambian de sucursal con una entrega en curso la puede terminar. **Invariante: una orden `IN_DELIVERY` siempre tiene repartidor.** Por eso recogerla sin repartidor da `NO_DRIVER_ASSIGNED` a todos, ADMIN incluido: ADMIN tiene `orders:deliver` y la acepta él primero. ADMIN (`orders:deliver` + `scope:all_stores`) sí puede recoger o entregar una orden asignada a otro repartidor (el repartidor sigue en `driver` y queda libre al entregarla). Otro repartidor o el personal de mostrador de la sucursal reciben `FORBIDDEN` con `reason: NOT_ASSIGNED_DRIVER`, o `NO_DRIVER_ASSIGNED` si nadie la ha aceptado. Quien no es de la sucursal recibe `ORDER_STATUS_CHANGE_DENIED`, sin enterarse de la asignación. `READY → DELIVERED` en una orden DELIVERY no es un paso de la ruta: el repartidor y ADMIN reciben `INVALID_STATUS_TRANSITION` y el personal de mostrador, sin `orders:deliver`, `ORDER_STATUS_CHANGE_DENIED`. La regla es pura (`orderStatusDenial` en `domain/access.js`; `canChangeOrderStatus` es `orderStatusDenial(...) === null`) y `changeOrderStatus` la vuelve a evaluar en cada reintento.
 
 Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin permiso):
 
@@ -312,7 +314,9 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | Público | `login`, `refreshToken`, `createUser` (registro; siempre `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
 | Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `logoutAllDevices`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
 | Dueño o `users:manage` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
-| Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal: las de sus sucursales; repartidor: solo DELIVERY), `cancelOrder`, `updateOrderStatus` (según la tabla anterior) |
+| Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal de mostrador: las de sus sucursales; repartidor: las disponibles para aceptar de sus sucursales y las asignadas a él), `cancelOrder`, `updateOrderStatus` (según la tabla anterior) |
+| `orders:deliver` (sucursales del alcance) | `availableDeliveries`, `acceptDelivery`, `myDeliveries`, `currentDelivery` |
+| Repartidor asignado, `orders:prepare` en la sucursal o ADMIN | `releaseDelivery` |
 | `stock:manage` en la sucursal del producto | `setProductStock` |
 | `catalog:manage` en la sucursal del artículo (alta: la `storeId` del input) | `createProduct`, `updateProduct`, `setProductActive`, `addProductDiscount`, `removeProductDiscount`, `createPackage`, `updatePackage`, `setPackageActive` |
 | `catalog:manage` + `scope:all_stores` | `createCategory` |
@@ -408,6 +412,13 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `INVALID_STATUS_TRANSITION` | La transición de estado no está permitida. | `from`, `to` |
 | `PICKUP_CANNOT_BE_DELIVERED` | Una orden de recogida (PICKUP) no puede salir a reparto. | — |
 
+**Reparto**
+
+| Código | Significado | Campos de `extensions` |
+|---|---|---|
+| `ORDER_NOT_AVAILABLE` | La orden no se puede aceptar ni liberar. `reason`: `TAKEN` (ya tiene repartidor), `NOT_READY` (aún no está lista), `PICKED_UP` (ya salió a reparto), `NOT_DELIVERY` (es de recogida), `CANCELLED` o `DELIVERED`. | `orderId`, `reason` |
+| `ALREADY_DELIVERING` | El repartidor ya tiene una entrega activa (`activeOrderId`, READY o IN_DELIVERY asignada a él); solo puede llevar una a la vez. | `activeOrderId` |
+
 **Roles y sucursales de usuarios**
 
 | Código | Significado | Campos de `extensions` |
@@ -439,6 +450,9 @@ Notas por código:
 | `STORE_NOT_ASSIGNED` | La sucursal `storeId` no está asignada al usuario (órdenes, catálogo, inventario o reportes de otra sucursal). |
 | `OWN_ORDERS_ONLY` | Solo se pueden consultar las órdenes propias. |
 | `CANNOT_CHANGE_OWN_ROLE` | Un usuario no puede cambiar su propio rol. |
+| `NOT_ASSIGNED_DRIVER` | La orden a domicilio tiene otro repartidor asignado: solo él (o ADMIN) la recoge y la entrega; liberarla pueden él, el personal de mostrador de la sucursal (`orders:prepare`) o ADMIN. Trae `status` en `updateOrderStatus`. |
+| `NO_DRIVER_ASSIGNED` | La orden a domicilio no tiene repartidor asignado: primero hay que aceptarla (`acceptDelivery`). Trae `status` en `updateOrderStatus`. En el reintento de `releaseDelivery` de un repartidor significa que ya se liberó. |
+| `OWN_ORDER` | Un repartidor no puede aceptar el reparto de una orden suya (`acceptDelivery`). |
 
 - `INVALID_CREDENTIALS` cubre correo inexistente, contraseña incorrecta y cuenta desactivada con el mismo código a propósito. `UNAUTHENTICATED` queda para "no hay sesión válida": el cliente canjea su refresh token una vez y reintenta; si no tiene o el canje falla, va al login.
 - `INVALID_REFRESH_TOKEN` y `REFRESH_TOKEN_REUSED` solo los devuelve `refreshToken`; en los dos casos el cliente borra los tokens guardados y va al login. `REFRESH_TOKEN_REUSED` indica que el token pudo haberse copiado (se presentó fuera de la ventana de gracia con su familia viva): la app puede avisar que se cerró la sesión de ese dispositivo por seguridad. Un token de una familia ya cerrada da `INVALID_REFRESH_TOKEN`, sin alerta. En cambio, ante `SERVICE_UNAVAILABLE` el cliente conserva el refresh token y reintenta con espera creciente.
@@ -446,6 +460,8 @@ Notas por código:
 - `VALIDATION_ERROR` es la validación de Mongoose al guardar. `violations` es `[{ field, rule }]`; `rule` es el código de dominio cuando la regla viene del dominio (p. ej. `INVALID_PRICE`, `INVALID_STOCK`) o el tipo de Mongoose (`required`, `min`, `max`, `enum`, `user defined`…).
 - Una clave única repetida (índice de MongoDB, error E11000) llega como `EMAIL_ALREADY_REGISTERED` si el campo es `email` y como `DUPLICATE_VALUE` con `field` en los demás casos.
 - `QUOTE_EXPIRED`, `QUOTE_MISMATCH` y `PRICE_CHANGED` traen `newQuote` (`quoteId`, `expiresAt`, `subtotal`, `discountTotal`, `deliveryFee`, `total` e `items`) para reconfirmar sin otra consulta. `CART_HAS_UNAVAILABLE_ITEMS.unavailable` es `[{ productId, packageId, reason, availableQuantity }]` con `reason` en `DELETED`, `INACTIVE`, `OUT_OF_STOCK`, `INSUFFICIENT_STOCK` u `OTHER_STORE`.
+- `ORDER_NOT_AVAILABLE` lo devuelven `acceptDelivery` (la orden no está en `READY` + `DELIVERY` + sin repartidor; `TAKEN` es el caso de dos repartidores que la aceptan a la vez) y `releaseDelivery` (la orden ya no está en `READY`: `PICKED_UP`, `CANCELLED`, `DELIVERED`…). La app muestra "ya no está disponible" y refresca la lista. `ALREADY_DELIVERING` solo lo devuelve `acceptDelivery`: la app lleva al repartidor a su entrega activa (`activeOrderId`). `activeOrderId` solo sería `null` si la entrega activa terminó justo entre el choque con el índice y su consulta, dos veces seguidas (no se ha visto en la práctica).
+- Reintentar `releaseDelivery` tras perder la respuesta: si la primera llamada sí liberó la orden, el reintento del repartidor recibe `FORBIDDEN` con `NO_DRIVER_ASSIGNED` (la orden ya está libre) o `NOT_ASSIGNED_DRIVER` (otro repartidor ya la aceptó). En los dos casos la orden ya no es suya: la app lo trata como liberada. Para el personal de mostrador o ADMIN, el reintento sobre una orden libre devuelve la orden sin cambios.
 - `NO_ACTIVE_STORE` ya no existe: la sucursal de una compra sale de sus artículos, nunca de "la primera sucursal activa".
 - Limitación conocida: el campo `quoteError` del carrito (`Cart.quoteError`) es una cadena en español, no un código; el esquema no cambia en esta etapa.
 
@@ -460,7 +476,7 @@ La aplicación exporta siete modelos. Cada dato vive en un solo lugar: lo que se
 | `products` | Sucursal (`storeId`), nombre, descripción, precio, imagen, unidad, stock y estado. | `discounts[]`: hasta 20 promociones. |
 | `packages` | Sucursal (`storeId`), nombre, descripción, precio fijo, imagen y estado. **Sin stock propio.** | `items[]`: entre 2 y 40 productos de su sucursal con su cantidad. |
 | `stores` | Nombre, contacto, horario y política de reparto. | `address`: ubicación incrustada. |
-| `orders` | Número, usuario, sucursal, modalidad, estado, envío, total y notas. | `items[]`: hasta 200 partidas; `deliveryAddress`: copia de la ubicación; `statusHistory[]`: hasta 20 cambios de estado (`status`, `at`, `byUserId`, `byRole`, `inferred`), solo se agrega. |
+| `orders` | Número, usuario, sucursal, modalidad, estado, envío, total, notas y, en las DELIVERY aceptadas, repartidor (`driverId`) y `assignedAt`. | `items[]`: hasta 200 partidas; `deliveryAddress`: copia de la ubicación; `statusHistory[]`: hasta 20 cambios de estado (`status`, `at`, `byUserId`, `byRole`, `inferred`), solo se agrega. |
 | `shopping_lists` | Usuario y nombre de la lista. | `items[]`: hasta 200 partidas de productos o paquetes. |
 
 ### Incrustación
@@ -486,7 +502,8 @@ Los pedidos se conservan en su propia colección para que el historial de un usu
 - Usuario y clave de idempotencia únicos cuando la clave es una cadena.
 - Categoría y estado activo de productos, y sucursal + categoría + estado activo (catálogo de una sucursal); índice de texto sobre nombre y descripción.
 - Sucursal y estado activo de paquetes; `packages.items.productId`, para saber qué paquetes contienen un producto.
-- Pedidos por usuario, estado, fecha y sucursal.
+- Pedidos por usuario, estado, fecha y sucursal; sucursal + estado + modalidad + repartidor + fecha (entregas disponibles); repartidor + estado + actualización (entregas de un repartidor).
+- `one_active_delivery_per_driver`: `driverId` único entre los pedidos `READY` / `IN_DELIVERY` con repartidor (índice parcial). Es lo que garantiza una sola entrega activa por repartidor.
 - Listas por usuario y fecha de actualización.
 
 ### Migración al marketplace
@@ -602,12 +619,12 @@ La clave opcional `idempotencyKey` evita crear otra orden para el mismo usuario 
 | `PENDING` | `CONFIRMED`, `CANCELLED` |
 | `CONFIRMED` | `PREPARING`, `CANCELLED` |
 | `PREPARING` | `READY`, `CANCELLED` |
-| `READY` | `IN_DELIVERY`, `DELIVERED`, `CANCELLED` |
+| `READY` | `IN_DELIVERY` (solo DELIVERY), `DELIVERED` (solo PICKUP), `CANCELLED` |
 | `IN_DELIVERY` | `DELIVERED`, `CANCELLED` |
 | `DELIVERED` | Ninguno |
 | `CANCELLED` | Ninguno |
 
-`updateOrderStatus` aplica estas transiciones y publica `ORDER_STATUS_CHANGED`. `cancelOrder` delega en esa operación. Repetir el mismo estado se rechaza; la tabla no distingue entre entrega y recogida.
+`updateOrderStatus` aplica estas transiciones y publica `ORDER_STATUS_CHANGED`. `cancelOrder` delega en esa operación. Repetir el mismo estado se rechaza. La modalidad decide el camino desde `READY`: una orden PICKUP se entrega en mostrador (`READY → DELIVERED`; `IN_DELIVERY` da `PICKUP_CANNOT_BE_DELIVERED`) y una DELIVERY sale a reparto (`READY → IN_DELIVERY → DELIVERED`; `READY → DELIVERED` da `INVALID_STATUS_TRANSITION`).
 
 ### Historial de estados: `statusHistory`
 
@@ -616,8 +633,30 @@ Cada orden guarda su línea de tiempo en `statusHistory: [{ status, at, byUserId
 - **Solo se agrega**, una entrada por transición, con tope de 20 (hay siete estados y las transiciones no regresan; lo valida el modelo). `createOrder` y `checkoutCart` escriben la entrada inicial `PENDING` con el cliente como autor (`byRole: CUSTOMER`); cada cambio exitoso, incluida la cancelación (que repone el stock), agrega `{ status: destino, at: ahora, byUserId, byRole }` del usuario de la sesión.
 - **Atómico con el cambio de estado.** `changeOrderStatus` valida la transición y la aplica con un solo `findOneAndUpdate` condicionado al estado validado (`{ _id, status: previo }`) que hace `$set` del estado y `$push` de la entrada. Si otra petición movió la orden antes, la escritura no hace nada, se relee la orden y se valida de nuevo contra el estado real: el perdedor recibe `ORDER_ALREADY_IN_STATUS` o `INVALID_STATUS_TRANSITION`, y si la transición sigue siendo válida (por ejemplo cancelar tras confirmar) se aplica y deja su propia entrada. Nunca hay una transición sin su entrada ni una entrada sin transición. Antes se hacía cargar y guardar con `optimisticConcurrency`, que fallaba el guardado del perdedor sin una respuesta de dominio; la actualización condicionada conserva esa exclusión y da el error correcto. La escritura incrementa `__v` para no romper a quien guarde un documento ya cargado.
 - **GraphQL:** `Order.statusHistory: [OrderStatusChange!]!` con `{ status, at, byRole, by, inferred }`. Lo lee quien puede leer la orden (`canViewOrder`); no hay permiso nuevo.
-- **Privacidad de `by`.** `by` (el `User`) solo se resuelve para quien no es el cliente de la orden: el personal de la sucursal que puede verla o ADMIN (`canSeeStatusActor` en `domain/access.js`). Para el cliente es `null`, pero sigue viendo `byRole` (`STAFF`, `DELIVERY`...). Si el cliente es además ADMIN, en su propia orden tampoco ve `by`.
+- **Privacidad de `by`.** `by` es `OrderActor { id, name }`, no el `User` completo: ni correo ni direcciones de quien hizo el cambio (por ejemplo, el personal de mostrador no ve el domicilio del repartidor). Solo se resuelve para quien no es el cliente de la orden: el personal de la sucursal que puede verla, su repartidor o ADMIN (`canSeeStatusActor` en `domain/access.js`). Para el cliente es `null`, pero sigue viendo `byRole` (`STAFF`, `DELIVERY`...). Si el cliente es además ADMIN, en su propia orden tampoco ve `by`.
 - **Órdenes anteriores.** Las creadas antes del historial se completan con la migración `backfillStatusHistory` (sección 3): entradas `inferred: true` y sin autor. Las nuevas son siempre `inferred: false`.
+
+### Reparto: asignación del repartidor
+
+Una orden DELIVERY en `READY` queda disponible para los repartidores de su sucursal. El flujo es **disponibles → aceptar → recoger → entregar**, con la opción de **liberar** mientras siga en `READY`:
+
+1. **Disponibles:** `availableDeliveries(storeId, limit, offset)` lista las órdenes `DELIVERY` en `READY` y sin repartidor (`driverId: null`) de las sucursales del alcance de quien consulta (`orders:deliver`; con `storeId`, esa sucursal, que debe ser del alcance: si no, `STORE_NOT_ASSIGNED`; ADMIN ve todas), **la más antigua primero** (por `createdAt`).
+2. **Aceptar:** `acceptDelivery(orderId)` exige `orders:deliver`, que la sucursal de la orden sea del alcance y que no sea una orden propia (`FORBIDDEN`, `OWN_ORDER`: nadie se reparte a sí mismo). Es **una sola escritura atómica**: `findOneAndUpdate` condicionado a `{ _id, status: READY, mode: DELIVERY, driverId: null }` que fija `driverId` y `assignedAt`. De dos aceptaciones simultáneas solo una encuentra la orden libre; la otra no escribe nada, relee la orden y recibe `ORDER_NOT_AVAILABLE` con `reason: TAKEN` (o `NOT_READY`, `PICKED_UP`, `NOT_DELIVERY`, `CANCELLED`, `DELIVERED` según la orden). Si el mismo repartidor la vuelve a aceptar (por ejemplo, al reintentar tras un corte de red) recibe la orden sin error. El estado no cambia (sigue `READY`), así que `statusHistory` no registra nada: la asignación se lee en `Order.driver` y `Order.assignedAt`. Se publica `DELIVERY_ACCEPTED`.
+3. **Recoger y entregar:** `updateOrderStatus` a `IN_DELIVERY` y luego a `DELIVERED`, solo el repartidor asignado (o ADMIN si la orden ya tiene repartidor; ver "Reglas de órdenes" en la sección 2), sin saltarse `IN_DELIVERY`. Cada paso deja su entrada en `statusHistory` con `byRole: DELIVERY`. La escritura condicionada de `changeOrderStatus` incluye el `driverId` validado, así que si la orden se liberó o la tomó otro entre la validación y la escritura, se relee y se vuelve a validar quién puede: un repartidor que la recoge mientras alguien la libera recibe `NO_DRIVER_ASSIGNED` si la liberación llegó primero, y nunca queda una orden `IN_DELIVERY` sin repartidor.
+4. **Liberar:** `releaseDelivery(orderId)` la devuelve a la lista de disponibles (limpia `driverId` y `assignedAt`) y publica `DELIVERY_RELEASED`. Pueden hacerlo el repartidor asignado (mientras tenga `orders:deliver`), el personal de mostrador de la sucursal (`orders:prepare`) o ADMIN, y solo mientras siga en `READY`: después de recogerla, `ORDER_NOT_AVAILABLE` con `reason: PICKED_UP`. Otro repartidor recibe `NOT_ASSIGNED_DRIVER`, o `NO_DRIVER_ASSIGNED` si la orden ya está libre. Liberar no es idempotente para el repartidor: si repite la llamada (por ejemplo, porque se perdió la respuesta) y la primera sí la liberó, ya no es su orden y recibe `NO_DRIVER_ASSIGNED` (o `NOT_ASSIGNED_DRIVER` si otro la aceptó en medio); la app debe tratar esos dos códigos, en un reintento, como "liberada". Para el personal de mostrador y ADMIN sí lo es: liberar una orden que ya está libre la devuelve sin cambios y sin evento.
+
+**Una entrega activa por repartidor.** Una orden asignada en `READY` o `IN_DELIVERY` es la entrega activa de su repartidor, y solo puede tener una: aceptar otra da `ALREADY_DELIVERING` con `activeOrderId`. La garantía la da MongoDB con el índice único parcial `one_active_delivery_per_driver` (`driverId` único entre las órdenes con repartidor en `READY` / `IN_DELIVERY`): dos aceptaciones simultáneas del mismo repartidor para dos órdenes distintas no pueden quedar las dos escritas, porque la segunda viola el índice (E11000) y se responde `ALREADY_DELIVERING`. Al entregarla, cancelarla o liberarla, la orden sale del índice y el repartidor queda libre. No hace falta un documento guardián por repartidor ni limpiarlo si el proceso cae a la mitad: la regla vive en los propios pedidos.
+
+- **Si el índice falta.** Al arrancar, después de `syncIndexes()`, mongoAPI comprueba que `one_active_delivery_per_driver` existe y, si no (por ejemplo, porque datos anteriores ya tienen dos órdenes activas con el mismo `driverId` y la creación falló), escribe un aviso `🚨 ÍNDICE AUSENTE` imposible de pasar por alto; la API sigue arrancando. Como defensa en profundidad, `acceptDelivery` consulta antes de escribir si el repartidor ya tiene otra entrega activa y responde `ALREADY_DELIVERING`: eso impide una segunda entrega en serie aunque falte el índice, pero ante dos aceptaciones simultáneas solo el índice es atómico. Se corrigen los pedidos duplicados y se reinicia mongoAPI.
+- **Limitación conocida.** Un repartidor que pierde el teléfono (o deja de responder) después de recoger la orden conserva su entrega activa: no puede aceptar otra hasta que el personal de mostrador cancele la orden o ADMIN la entregue. Reasignar una orden `IN_DELIVERY` a otro repartidor queda fuera de esta etapa.
+
+**Sin repartidor.** Una orden `IN_DELIVERY` siempre tiene repartidor: recoger una orden DELIVERY sin repartidor da `NO_DRIVER_ASSIGNED` a todos, ADMIN incluido. Si nadie la acepta, ADMIN la acepta él mismo (`acceptDelivery`; cuenta como su entrega activa) y la lleva: `driver` es el administrador y `statusHistory` registra `byRole: ADMIN`. ADMIN también puede recoger o entregar una orden que ya aceptó otro repartidor; el repartidor sigue en `driver` y queda libre al entregarla. Solo una orden `IN_DELIVERY` sin repartidor anterior a esta regla puede entregarla ADMIN tal cual.
+
+**Cancelar** sigue las reglas de siempre (el cliente, o `orders:prepare` en la sucursal), también con la orden asignada o en camino. Cancelar una orden asignada conserva su `driverId` como historia (sigue saliendo en `driver` y en el historial del repartidor) y libera al repartidor.
+
+**Qué ve cada quien.** La orden la leen su cliente, el personal de mostrador de la sucursal, su repartidor asignado (en cualquier estado y aunque lo hayan cambiado de sucursal, mientras siga teniendo `orders:deliver`: si vuelve a CUSTOMER deja de verla) y ADMIN; los demás repartidores de la sucursal, solo mientras está disponible. `Order.driver` es `OrderDriver { id, name }`: el cliente ve el nombre de su repartidor, nunca su correo ni su rol. En `orders`, el rol DELIVERY ve **solo las disponibles de sus sucursales más las asignadas a él** (antes veía todas las DELIVERY de su sucursal, en cualquier estado y de cualquier repartidor); `status` y `storeId` filtran sobre eso.
+
+**Vistas del repartidor** (`orders:deliver`): `currentDelivery` devuelve su entrega activa o `null`; `myDeliveries(active: true)` la devuelve en una lista y `myDeliveries` (o `active: false`) su historial, entregadas y canceladas, la más reciente primero, con `limit` y `offset`. Una orden que liberó ya no es suya y no aparece.
 
 ### Inventario
 
@@ -640,6 +679,7 @@ El SDL es la referencia completa de argumentos y tipos. Las operaciones se organ
 | Sucursales | `stores`, `store` | `createStore`, `updateStore` |
 | Carrito | `cart` | `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart` |
 | Pedidos | `quoteOrder`, `orders`, `order`, `orderByNumber`, `recentOrders` | `createOrder`, `updateOrderStatus`, `cancelOrder` |
+| Reparto | `availableDeliveries`, `myDeliveries`, `currentDelivery`; campos `driver` y `assignedAt` de `Order` | `acceptDelivery`, `releaseDelivery` |
 | Listas | `shoppingLists`, `shoppingList` | `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Analítica | `salesReport`, `packageComponentDemand` | — |
 
@@ -694,9 +734,9 @@ mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `
 | `SECURITY` | `LOGIN_SUCCESS`, `LOGIN_FAILED` (con el motivo real), `LOGOUT`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `SESSION_REVOKED`, `ACCESS_DENIED` (operación y motivo), `RBAC_UNAVAILABLE`, `TOKEN_REFRESHED` (`familyId`, `jti` nuevo), `REFRESH_FAILED` (con el motivo real), `REFRESH_REUSED` (`familyId`), `SESSIONS_REVOKED` (`logoutAllDevices`) |
 | `ADMIN` | `USER_REGISTERED`, `ROLE_CHANGED`, `STORE_ASSIGNMENT_CHANGED`, `SESSIONS_REVOKED` (cambio de rol o de sucursales; sesiones y familias de refresh tokens revocadas), `STORE_CREATED`, `STORE_UPDATED` |
 | `CATALOG` | `CATEGORY_CREATED`, `PRODUCT_CREATED`, `PRODUCT_UPDATED` (cambios `{ from, to }`, p. ej. precio), `PRODUCT_ACTIVE_CHANGED`, `STOCK_SET`, `DISCOUNT_ADDED`, `DISCOUNT_REMOVED`, `PACKAGE_CREATED`, `PACKAGE_UPDATED`, `PACKAGE_ACTIVE_CHANGED` |
-| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, `MIXED_STORES`, `STORE_MISMATCH`, stock insuficiente) |
+| `ORDER` | `ORDER_CREATED`, `ORDER_STATUS_CHANGED` (`from → to` y quién), `ORDER_REJECTED` (`PRICE_CHANGED`, `QUOTE_*`, `CART_*`, `MIXED_STORES`, `STORE_MISMATCH`, stock insuficiente), `DELIVERY_ACCEPTED` y `DELIVERY_RELEASED` (objetivo la orden; `metadata.driverId` es el repartidor que la aceptó o al que se le quitó) |
 
-Los eventos de productos, paquetes, descuentos y stock (`CATALOG`) y los de órdenes `ORDER_CREATED` y `ORDER_STATUS_CHANGED` llevan la sucursal en `metadata.storeId`. `CATEGORY_CREATED` no la lleva (las categorías son globales) y `ORDER_REJECTED` tampoco (la compra no llegó a tener sucursal).
+Los eventos de productos, paquetes, descuentos y stock (`CATALOG`) y los de órdenes `ORDER_CREATED`, `ORDER_STATUS_CHANGED`, `DELIVERY_ACCEPTED` y `DELIVERY_RELEASED` llevan la sucursal en `metadata.storeId`. `CATEGORY_CREATED` no la lleva (las categorías son globales) y `ORDER_REJECTED` tampoco (la compra no llegó a tener sucursal).
 
 `ACCESS_DENIED` y `ORDER_REJECTED` se registran en un solo lugar: un plugin de Apollo (`auditPlugin` en `infrastructure/events.js`) que revisa los errores de cada operación. Nunca se registran contraseñas ni tokens.
 
@@ -877,7 +917,7 @@ Con el Compose arriba (`docker compose up -d`), desde la raíz:
 npm run test:integration
 ```
 
-Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
+Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, reparto (entregas disponibles, aceptaciones simultáneas, una entrega activa por repartidor, liberar, la ruta del repartidor asignado), bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
 
 - **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida, `REFRESH_TTL_SECONDS=10` (para probar el vencimiento), `REFRESH_REUSE_GRACE_SECONDS=2` (para probar lo que pasa después de la ventana) y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
 - **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
@@ -911,7 +951,7 @@ En una base vacía crea dos negocios independientes del marketplace:
 
 - La sucursal `CARNYFRUT Centro`, con tarifa de reparto de $35 y envío gratuito desde $400 después de descuentos.
 - La sucursal `Frutería La Huerta` (Calle Libertad 450, Col. Obrera), con tarifa de reparto de $25 y envío gratuito desde $250.
-- Siete usuarios de demostración (contraseñas solo de desarrollo). El seed asigna la contraseña también a usuarios demo ya existentes que no tengan una.
+- Ocho usuarios de demostración (contraseñas solo de desarrollo). El seed asigna la contraseña también a usuarios demo ya existentes que no tengan una.
 
   | Correo | Rol | Sucursal (`WORKS_AT`) | Contraseña | Variable para cambiarla |
   |---|---|---|---|---|
@@ -919,14 +959,17 @@ En una base vacía crea dos negocios independientes del marketplace:
   | `gerente@carnyfrut.mx` | MANAGER | CARNYFRUT Centro | `Manager1234` | `SEED_MANAGER_PASSWORD` |
   | `empleado@carnyfrut.mx` | STAFF | CARNYFRUT Centro | `Staff1234` | `SEED_STAFF_PASSWORD` |
   | `repartidor@carnyfrut.mx` | DELIVERY | CARNYFRUT Centro | `Delivery1234` | `SEED_DELIVERY_PASSWORD` |
+  | `repartidor2@carnyfrut.mx` | DELIVERY | CARNYFRUT Centro | `Delivery1234` | `SEED_DELIVERY2_PASSWORD` |
   | `gerente@lahuerta.mx` | MANAGER | Frutería La Huerta | `Manager1234` | `SEED_HUERTA_MANAGER_PASSWORD` |
   | `empleado@lahuerta.mx` | STAFF | Frutería La Huerta | `Staff1234` | `SEED_HUERTA_STAFF_PASSWORD` |
   | `cliente@demo.mx` | CUSTOMER (con dirección predeterminada) | — | `Cliente1234` | `SEED_CUSTOMER_PASSWORD` |
 
-- En Neo4j, los siete usuarios con su rol y el personal asignado a su sucursal (`WORKS_AT`). Un rol ya existente en el grafo no se cambia. Si Neo4j no está arriba durante el seed, el personal queda sin sucursal hasta volver a ejecutarlo.
+- En Neo4j, los ocho usuarios con su rol y el personal asignado a su sucursal (`WORKS_AT`). Un rol ya existente en el grafo no se cambia. Si Neo4j no está arriba durante el seed, el personal queda sin sucursal hasta volver a ejecutarlo.
 - Cuatro categorías globales: Carnes, Frutas, Verduras y Abarrotes.
 - En CARNYFRUT Centro: once productos y un paquete familiar para carne asada con ocho productos; una promoción del 15% incrustada en el producto Plátano.
 - En Frutería La Huerta: seis productos de Frutas y Verduras (manzana, naranja, aguacate, jitomate, chile jalapeño y papa) y el paquete "Canasta para guacamole y salsa" con tres de ellos.
+
+Con dos repartidores en CARNYFRUT Centro se puede ver la carrera por una orden: los dos aceptan la misma orden lista y solo uno gana (el otro recibe `ORDER_NOT_AVAILABLE`, `TAKEN`).
 
 El seed no crea pedidos ni listas de compra. Busca registros existentes por nombre o correo (productos y paquetes, por nombre dentro de su sucursal) y no sobrescribe sus datos comerciales. Esta estrategia evita duplicados en ejecuciones secuenciales normales, pero los nombres de producto, paquete y sucursal no tienen un índice único que garantice lo mismo ante ejecuciones concurrentes.
 

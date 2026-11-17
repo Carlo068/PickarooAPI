@@ -66,16 +66,19 @@ export async function seed({ User, Category, Product, Package, Store }) {
   }
   await ensurePassword(cliente, clientePassword);
 
-  // Personal de la sucursal (contraseñas solo de desarrollo).
-  const staffPassword = role => process.env[`SEED_${role}_PASSWORD`] || `${role[0]}${role.slice(1).toLowerCase()}1234`;
+  // Personal de la sucursal (contraseñas solo de desarrollo). `key` nombra la
+  // variable cuando hay dos usuarios con el mismo rol (SEED_DELIVERY2_PASSWORD).
+  const staffPassword = (role, key = role) => process.env[`SEED_${key}_PASSWORD`] || `${role[0]}${role.slice(1).toLowerCase()}1234`;
   const staff = [];
-  for (const { email, name, role } of [
+  for (const { email, name, role, key } of [
     { email: 'gerente@carnyfrut.mx', name: 'Gerente CARNYFRUT Centro', role: 'MANAGER' },
     { email: 'empleado@carnyfrut.mx', name: 'Empleado de mostrador', role: 'STAFF' },
     { email: 'repartidor@carnyfrut.mx', name: 'Repartidor Centro', role: 'DELIVERY' },
+    // Segundo repartidor: para ver dos aceptaciones de la misma orden (solo una gana).
+    { email: 'repartidor2@carnyfrut.mx', name: 'Repartidor Centro 2', role: 'DELIVERY', key: 'DELIVERY2' },
   ]) {
     const user = await ensure(User, { email }, { name, role });
-    await ensurePassword(user, staffPassword(role));
+    await ensurePassword(user, staffPassword(role, key));
     staff.push(user);
   }
 

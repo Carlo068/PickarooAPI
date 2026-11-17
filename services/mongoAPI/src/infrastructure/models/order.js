@@ -7,7 +7,7 @@
 // y para los reportes.
 
 import mongoose from 'mongoose';
-import { UNITS, ORDER_MODES, ORDER_STATUSES, PACKAGE_MAX_ITEMS, STATUS_HISTORY_MAX } from '../../domain/entities.js';
+import { UNITS, ORDER_MODES, ORDER_STATUSES, PACKAGE_MAX_ITEMS, STATUS_HISTORY_MAX, ACTIVE_DELIVERY_STATUSES } from '../../domain/entities.js';
 import { ROLES } from '../../domain/access.js';
 import { text, optionalText, money, integer, ref, optionalRef, choice, array, sub, main, assertOneRef } from './helpers.js';
 import { location } from './location.js';
@@ -45,6 +45,10 @@ const order = main({
   deliveryAddress: { type: location, default: null }, // solo DELIVERY
   status: choice(ORDER_STATUSES, 'PENDING'),
   statusHistory: array(statusChange, STATUS_HISTORY_MAX),
+  // Repartidor que aceptó la orden (solo DELIVERY). Se limpia al liberarla; al
+  // entregarla o cancelarla se conserva como historia.
+  driverId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  assignedAt: { type: Date, default: null },
   items: array(orderItem, 200, 1),
   deliveryFee: { ...money(0), default: 0 },
   total: money(0), // lo cobrado al cliente
@@ -57,5 +61,17 @@ order.index({ userId: 1, createdAt: -1 });
 order.index({ status: 1, createdAt: -1 });
 order.index({ storeId: 1, status: 1 });
 order.index({ userId: 1, idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } });
+// Entregas disponibles de una sucursal (READY, DELIVERY, sin repartidor), la más antigua primero.
+order.index({ storeId: 1, status: 1, mode: 1, driverId: 1, createdAt: 1 });
+// Entregas de un repartidor (myDeliveries, currentDelivery).
+order.index({ driverId: 1, status: 1, updatedAt: -1 });
+// Una sola entrega activa por repartidor: dos órdenes READY / IN_DELIVERY con el
+// mismo driverId violan este índice (E11000), también entre aceptaciones simultáneas.
+export const ONE_ACTIVE_DELIVERY_INDEX = 'one_active_delivery_per_driver';
+order.index({ driverId: 1 }, {
+  name: ONE_ACTIVE_DELIVERY_INDEX,
+  unique: true,
+  partialFilterExpression: { driverId: { $type: 'objectId' }, status: { $in: ACTIVE_DELIVERY_STATUSES } },
+});
 
 export const Order = mongoose.model('Order', order, 'orders');

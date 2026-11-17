@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { ERROR_CODES, FORBIDDEN_REASONS, DomainError, notFoundError, isErrorCode, ENTITY_LABELS } from '../../src/domain/errors.js';
 import {
   assertProductPersistable, assertPackagePersistable, Product, Package, assertModeConsistency, priceOrder,
-  assertQuoteStillValid, assertTransition, PACKAGE_MIN_ITEMS, PACKAGE_MAX_ITEMS,
+  assertQuoteStillValid, assertTransition, PACKAGE_MIN_ITEMS, PACKAGE_MAX_ITEMS, orderNotAvailableError,
   assertPackageSameStore, linesStoreId, cartStoreId, assertCartAccepts,
 } from '../../src/domain/entities.js';
 import * as access from '../../src/domain/access.js';
@@ -192,8 +192,24 @@ describe('transiciones de estado', () => {
     expectError(() => assertTransition('DELIVERED', 'PENDING', 'DELIVERY'), 'INVALID_STATUS_TRANSITION', { from: 'DELIVERED', to: 'PENDING' });
     expectError(() => assertTransition('BOGUS', 'CONFIRMED', 'DELIVERY'), 'INVALID_STATUS_TRANSITION', { from: 'BOGUS', to: 'CONFIRMED' });
   });
+  test('INVALID_STATUS_TRANSITION: una orden DELIVERY no pasa de READY a DELIVERED', () => {
+    expectError(() => assertTransition('READY', 'DELIVERED', 'DELIVERY'), 'INVALID_STATUS_TRANSITION', { from: 'READY', to: 'DELIVERED' });
+  });
   test('PICKUP_CANNOT_BE_DELIVERED', () => {
     expectError(() => assertTransition('READY', 'IN_DELIVERY', 'PICKUP'), 'PICKUP_CANNOT_BE_DELIVERED');
+  });
+});
+
+describe('reparto (PIC-76)', () => {
+  test('ORDER_NOT_AVAILABLE con orderId y reason', () => {
+    expectError(() => { throw orderNotAvailableError({ _id: 'O1', mode: 'DELIVERY', status: 'READY', driverId: 'd1' }); }, 'ORDER_NOT_AVAILABLE', { orderId: 'O1', reason: 'TAKEN' });
+    assert.deepEqual(ERROR_CODES.ORDER_NOT_AVAILABLE.fields, ['orderId', 'reason']);
+  });
+  test('ALREADY_DELIVERING declara activeOrderId', () => {
+    assert.deepEqual(ERROR_CODES.ALREADY_DELIVERING.fields, ['activeOrderId']);
+  });
+  test('FORBIDDEN tiene las razones del repartidor asignado', () => {
+    for (const reason of ['NOT_ASSIGNED_DRIVER', 'NO_DRIVER_ASSIGNED', 'OWN_ORDER']) assert.ok(Object.hasOwn(FORBIDDEN_REASONS, reason), reason);
   });
 });
 

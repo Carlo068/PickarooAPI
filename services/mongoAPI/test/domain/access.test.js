@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG,
   isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder, canSeeStatusActor,
+  orderStatusDenial, acceptDeliveryDenial, releaseDeliveryDenial, isAssignedDriver,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
 } from '../../src/domain/access.js';
 import { ORDER_STATUSES, ORDER_MODES } from '../../src/domain/entities.js';
@@ -218,13 +219,20 @@ describe('canChangeOrderStatus (README: Reglas de órdenes)', () => {
     return PREPARE_ROLES; // CONFIRMED, PREPARING, READY, CANCELLED
   };
 
+  // En la matriz, el repartidor de la sucursal es el asignado a la orden (PIC-76:
+  // los pasos de reparto son solo suyos; ver 'asignación del repartidor' abajo).
+  // Fuera de la sucursal, la orden es de otro repartidor: el asignado puede
+  // terminarla aunque lo cambien de sucursal, y eso se prueba aparte.
+  const assigned = mode => orderOf(mode, { driverId: 'staff-DELIVERY' });
+  const assignedToOther = mode => orderOf(mode, { driverId: 'otro-repartidor' });
+
   for (const to of ORDER_STATUSES.filter(s => s !== 'PENDING')) {
     for (const mode of ORDER_MODES) {
       test(`-> ${to} (${mode}): roles con permiso en su sucursal`, () => {
         const allowed = expectedRoles(to, mode);
         for (const role of ROLES) {
           const access = accessOf(role, { id: `staff-${role}`, storeIds: [STORE] });
-          assert.equal(canChangeOrderStatus(access, orderOf(mode), to), allowed.includes(role), `${role} -> ${to} (${mode})`);
+          assert.equal(canChangeOrderStatus(access, assigned(mode), to), allowed.includes(role), `${role} -> ${to} (${mode})`);
         }
       });
       test(`-> ${to} (${mode}): personal de otra sucursal es rechazado; scope:all_stores pasa`, () => {
@@ -233,8 +241,8 @@ describe('canChangeOrderStatus (README: Reglas de órdenes)', () => {
           const outside = accessOf(role, { id: `staff-${role}`, storeIds: ['OTRA'] });
           const noStores = accessOf(role, { id: `staff-${role}`, storeIds: [] });
           const inScope = role === 'ADMIN'; // el único con scope:all_stores
-          assert.equal(canChangeOrderStatus(outside, orderOf(mode), to), inScope && allowed.includes(role), `${role} fuera de sucursal -> ${to}`);
-          assert.equal(canChangeOrderStatus(noStores, orderOf(mode), to), inScope && allowed.includes(role), `${role} sin sucursales -> ${to}`);
+          assert.equal(canChangeOrderStatus(outside, assignedToOther(mode), to), inScope && allowed.includes(role), `${role} fuera de sucursal -> ${to}`);
+          assert.equal(canChangeOrderStatus(noStores, assignedToOther(mode), to), inScope && allowed.includes(role), `${role} sin sucursales -> ${to}`);
         }
       });
     }
@@ -307,10 +315,29 @@ describe('canViewOrder', () => {
       for (const mode of ORDER_MODES) assert.equal(canViewOrder(accessOf(role, { id: 'p' }), orderOf(mode)), true, `${role} ${mode}`);
     }
   });
-  test('el repartidor de la sucursal solo ve las DELIVERY', () => {
+  test('el repartidor de la sucursal ve las DELIVERY libres para aceptar (READY, sin repartidor), no las demás', () => {
     const d = accessOf('DELIVERY', { id: 'p' });
-    assert.equal(canViewOrder(d, orderOf('DELIVERY')), true);
-    assert.equal(canViewOrder(d, orderOf('PICKUP')), false);
+    assert.equal(canViewOrder(d, orderOf('DELIVERY', { status: 'READY' })), true);
+    assert.equal(canViewOrder(d, orderOf('DELIVERY', { status: 'READY', driverId: null })), true);
+    assert.equal(canViewOrder(d, orderOf('DELIVERY', { status: 'READY', driverId: 'otro' })), false);
+    for (const status of ['PENDING', 'CONFIRMED', 'PREPARING', 'IN_DELIVERY', 'DELIVERED', 'CANCELLED']) {
+      assert.equal(canViewOrder(d, orderOf('DELIVERY', { status })), false, status);
+    }
+    assert.equal(canViewOrder(d, orderOf('PICKUP', { status: 'READY' })), false);
+  });
+  test('el repartidor asignado ve su orden en cualquier estado, también si lo cambiaron de sucursal', () => {
+    for (const status of ['READY', 'IN_DELIVERY', 'DELIVERED', 'CANCELLED']) {
+      assert.equal(canViewOrder(accessOf('DELIVERY', { id: 'p' }), orderOf('DELIVERY', { status, driverId: 'p' })), true, status);
+      assert.equal(canViewOrder(accessOf('DELIVERY', { id: 'p', storeIds: [] }), orderOf('DELIVERY', { status, driverId: 'p' })), true, status);
+    }
+  });
+  test('quien fue su repartidor y ya no tiene orders:deliver (p. ej. volvió a CUSTOMER) deja de verla', () => {
+    for (const status of ['READY', 'IN_DELIVERY', 'DELIVERED', 'CANCELLED']) {
+      const order = orderOf('DELIVERY', { status, driverId: 'p' });
+      assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'p' }), order), false, status);
+      assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'p', storeIds: [] }), order), false, status);
+      assert.equal(canSeeStatusActor(accessOf('CUSTOMER', { id: 'p' }), order), false, status);
+    }
   });
   test('personal de otra sucursal no ve la orden', () => {
     for (const role of ['STAFF', 'DELIVERY', 'MANAGER']) {
@@ -333,6 +360,127 @@ describe('canViewOrder', () => {
     assert.equal(canViewOrder(accessOf('STAFF', { id: 'p' }), o), false);
     assert.equal(canViewOrder(accessOf('CUSTOMER', { id: 'cliente' }), o), true);
     assert.equal(canViewOrder(accessOf('ADMIN', { id: 'admin' }), o), true);
+  });
+});
+
+// ---------- Reparto: repartidor asignado (PIC-76) ----------
+describe('asignación del repartidor (orderStatusDenial)', () => {
+  const driver = accessOf('DELIVERY', { id: 'd1' });
+  const otherDriver = accessOf('DELIVERY', { id: 'd2' });
+  const huertaDriver = accessOf('DELIVERY', { id: 'd3', storeIds: ['OTRA'] });
+  const staff = accessOf('STAFF', { id: 'st' });
+  const manager = accessOf('MANAGER', { id: 'mg' });
+  const admin = accessOf('ADMIN', { id: 'ad', storeIds: [] });
+  const stranger = accessOf('CUSTOMER', { id: 'otro' });
+  const delivery = (over = {}) => ({ id: 'O1', userId: 'cliente', storeId: 'S1', mode: 'DELIVERY', status: 'READY', driverId: 'd1', ...over });
+  // Los pasos de la ruta, cada uno desde su estado: recoger y entregar.
+  const ROUTE = [['READY', 'IN_DELIVERY'], ['IN_DELIVERY', 'DELIVERED']];
+
+  test('el repartidor asignado recoge y entrega', () => {
+    for (const [status, to] of ROUTE) assert.equal(orderStatusDenial(driver, delivery({ status }), to), null, to);
+  });
+  test('el repartidor asignado que cambiaron de sucursal puede terminar su entrega', () => {
+    const moved = accessOf('DELIVERY', { id: 'd1', storeIds: ['OTRA'] });
+    for (const [status, to] of ROUTE) assert.equal(orderStatusDenial(moved, delivery({ status }), to), null, to);
+  });
+  test('el asignado que ya no tiene orders:deliver no la mueve', () => {
+    const demoted = accessOf('CUSTOMER', { id: 'd1' });
+    for (const [status, to] of ROUTE) assert.deepEqual(orderStatusDenial(demoted, delivery({ status }), to), { reason: 'ORDER_STATUS_CHANGE_DENIED', status: to });
+  });
+  test('otro repartidor y el personal de mostrador: NOT_ASSIGNED_DRIVER con status', () => {
+    for (const who of [otherDriver, staff, manager]) {
+      for (const [status, to] of ROUTE) assert.deepEqual(orderStatusDenial(who, delivery({ status }), to), { reason: 'NOT_ASSIGNED_DRIVER', status: to }, `${who.role} -> ${to}`);
+    }
+  });
+  test('sin repartidor nadie la saca a reparto, ADMIN incluido: NO_DRIVER_ASSIGNED (también driverId ausente)', () => {
+    const { driverId: _omit, ...missing } = delivery();
+    for (const who of [driver, staff, admin]) {
+      assert.deepEqual(orderStatusDenial(who, delivery({ driverId: null }), 'IN_DELIVERY'), { reason: 'NO_DRIVER_ASSIGNED', status: 'IN_DELIVERY' }, who.role);
+      assert.deepEqual(orderStatusDenial(who, missing, 'IN_DELIVERY'), { reason: 'NO_DRIVER_ASSIGNED', status: 'IN_DELIVERY' }, who.role);
+    }
+  });
+  test('ADMIN recoge y entrega la de otro repartidor; y entrega una IN_DELIVERY sin repartidor (anterior a la regla)', () => {
+    for (const [status, to] of ROUTE) assert.equal(orderStatusDenial(admin, delivery({ status }), to), null, to);
+    assert.equal(orderStatusDenial(admin, delivery({ status: 'IN_DELIVERY', driverId: null }), 'DELIVERED'), null);
+    assert.deepEqual(orderStatusDenial(driver, delivery({ status: 'IN_DELIVERY', driverId: null }), 'DELIVERED'), { reason: 'NO_DRIVER_ASSIGNED', status: 'DELIVERED' });
+  });
+  test('READY → DELIVERED en DELIVERY no es un paso de la ruta: decide el permiso y lo rechaza assertTransition', () => {
+    // El repartidor y ADMIN tienen orders:deliver (pasan aquí; INVALID_STATUS_TRANSITION después); mostrador no.
+    assert.equal(orderStatusDenial(driver, delivery(), 'DELIVERED'), null);
+    assert.equal(orderStatusDenial(admin, delivery({ driverId: null }), 'DELIVERED'), null);
+    assert.deepEqual(orderStatusDenial(staff, delivery(), 'DELIVERED'), { reason: 'ORDER_STATUS_CHANGE_DENIED', status: 'DELIVERED' });
+  });
+  test('quien no es de la sucursal recibe la denegación genérica (no se entera de la asignación)', () => {
+    for (const who of [stranger, huertaDriver, accessOf('CUSTOMER', { id: 'cliente' })]) {
+      for (const [status, to] of ROUTE) assert.deepEqual(orderStatusDenial(who, delivery({ status }), to), { reason: 'ORDER_STATUS_CHANGE_DENIED', status: to });
+    }
+  });
+  test('cancelar no depende del repartidor: el dueño o orders:prepare; el repartidor asignado no', () => {
+    for (const status of ['READY', 'IN_DELIVERY']) {
+      assert.equal(orderStatusDenial(accessOf('CUSTOMER', { id: 'cliente', storeIds: [] }), delivery({ status }), 'CANCELLED'), null);
+      assert.equal(orderStatusDenial(staff, delivery({ status }), 'CANCELLED'), null);
+      assert.deepEqual(orderStatusDenial(driver, delivery({ status }), 'CANCELLED'), { reason: 'ORDER_STATUS_CHANGE_DENIED', status: 'CANCELLED' });
+    }
+  });
+  test('las órdenes PICKUP y los pasos de mostrador no miran al repartidor', () => {
+    const pickup = delivery({ mode: 'PICKUP', driverId: null });
+    assert.equal(orderStatusDenial(staff, pickup, 'DELIVERED'), null);
+    for (const to of ['CONFIRMED', 'PREPARING', 'READY']) assert.equal(orderStatusDenial(staff, delivery({ driverId: null }), to), null);
+  });
+  test('canChangeOrderStatus es orderStatusDenial === null', () => {
+    assert.equal(canChangeOrderStatus(driver, delivery(), 'IN_DELIVERY'), true);
+    assert.equal(canChangeOrderStatus(otherDriver, delivery(), 'IN_DELIVERY'), false);
+  });
+  test('isAssignedDriver compara ids como cadena; sin driverId o sin access nadie lo es', () => {
+    assert.equal(isAssignedDriver({ id: 7 }, { driverId: '7' }), true);
+    assert.equal(isAssignedDriver({ id: '7' }, { driverId: null }), false);
+    assert.equal(isAssignedDriver({ id: '7' }, {}), false);
+    assert.equal(isAssignedDriver(null, { driverId: '7' }), false);
+    assert.equal(isAssignedDriver({}, { driverId: undefined }), false);
+  });
+  test('el repartidor asignado ve `by` del historial; otro repartidor de la sucursal no, si ya la tomó alguien', () => {
+    assert.equal(canSeeStatusActor(driver, delivery({ status: 'IN_DELIVERY' })), true);
+    assert.equal(canSeeStatusActor(otherDriver, delivery({ status: 'IN_DELIVERY' })), false);
+  });
+});
+
+describe('acceptDeliveryDenial y releaseDeliveryDenial', () => {
+  const order = (over = {}) => ({ id: 'O1', userId: 'cliente', storeId: 'S1', mode: 'DELIVERY', status: 'READY', driverId: null, ...over });
+
+  test('aceptar: orders:deliver en la sucursal de la orden', () => {
+    assert.equal(acceptDeliveryDenial(accessOf('DELIVERY'), order()), null);
+    assert.equal(acceptDeliveryDenial(accessOf('DELIVERY', { id: 7 }), order({ userId: '8' })), null);
+    assert.equal(acceptDeliveryDenial(accessOf('ADMIN', { storeIds: [] }), order()), null);
+    assert.deepEqual(acceptDeliveryDenial(accessOf('DELIVERY', { storeIds: ['OTRA'] }), order()), { reason: 'STORE_NOT_ASSIGNED', storeId: 'S1' });
+    for (const role of ['CUSTOMER', 'STAFF', 'MANAGER']) {
+      assert.deepEqual(acceptDeliveryDenial(accessOf(role), order()), { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER }, role);
+    }
+  });
+  test('aceptar una orden propia: OWN_ORDER (también ADMIN), comparando ids como cadena', () => {
+    assert.deepEqual(acceptDeliveryDenial(accessOf('DELIVERY', { id: 'cliente' }), order()), { reason: 'OWN_ORDER' });
+    assert.deepEqual(acceptDeliveryDenial(accessOf('DELIVERY', { id: 7 }), order({ userId: '7' })), { reason: 'OWN_ORDER' });
+    assert.deepEqual(acceptDeliveryDenial(accessOf('ADMIN', { id: 'cliente', storeIds: [] }), order()), { reason: 'OWN_ORDER' });
+    // El permiso y la sucursal se revisan antes.
+    assert.deepEqual(acceptDeliveryDenial(accessOf('CUSTOMER', { id: 'cliente' }), order()), { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER });
+    assert.deepEqual(acceptDeliveryDenial(accessOf('DELIVERY', { id: 'cliente', storeIds: ['OTRA'] }), order()), { reason: 'STORE_NOT_ASSIGNED', storeId: 'S1' });
+  });
+  test('liberar: el asignado que ya no tiene orders:deliver no; si lo cambiaron de sucursal, sí', () => {
+    const taken = order({ driverId: 'd1' });
+    assert.deepEqual(releaseDeliveryDenial(accessOf('CUSTOMER', { id: 'd1' }), taken), { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER });
+    assert.equal(releaseDeliveryDenial(accessOf('DELIVERY', { id: 'd1', storeIds: ['OTRA'] }), taken), null);
+  });
+  test('liberar: el repartidor asignado, orders:prepare de la sucursal o ADMIN', () => {
+    const taken = order({ driverId: 'd1' });
+    assert.equal(releaseDeliveryDenial(accessOf('DELIVERY', { id: 'd1' }), taken), null);
+    assert.equal(releaseDeliveryDenial(accessOf('DELIVERY', { id: 'd1', storeIds: [] }), taken), null);
+    for (const role of ['STAFF', 'MANAGER']) assert.equal(releaseDeliveryDenial(accessOf(role, { id: 'x' }), taken), null, role);
+    assert.equal(releaseDeliveryDenial(accessOf('ADMIN', { id: 'x', storeIds: [] }), taken), null);
+  });
+  test('liberar: otro repartidor NOT_ASSIGNED_DRIVER (NO_DRIVER_ASSIGNED si está libre); fuera de la sucursal STORE_NOT_ASSIGNED; un cliente PERMISSION_REQUIRED', () => {
+    assert.deepEqual(releaseDeliveryDenial(accessOf('DELIVERY', { id: 'd2' }), order({ driverId: 'd1' })), { reason: 'NOT_ASSIGNED_DRIVER' });
+    assert.deepEqual(releaseDeliveryDenial(accessOf('DELIVERY', { id: 'd2' }), order()), { reason: 'NO_DRIVER_ASSIGNED' });
+    assert.deepEqual(releaseDeliveryDenial(accessOf('STAFF', { id: 'x', storeIds: ['OTRA'] }), order({ driverId: 'd1' })), { reason: 'STORE_NOT_ASSIGNED', storeId: 'S1' });
+    assert.deepEqual(releaseDeliveryDenial(accessOf('CUSTOMER', { id: 'cliente' }), order({ driverId: 'd1' })), { reason: 'PERMISSION_REQUIRED', permission: P.ORDERS_DELIVER });
   });
 });
 
@@ -412,7 +560,7 @@ describe('reportStoreScope (reportes por sucursal)', () => {
 
 describe('canSeeStatusActor (quién ve `by` en statusHistory)', () => {
   const order = { id: 'O1', userId: 'cliente', storeId: 'S1', mode: 'PICKUP' };
-  const delivery = { ...order, mode: 'DELIVERY' };
+  const delivery = { ...order, mode: 'DELIVERY', status: 'READY' };
 
   test('el cliente de la orden nunca ve quién fue, aunque sea ADMIN', () => {
     assert.equal(canSeeStatusActor(accessOf('CUSTOMER', { id: 'cliente', storeIds: [] }), order), false);

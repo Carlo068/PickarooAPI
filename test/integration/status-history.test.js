@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ok, gql, fails, forbidden, tokenOf, decodeJwt, newCustomer, newProduct, createOrder, moveOrder, stockOf, uid, UPDATE_STATUS,
+  newDriver, acceptDelivery,
 } from './client.js';
 
 const MONGO_API = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'services', 'mongoAPI');
@@ -64,12 +65,14 @@ test('a PICKUP order records the exact path, with increasing timestamps and the 
 test('a DELIVERY order records staff for the counter steps and DELIVERY for the route', async () => {
   const { order } = await newOrder({ mode: 'DELIVERY' });
   await moveOrder(order.id, ['CONFIRMED', 'PREPARING', 'READY'], await tokenOf('STAFF'));
-  const driver = await tokenOf('DELIVERY');
-  await moveOrder(order.id, ['IN_DELIVERY', 'DELIVERED'], driver);
-  const history = await historyOf(order.id, driver);
+  // PIC-76: la recoge y la entrega el repartidor que la aceptó; aceptar no agrega entrada.
+  const driver = await newDriver();
+  await acceptDelivery(order.id, driver.token);
+  await moveOrder(order.id, ['IN_DELIVERY', 'DELIVERED'], driver.token);
+  const history = await historyOf(order.id, driver.token);
   assert.deepEqual(statuses(history), ['PENDING', 'CONFIRMED', 'PREPARING', 'READY', 'IN_DELIVERY', 'DELIVERED']);
   assert.deepEqual(history.map(e => e.byRole), ['CUSTOMER', 'STAFF', 'STAFF', 'STAFF', 'DELIVERY', 'DELIVERY']);
-  assert.equal(history[5].by.id, decodeJwt(driver).sub);
+  assert.equal(history[5].by.id, driver.id);
   const times = history.map(e => Date.parse(e.at));
   for (let i = 1; i < times.length; i += 1) assert.ok(times[i] > times[i - 1]);
 });
@@ -215,6 +218,8 @@ test('the customer sees byRole but by is null; staff and ADMIN see by { id name 
     assert.equal(seen[2].by.id, decodeJwt(admin).sub);
     assert.ok(seen.every(e => typeof e.by.name === 'string' && e.by.name.length));
   }
+  // PIC-76: `by` es OrderActor (id y nombre): ni el correo ni las direcciones de quien lo hizo.
+  await fails('GRAPHQL_VALIDATION_FAILED', 'query($id: ID!) { order(id: $id) { statusHistory { by { email } } } }', { id: order.id }, staff);
 });
 
 test("another customer cannot read an order's history", async () => {

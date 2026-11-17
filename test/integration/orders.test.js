@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ok, fails, forbidden, tokenOf, uid, newCustomer, newProduct, newPackage, stockOf, seedStore, createOrder, moveOrder, UPDATE_STATUS, ORDER_FIELDS,
+  newDriver, acceptDelivery,
 } from './client.js';
 
 const ORDER = `query($id: ID!) { order(id: $id) { ${ORDER_FIELDS} } }`;
@@ -32,7 +33,8 @@ test('a PICKUP order goes PENDING → CONFIRMED → PREPARING → READY → DELI
   assert.equal((await ok(ORDER, { id: order.id }, customer.token)).order.status, 'DELIVERED');
 });
 
-test('a DELIVERY order goes through IN_DELIVERY to DELIVERED (staff, then the delivery driver)', async () => {
+// PIC-76: la ruta es del repartidor que aceptó la orden (antes, cualquier repartidor de la sucursal).
+test('a DELIVERY order goes through IN_DELIVERY to DELIVERED (staff, then the driver who accepted it)', async () => {
   const customer = await newCustomer();
   const product = await newProduct({ price: 100 });
   const order = await createOrder(customer, { mode: 'DELIVERY', items: [{ productId: product.id, quantity: 1 }] });
@@ -40,7 +42,9 @@ test('a DELIVERY order goes through IN_DELIVERY to DELIVERED (staff, then the de
   assert.equal(order.deliveryFee, store.deliveryFee); // 100 < freeDeliveryThreshold (400)
   assert.equal(order.total, 100 + store.deliveryFee);
   await moveOrder(order.id, ['CONFIRMED', 'PREPARING', 'READY'], await tokenOf('STAFF'));
-  await moveOrder(order.id, ['IN_DELIVERY', 'DELIVERED'], await tokenOf('DELIVERY'));
+  const driver = await newDriver();
+  await acceptDelivery(order.id, driver.token);
+  await moveOrder(order.id, ['IN_DELIVERY', 'DELIVERED'], driver.token);
   assert.equal((await ok(ORDER, { id: order.id }, customer.token)).order.status, 'DELIVERED');
 });
 
