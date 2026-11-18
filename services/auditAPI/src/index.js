@@ -101,6 +101,8 @@ const server = new ApolloServer({
     }
     return formatted;
   },
+  // En producción las respuestas de error no llevan stacktrace.
+  includeStacktraceInErrorResponses: process.env.NODE_ENV !== 'production',
 });
 
 const port = parseInt(process.env.PORT_AUDITORIA) || 4003;

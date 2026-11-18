@@ -12,12 +12,13 @@
     "dev:campamentos": "npm run dev --workspace=services/mongoAPI",
     "dev:auditoria": "npm run dev --workspace=services/auditAPI",
     "dev": "npx concurrently -n api,audit,gateway \"npm run dev:campamentos\" \"npm run dev:auditoria\" \"npm run dev:gateway\"",
+    "start": "node scripts/start.js",
     "migrate": "npm run migrate --workspace=services/mongoAPI",
     "schema:build": "node scripts/build-schema.js",
     "schema:check": "node scripts/build-schema.js --check",
     "rbac:script": "node scripts/build-rbac-script.js",
     "rbac:check": "node scripts/build-rbac-script.js --check",
-    "test": "npm run test --workspaces --if-present && npm run schema:check && npm run rbac:check",
+    "test": "npm run test --workspaces --if-present && node --test \"scripts/*.test.js\" && npm run schema:check && npm run rbac:check",
     "test:integration": "node test/integration/run.js"
   },
   "devDependencies": {
@@ -38,5 +39,8 @@
   "bugs": {
     "url": "https://github.com/Carlo068/PickarooAPI/issues"
   },
-  "homepage": "https://github.com/Carlo068/PickarooAPI#readme"
+  "homepage": "https://github.com/Carlo068/PickarooAPI#readme",
+  "engines": {
+    "node": ">=20.11"
+  }
 }

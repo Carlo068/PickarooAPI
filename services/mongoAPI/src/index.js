@@ -1357,6 +1357,8 @@ const server = new ApolloServer({
   plugins: [auditPlugin], // ACCESS_DENIED y ORDER_REJECTED → bitácora
   // Errores de dominio, validación de Mongoose y claves duplicadas -> extensions.code estable.
   formatError: formatApiError,
+  // En producción las respuestas de error no llevan stacktrace.
+  includeStacktraceInErrorResponses: process.env.NODE_ENV !== 'production',
 });
 
 const port = parseInt(process.env.PORT_CAMPAMENTOS) || 4001;

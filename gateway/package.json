@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "dependencies": {
     "@apollo/gateway": "^2.7.2",
     "@apollo/server": "^5.5.1",
+    "@as-integrations/express5": "^1.1.2",
+    "cors": "^2.8.6",
     "dotenv": "^16.4.5",
+    "express": "^5.3.0",
     "graphql": "^16.8.1"
   }
 }
