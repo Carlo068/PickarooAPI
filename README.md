@@ -48,13 +48,16 @@ PickarooAPI/
 ├── README.md
 ├── package.json
 ├── docker-compose.yml
+├── render.yaml                   Blueprint de Render (sección 15)
 ├── schema/
 │   └── api.graphql               esquema para clientes (generado, no editar)
 ├── scripts/
 │   ├── package.json
 │   ├── build-schema.js           npm run schema:build / schema:check
 │   ├── build-rbac-script.js      npm run rbac:script / rbac:check
-│   └── init-rbac.cql             catálogo RBAC para cypher-shell (generado, no editar)
+│   ├── init-rbac.cql             catálogo RBAC para cypher-shell (generado, no editar)
+│   ├── start.js                  npm start: los tres procesos en producción
+│   └── supervisor.js             arranca/detiene los procesos (si uno muere, sale con error)
 ├── test/
 │   └── integration/              npm run test:integration (contra el Compose)
 ├── docs/
@@ -62,6 +65,7 @@ PickarooAPI/
 ├── gateway/
 │   ├── package.json
 │   ├── .env.example
+│   ├── config.js                 puertos, subgrafos y CORS desde el entorno
 │   └── index.js
 └── services/
     ├── auditAPI/                 bitácora: RabbitMQ → ScyllaDB + consultas GraphQL
@@ -72,6 +76,7 @@ PickarooAPI/
     │       ├── schema.graphql
     │       ├── auth.js           JWT + sesión de Redis (permiso audit:view)
     │       ├── consumer.js       consumidor de RabbitMQ
+    │       ├── scylla-options.js opciones de conexión a ScyllaDB desde el entorno
     │       └── scylla.js         keyspace, tablas y consultas CQL
     └── mongoAPI/
         ├── package.json
@@ -1019,7 +1024,7 @@ Desde la raíz, sin levantar Docker:
 npm test
 ```
 
-Ejecuta las pruebas unitarias del dominio y del contrato de errores (`services/mongoAPI/test/`, con el ejecutor integrado de Node; incluye una guardia estática que revisa el código de ambos subgrafos) `npm run schema:check` y `npm run rbac:check`, de modo que un `schema/api.graphql` o un `scripts/init-rbac.cql` desactualizados también hacen fallar el comando. Termina con código distinto de cero si algo falla.
+Ejecuta las pruebas unitarias de configuración (`gateway/test/`, `services/auditAPI/test/` y `scripts/*.test.js`: puertos, subgrafos, ScyllaDB y arranque de producción), las del dominio y del contrato de errores (`services/mongoAPI/test/`, con el ejecutor integrado de Node; incluye una guardia estática que revisa el código de ambos subgrafos), `npm run schema:check` y `npm run rbac:check`, de modo que un `schema/api.graphql` o un `scripts/init-rbac.cql` desactualizados también hacen fallar el comando. Termina con código distinto de cero si algo falla.
 
 | Servicio | Dirección local |
 |---|---|
@@ -1333,7 +1338,7 @@ URLs del gateway para los clientes:
 | Dashboard (navegador) | `http://localhost:4000/` |
 | Emulador de Android | `http://10.0.2.2:4000/` (`10.0.2.2` es la dirección del equipo anfitrión vista desde el emulador) |
 
-El CORS del gateway está abierto en desarrollo (valor por defecto del servidor independiente de Apollo) y debe restringirse antes de cualquier despliegue.
+El CORS del gateway está abierto por omisión; en un despliegue se restringe con `CORS_ORIGIN` (lista separada por comas, sección 15).
 
 Para configurar cada servicio se puede copiar su plantilla: `gateway/.env.example`, `services/mongoAPI/.env.example` y `services/auditAPI/.env.example` (a `.env` en la misma carpeta). Los secretos son marcadores de posición que deben sustituirse.
 
@@ -1344,6 +1349,7 @@ Esta versión contiene los elementos de Docker, dominio, Mongoose, GraphQL y agr
 Aspectos relevantes al continuar el desarrollo:
 
 - La autenticación es JWT + sesión en Redis, con refresh tokens rotativos de un solo uso. No hay limitación de intentos de `login` ni de `refreshToken`, recuperación ni cambio de contraseña, ni una operación para desactivar usuarios. Los intentos fallidos sí quedan en la bitácora (`LOGIN_FAILED`).
+- Detrás de Render la IP que queda en la bitácora sale de `X-Forwarded-For`, y un cliente puede falsificar su primera entrada; no es una IP de confianza para investigaciones.
 - Los roles viven en Neo4j; MongoDB guarda un espejo. Si se edita el grafo a mano (sin `assignRole`), el cambio aplica en el siguiente login del usuario, no en sus sesiones abiertas.
 - Cada sucursal es un negocio con su propio catálogo y stock; todavía no hay un rol de dueño de sucursal (OWNER) ni una relación `OWNS`: el alcance del personal sale solo de `WORKS_AT`.
 - La bitácora es de "al menos una vez": si RabbitMQ no está disponible cuando mongoAPI publica, ese evento se pierde (no hay outbox). auditAPI no expone borrado ni edición de eventos.
@@ -1358,3 +1364,81 @@ Aspectos relevantes al continuar el desarrollo:
 - Existen pruebas unitarias de las reglas de dominio (`domain/entities.js` y `domain/access.js`), que se ejecutan con `npm test` y no necesitan Docker ni bases de datos, y pruebas de integración contra el Compose (`npm run test:integration`, sección 10) que recorren el Gateway, los resolvers y las bases. Los ejemplos de este README son procedimientos de uso, no evidencia de pruebas ejecutadas.
 
 Para cambiar estas conductas debe modificarse la implementación y mantenerse sincronizada la documentación. Este README no altera modelos, operaciones, datos ni infraestructura.
+
+## 15. Deploy on Render with free hosted databases
+
+La API completa (Gateway, mongoAPI y auditAPI) corre como **un solo Web Service de Render**, contra bases de datos gratuitas alojadas fuera de Render. El comportamiento de desarrollo (`docker compose up -d` y `npm run dev`) no cambia: todo lo de esta sección se activa solo con variables de entorno.
+
+### Servicios externos
+
+| Función | Servicio gratuito | Variable | Formato de ejemplo |
+|---|---|---|---|
+| MongoDB | MongoDB Atlas M0 | `MONGODB_URI` | `mongodb+srv://USUARIO:CONTRASENA@cluster0.xxxxx.mongodb.net/pickaroodb?retryWrites=true&w=majority` |
+| Redis Stack (sesiones, carrito, caché; necesita los módulos JSON y Search para Redis OM) | Redis Cloud | `REDIS_URL` | `redis://default:CONTRASENA@host:puerto` o `rediss://...` si la base usa TLS |
+| Neo4j (roles y permisos) | Neo4j AuraDB Free | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | `neo4j+s://xxxxxxxx.databases.neo4j.io` |
+| RabbitMQ (eventos de auditoría) | CloudAMQP (plan Little Lemur) | `RABBITMQ_URL` | `amqps://USUARIO:CONTRASENA@host/vhost` |
+| ScyllaDB (bitácora), opcional | ScyllaDB Cloud | `SCYLLADB_*` | ver la tabla de variables |
+
+En Atlas, **Network Access** debe permitir `0.0.0.0/0`: Render gratuito no tiene IP de salida fija. Crear un usuario de base de datos con permisos de lectura y escritura sobre `pickaroodb`.
+
+### Configuración del Web Service
+
+El repositorio incluye `render.yaml` (Blueprint) con esto ya definido; también se puede crear a mano:
+
+| Ajuste | Valor |
+|---|---|
+| Tipo | Web Service |
+| Runtime | Node (20.11 o superior) |
+| Root directory | la raíz del repositorio |
+| Build command | `npm install` |
+| Start command | `node scripts/start.js` (equivale a `npm start`) |
+| Health check path | `/health` (responde `{"status":"ok"}` sin autenticación) |
+| Instance type | Free |
+| Región | la más cercana a las bases de datos (idealmente la misma región de Atlas, Redis Cloud y AuraDB) |
+
+`node scripts/start.js` (el script `npm start` hace lo mismo; se usa `node` directo para que Render envíe SIGTERM al supervisor sin el intermediario de npm): levanta mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) y, si uno muere, detiene los demás y sale con error para que Render reinicie el servicio. Los subgrafos escuchan en `localhost` (4001 y 4003) dentro del contenedor; solo el Gateway usa el puerto `PORT` que asigna Render. El health check es `/health` porque el servidor de Apollo no expone un endpoint de salud propio: un `GET` simple a `/` responde 400 (protección CSRF).
+
+### Variables de entorno
+
+| Variable | Valor | Notas |
+|---|---|---|
+| `NODE_ENV` | `production` | Quita el stacktrace de las respuestas de error y desactiva la introspección de Apollo. |
+| `JWT_SECRET` | cadena larga aleatoria | Un solo valor: lo comparten los tres procesos. El Blueprint lo genera. |
+| `MONGODB_URI` | URI `mongodb+srv://...` de Atlas | |
+| `REDIS_URL` | URL de Redis Cloud | `rediss://` si usa TLS. |
+| `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | datos de AuraDB | `NEO4J_DATABASE` solo si no es `neo4j`. |
+| `RABBITMQ_URL` | URL `amqps://...` de CloudAMQP | Solo con `AUDIT_ENABLED=true`. Si la auditoría está desactivada, déjala sin definir: nadie consumiría la cola y se llenaría (los eventos se omiten con un aviso al arrancar). |
+| `AUDIT_ENABLED` | `true` o `false` | `false` (por omisión en el Blueprint) quita el subgrafo `auditoria` del Gateway y `npm start` no arranca auditAPI; no hace falta ScyllaDB. Las consultas de la bitácora (`auditEvents`, `auditByActor`, `auditByTarget`, `auditSummary`) dejan de existir en la API en ejecución; `schema/api.graphql` no cambia porque se genera sin conexión y sigue listando las operaciones de auditoría, así que **los clientes (app y dashboard) deben ocultar la pantalla de auditoría cuando `AUDIT_ENABLED=false`**. |
+| `SCYLLADB_CONTACT_POINTS` | hosts separados por comas | Con `AUDIT_ENABLED=true`. |
+| `SCYLLADB_USERNAME`, `SCYLLADB_PASSWORD` | credenciales del clúster | Activan `PlainTextAuthProvider`. |
+| `SCYLLADB_DATACENTER` | centro de datos local, p. ej. `AWS_US_EAST_1` | Por omisión `datacenter1`. |
+| `SCYLLADB_SSL` | `true` | TLS verificando el certificado. `SCYLLADB_SSL_REJECT_UNAUTHORIZED=false` lo desactiva de forma explícita. |
+| `SCYLLADB_CREATE_KEYSPACE` | `false` | Omite `CREATE KEYSPACE` (el keyspace debe existir; las tablas sí se crean). Por omisión `true`. |
+| `SCYLLADB_KEYSPACE`, `SCYLLADB_REPLICATION_CLASS`, `SCYLLADB_REPLICATION_FACTOR` | `pickaroo_audit`, `SimpleStrategy`, `1` | Solo si el keyspace lo crea la API. Con `NetworkTopologyStrategy` replica en `SCYLLADB_DATACENTER`. |
+| `SEED` | `true` solo en el primer despliegue; después `false` | Carga los datos de demostración (la sección 11 explica las cuentas). Es idempotente, pero no hace falta repetirlo. |
+| `SEED_ADMIN_PASSWORD`, `SEED_CUSTOMER_PASSWORD`, `SEED_MANAGER_PASSWORD`, `SEED_STAFF_PASSWORD`, `SEED_DELIVERY_PASSWORD`, `SEED_DELIVERY2_PASSWORD`, `SEED_HUERTA_MANAGER_PASSWORD`, `SEED_HUERTA_STAFF_PASSWORD` | una contraseña propia por cada una | **Obligatorias con `SEED=true` y `NODE_ENV=production`**: las contraseñas de demostración del README son públicas, así que en producción el seed no las usa. Si falta alguna, el seed se omite por completo (no crea ningún dato), registra un error con las variables que faltan y el servidor sigue arrancando; basta definirlas y redesplegar. |
+| `GATEWAY_COMPOSE_RETRIES` | opcional | Intentos de composición inicial del Gateway, uno cada 2 s. Por omisión 15 y, con `NODE_ENV=production`, 90 (~3 min, el arranque en frío de las bases alojadas). |
+| `CORS_ORIGIN` | orígenes separados por comas | Sin definir, CORS queda abierto. Ejemplo: la URL del dashboard. Se ignora la barra final de cada origen. |
+| `SUBGRAPH_MONGO_URL`, `SUBGRAPH_AUDIT_URL` | opcionales | Solo si los subgrafos no están en el mismo contenedor. Por omisión `http://localhost:4001/graphql` y `http://localhost:4003/graphql`. |
+
+El resto de variables (TTL, caché, etc.) mantiene sus valores por omisión; las plantillas `.env.example` de cada carpeta las documentan.
+
+### Limitaciones del plan gratuito
+
+- Render duerme el servicio tras unos 15 minutos sin tráfico y despertarlo tarda alrededor de un minuto (arranque en frío más la conexión a las bases). Antes de una demostración, abrir `/health` unos minutos antes.
+- El plan gratuito no tiene disco persistente. No es un problema: todo el estado está en las bases externas.
+- Los planes gratuitos de las bases tienen sus propios límites (por ejemplo, AuraDB Free se pausa tras unos días sin uso). Si Neo4j o Redis no responden, la API degrada igual que en desarrollo: sin Neo4j el login no otorga permisos; sin Redis no se puede iniciar sesión y las lecturas van directo a MongoDB.
+- mongoAPI se conecta a RabbitMQ una sola vez al arrancar; si CloudAMQP no estaba disponible en ese momento, los eventos se omiten hasta el siguiente reinicio.
+
+### Dashboard como Render Static Site
+
+El dashboard (repositorio `PickarooFrontend`) se despliega como **Static Site** de Render:
+
+| Ajuste | Valor |
+|---|---|
+| Build command | `npm run build` |
+| Publish directory | `dist` |
+| Variable de entorno | `VITE_GRAPHQL_URL=https://<servicio-api>.onrender.com/` (se fija al compilar) |
+| Redirects/Rewrites | `/*` → `/index.html` (acción Rewrite, para las rutas del lado del cliente) |
+
+Para que solo el dashboard pueda llamar a la API desde un navegador, definir `CORS_ORIGIN` en el servicio de la API con la URL del sitio estático. La app Android no usa CORS.

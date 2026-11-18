@@ -15,6 +15,7 @@
 import { hashPassword } from './passwords.js';
 import { isNeo4jReady } from './neo4j.js';
 import * as rbac from './rbac-graph.js';
+import { seedPasswords, seedBlockedBy } from './seed-guard.js';
 
 async function ensure(Model, filter, doc) {
   const existing = await Model.findOne(filter);
@@ -23,6 +24,14 @@ async function ensure(Model, filter, doc) {
 }
 
 export async function seed({ User, Category, Product, Package, Store }) {
+  // En producción no se crean usuarios con las contraseñas públicas de demostración: si falta alguna
+  // SEED_*_PASSWORD se omite el seed completo (se registra el error; el servidor sigue arrancando).
+  const missing = seedBlockedBy(process.env);
+  if (missing.length) {
+    console.error(`❌ SEED=true omitido: con NODE_ENV=production hay que definir ${missing.join(', ')} (contraseñas de los usuarios demo). No se creó ningún dato.`);
+    return;
+  }
+  const { passwords } = seedPasswords(process.env);
   console.log('🌱 SEED=true — verificando datos demo (CARNYFRUT Centro y Frutería La Huerta)...');
 
   const store = await ensure(Store, { name: 'CARNYFRUT Centro' }, {
@@ -43,8 +52,8 @@ export async function seed({ User, Category, Product, Package, Store }) {
   });
 
   // Contraseñas de la demo (solo desarrollo). Se asignan únicamente si el usuario no tiene una.
-  const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'Admin1234';
-  const clientePassword = process.env.SEED_CUSTOMER_PASSWORD || 'Cliente1234';
+  const adminPassword = passwords.SEED_ADMIN_PASSWORD;
+  const clientePassword = passwords.SEED_CUSTOMER_PASSWORD;
   const ensurePassword = async (user, password) => {
     const withHash = await User.findById(user._id).select('+passwordHash');
     if (withHash.passwordHash) return;
@@ -68,7 +77,7 @@ export async function seed({ User, Category, Product, Package, Store }) {
 
   // Personal de la sucursal (contraseñas solo de desarrollo). `key` nombra la
   // variable cuando hay dos usuarios con el mismo rol (SEED_DELIVERY2_PASSWORD).
-  const staffPassword = (role, key = role) => process.env[`SEED_${key}_PASSWORD`] || `${role[0]}${role.slice(1).toLowerCase()}1234`;
+  const staffPassword = (role, key = role) => passwords[`SEED_${key}_PASSWORD`];
   const staff = [];
   for (const { email, name, role, key } of [
     { email: 'gerente@carnyfrut.mx', name: 'Gerente CARNYFRUT Centro', role: 'MANAGER' },
@@ -83,7 +92,7 @@ export async function seed({ User, Category, Product, Package, Store }) {
   }
 
   // Personal de Frutería La Huerta (contraseñas solo de desarrollo, mismo patrón).
-  const huertaPassword = role => process.env[`SEED_HUERTA_${role}_PASSWORD`] || `${role[0]}${role.slice(1).toLowerCase()}1234`;
+  const huertaPassword = role => passwords[`SEED_HUERTA_${role}_PASSWORD`];
   const huertaStaff = [];
   for (const { email, name, role } of [
     { email: 'gerente@lahuerta.mx', name: 'Gerente La Huerta', role: 'MANAGER' },

@@ -16,13 +16,12 @@
 
 import cassandra from 'cassandra-driver';
 import { GraphQLError } from 'graphql';
+import { scyllaConfig } from './scylla-options.js';
 
 const { LocalDate } = cassandra.types;
 
-const contactPoints = (process.env.SCYLLADB_CONTACT_POINTS || '127.0.0.1').split(',').map(s => s.trim());
-const port = parseInt(process.env.SCYLLADB_PORT) || 9042;
-const localDataCenter = process.env.SCYLLADB_DATACENTER || 'datacenter1';
-export const KEYSPACE = process.env.SCYLLADB_KEYSPACE || 'pickaroo_audit';
+const config = scyllaConfig();
+export const KEYSPACE = config.keyspace;
 
 const COLUMNS = `
   occurred_at timestamp,
@@ -61,14 +60,15 @@ const RETRY_MS = 5000;
 
 // ScyllaDB tarda en arrancar: se reintenta hasta conectar y luego se avisa con onReady.
 export async function initScylla(onReady) {
-  const bootstrap = new cassandra.Client({ contactPoints, localDataCenter, protocolOptions: { port } });
+  const bootstrap = new cassandra.Client(config.clientOptions);
   try {
-    await bootstrap.connect();
-    await bootstrap.execute(`CREATE KEYSPACE IF NOT EXISTS ${KEYSPACE}
-      WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}`);
+    if (config.createKeyspace) {
+      await bootstrap.connect();
+      await bootstrap.execute(config.createKeyspaceCql);
+    }
     await bootstrap.shutdown();
 
-    const audit = new cassandra.Client({ contactPoints, localDataCenter, keyspace: KEYSPACE, protocolOptions: { port } });
+    const audit = new cassandra.Client({ ...config.clientOptions, keyspace: KEYSPACE });
     await audit.connect();
     for (const ddl of TABLES) await audit.execute(ddl);
     client = audit;
