@@ -71,6 +71,26 @@ export const MENU_CATALOG = [
   ] },
 ];
 
+// Rutas del cliente web controladas por RBAC: (:Role)-[:CAN_ACCESS]->(:Route).
+// Cada ruta se enlaza solo con el rol MÁS BAJO autorizado; los superiores la
+// alcanzan por herencia ([:INHERITS*0..]). /reparto/entregas lleva además ADMIN,
+// que no hereda de DELIVERY. Las rutas públicas (/, /login) y el armazón del
+// panel (/app) no están aquí: basta con tener (o no) sesión.
+export const ROUTE_CATALOG = [
+  { path: '/catalogo', roles: ['CUSTOMER'] },
+  { path: '/carrito', roles: ['CUSTOMER'] },
+  { path: '/mis-pedidos', roles: ['CUSTOMER'] },
+  { path: '/mis-listas', roles: ['CUSTOMER'] },
+  { path: '/sucursal/pedidos', roles: ['STAFF'] },
+  { path: '/sucursal/inventario', roles: ['STAFF'] },
+  { path: '/reparto/entregas', roles: ['DELIVERY', 'ADMIN'] },
+  { path: '/admin/catalogo', roles: ['MANAGER'] },
+  { path: '/admin/reportes', roles: ['MANAGER'] },
+  { path: '/admin/sucursales', roles: ['ADMIN'] },
+  { path: '/admin/usuarios', roles: ['ADMIN'] },
+  { path: '/admin/auditoria', roles: ['ADMIN'] },
+];
+
 // ------------------------------------------------------------
 // Reglas
 // ------------------------------------------------------------

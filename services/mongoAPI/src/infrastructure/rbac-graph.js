@@ -1,39 +1,51 @@
 // ============================================================
 // RBAC EN NEO4J — consultas Cypher
 //
-//   (:User {id})-[:HAS_ROLE]->(:Role {name})-[:INHERITS]->(:Role)
+//   (:User {id})-[:HAS_ROLE]->(:Role {name})-[:INHERITS]->(:Role)   (superior)->(inferior)
 //   (:Role)-[:HAS_PERMISSION]->(:Permission {name})
 //   (:User)-[:WORKS_AT]->(:Store {id})
-//   (:Role)-[:CAN_VIEW_MENU]->(:MenuItem)-[:NAVIGATES_TO]->(:Route {path})
-//   (:MenuItem)-[:HAS_CHILD]->(:MenuItem)
+//   (:Role)-[:CAN_ACCESS]->(:Route {path})                         solo el rol más bajo
+//   (:Role)-[:CAN_VIEW_MENU]->(:MenuNode {id, title, order})-[:NAVIGATES_TO]->(:Route)
+//   (:MenuNode)-[:HAS_CHILD]->(:MenuNode)
 //
 // El id de User y Store es el _id de MongoDB, así los dos almacenes se cruzan.
+// Las consultas de ruta y de menú están en rbac.service.js.
 // ============================================================
 
 import { DomainError } from '../domain/errors.js';
-import { ROLE_CATALOG, PERMISSION_CATALOG, MENU_CATALOG, isRole } from '../domain/access.js';
-import { readQuery, writeQuery, toNumber, isNeo4jReady } from './neo4j.js';
-
-function assertReady() {
-  if (!isNeo4jReady()) throw new DomainError('El servicio de roles (Neo4j) no está disponible. Intenta de nuevo.', 'SERVICE_UNAVAILABLE', { service: 'RBAC' });
-}
+import { ROLE_CATALOG, PERMISSION_CATALOG, MENU_CATALOG, ROUTE_CATALOG, isRole } from '../domain/access.js';
+import { readQuery, writeQuery, toNumber } from './neo4j.js';
+import { assertRbacReady as assertReady } from './rbac.service.js';
 
 // ---------- Catálogo (idempotente: se ejecuta en cada arranque) ----------
-const CONSTRAINTS = [
-  'CREATE CONSTRAINT role_name IF NOT EXISTS FOR (r:Role) REQUIRE r.name IS UNIQUE',
-  'CREATE CONSTRAINT permission_name IF NOT EXISTS FOR (p:Permission) REQUIRE p.name IS UNIQUE',
-  'CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE',
-  'CREATE CONSTRAINT store_id IF NOT EXISTS FOR (s:Store) REQUIRE s.id IS UNIQUE',
-  'CREATE CONSTRAINT menu_id IF NOT EXISTS FOR (m:MenuItem) REQUIRE m.id IS UNIQUE',
-  'CREATE CONSTRAINT route_path IF NOT EXISTS FOR (r:Route) REQUIRE r.path IS UNIQUE',
+// Los mismos enunciados (y los mismos catálogos) generan scripts/init-rbac.cql.
+export const CONSTRAINTS = [
+  'CREATE CONSTRAINT unique_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE',
+  'CREATE CONSTRAINT unique_role_name IF NOT EXISTS FOR (r:Role) REQUIRE r.name IS UNIQUE',
+  'CREATE CONSTRAINT unique_route_path IF NOT EXISTS FOR (rt:Route) REQUIRE rt.path IS UNIQUE',
+  'CREATE CONSTRAINT unique_menu_id IF NOT EXISTS FOR (m:MenuNode) REQUIRE m.id IS UNIQUE',
+  'CREATE CONSTRAINT unique_permission_name IF NOT EXISTS FOR (p:Permission) REQUIRE p.name IS UNIQUE',
+  'CREATE CONSTRAINT unique_store_id IF NOT EXISTS FOR (s:Store) REQUIRE s.id IS UNIQUE',
 ];
 
-const flatMenu = MENU_CATALOG.flatMap(parent => [
+// Migración: las restricciones con los nombres anteriores. Van antes que las
+// nuevas porque Neo4j no crea una restricción equivalente con otro nombre
+// (IF NOT EXISTS la omitiría y luego quedaría sin ninguna al borrar la vieja).
+// menu_id era la de (:MenuItem), la etiqueta anterior de MenuNode.
+export const LEGACY_CONSTRAINTS = ['role_name', 'user_id', 'route_path', 'menu_id', 'permission_name', 'store_id']
+  .map(name => `DROP CONSTRAINT ${name} IF EXISTS`);
+
+// Migración: los nodos (:MenuItem) eran datos de catálogo; se recrean como (:MenuNode).
+export const LEGACY_MENU_CLEANUP = 'MATCH (m:MenuItem) DETACH DELETE m';
+
+export const flatMenu = MENU_CATALOG.flatMap(parent => [
   { id: parent.id, title: parent.title, order: parent.order, path: parent.path ?? null, roles: parent.roles, parentId: null },
   ...parent.children.map(c => ({ id: c.id, title: c.title, order: c.order, path: c.path ?? null, roles: c.roles, parentId: parent.id })),
 ]);
 
 export async function bootstrapRbac(stores = []) {
+  for (const c of LEGACY_CONSTRAINTS) await writeQuery(c);
+  await writeQuery(LEGACY_MENU_CLEANUP);
   for (const c of CONSTRAINTS) await writeQuery(c);
 
   await writeQuery(
@@ -58,25 +70,46 @@ export async function bootstrapRbac(stores = []) {
     { roles: ROLE_CATALOG },
   );
 
+  // Rutas: solo las del catálogo, cada una enlazada con su rol más bajo.
   await writeQuery(
-    `MATCH (:Role)-[old:CAN_VIEW_MENU]->() DELETE old
+    `OPTIONAL MATCH (stale:Route) WHERE NOT stale.path IN $paths
+     DETACH DELETE stale
+     WITH count(*) AS removed
+     OPTIONAL MATCH (:Role)-[old:CAN_ACCESS]->(:Route)
+     DELETE old
      WITH count(*) AS cleared
+     UNWIND $routes AS rt
+     MERGE (route:Route {path: rt.path})
+     FOREACH (roleName IN rt.roles |
+       MERGE (role:Role {name: roleName}) MERGE (role)-[:CAN_ACCESS]->(route))`,
+    { routes: ROUTE_CATALOG, paths: ROUTE_CATALOG.map(r => r.path) },
+  );
+
+  // Árbol de menú: se borran sus aristas y los nodos que ya no están en el catálogo.
+  await writeQuery(
+    `OPTIONAL MATCH (:Role)-[old:CAN_VIEW_MENU]->(:MenuNode)
+     DELETE old
+     WITH count(*) AS cleared
+     OPTIONAL MATCH (:MenuNode)-[oldEdge:HAS_CHILD|NAVIGATES_TO]->()
+     DELETE oldEdge
+     WITH count(*) AS clearedEdges
+     OPTIONAL MATCH (stale:MenuNode) WHERE NOT stale.id IN $ids
+     DETACH DELETE stale
+     WITH count(*) AS removed
      UNWIND $items AS m
-     MERGE (item:MenuItem {id: m.id}) SET item.title = m.title, item.order = m.order
+     MERGE (item:MenuNode {id: m.id}) SET item.title = m.title, item.order = toInteger(m.order)
      WITH item, m
-     OPTIONAL MATCH (item)-[oldNav:NAVIGATES_TO]->() DELETE oldNav
-     WITH DISTINCT item, m
      FOREACH (x IN CASE WHEN m.path IS NULL THEN [] ELSE [1] END |
        MERGE (route:Route {path: m.path}) MERGE (item)-[:NAVIGATES_TO]->(route))
      FOREACH (roleName IN m.roles |
        MERGE (role:Role {name: roleName}) MERGE (role)-[:CAN_VIEW_MENU]->(item))
      FOREACH (x IN CASE WHEN m.parentId IS NULL THEN [] ELSE [1] END |
-       MERGE (parent:MenuItem {id: m.parentId}) MERGE (parent)-[:HAS_CHILD]->(item))`,
-    { items: flatMenu },
+       MERGE (parent:MenuNode {id: m.parentId}) MERGE (parent)-[:HAS_CHILD]->(item))`,
+    { items: flatMenu, ids: flatMenu.map(m => m.id) },
   );
 
   if (stores.length) await syncStores(stores);
-  console.log(`🌿 Catálogo RBAC listo en Neo4j: ${ROLE_CATALOG.length} roles, ${PERMISSION_CATALOG.length} permisos, ${flatMenu.length} elementos de menú, ${stores.length} sucursal(es).`);
+  console.log(`🌿 Catálogo RBAC listo en Neo4j: ${ROLE_CATALOG.length} roles, ${PERMISSION_CATALOG.length} permisos, ${ROUTE_CATALOG.length} rutas, ${flatMenu.length} elementos de menú, ${stores.length} sucursal(es).`);
 }
 
 // ---------- Sucursales y usuarios (espejo mínimo de Mongo) ----------
@@ -121,34 +154,6 @@ export async function getAccess(userId) {
     storeIds: row.storeIds,
     stores: row.stores.filter(s => s.id),
   };
-}
-
-// Árbol de menú: raíces visibles para el rol (o sus heredados) con sus hijos visibles.
-export async function getMenu(userId) {
-  const rows = await readQuery(
-    `MATCH (u:User {id: $userId})-[:HAS_ROLE]->(:Role)-[:INHERITS*0..]->(eff:Role)
-     WITH collect(DISTINCT eff) AS roles
-     UNWIND roles AS role
-     MATCH (role)-[:CAN_VIEW_MENU]->(parent:MenuItem)
-     WHERE NOT ()-[:HAS_CHILD]->(parent)
-     WITH DISTINCT parent, roles
-     OPTIONAL MATCH (parent)-[:NAVIGATES_TO]->(pRoute:Route)
-     OPTIONAL MATCH (parent)-[:HAS_CHILD]->(child:MenuItem)
-       WHERE any(r IN roles WHERE (r)-[:CAN_VIEW_MENU]->(child))
-     OPTIONAL MATCH (child)-[:NAVIGATES_TO]->(cRoute:Route)
-     WITH parent, pRoute, child, cRoute ORDER BY child.order
-     RETURN parent.id AS id, parent.title AS title, parent.order AS menuOrder, pRoute.path AS path,
-            collect(CASE WHEN child IS NULL THEN null ELSE {id: child.id, title: child.title, order: child.order, path: cRoute.path} END) AS children
-     ORDER BY menuOrder`,
-    { userId: String(userId) },
-  );
-  return rows.map(r => ({
-    id: r.id,
-    title: r.title,
-    order: toNumber(r.menuOrder),
-    path: r.path ?? null,
-    children: r.children.filter(Boolean).map(c => ({ id: c.id, title: c.title, order: toNumber(c.order), path: c.path ?? null, children: [] })),
-  }));
 }
 
 // ---------- Administración ----------

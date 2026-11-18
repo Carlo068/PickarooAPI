@@ -706,6 +706,11 @@ type Query {
   """Menú de navegación del usuario autenticado."""
   myMenu: [MenuItem!]!
 
+  """
+  Requiere sesión. True si el rol del usuario autenticado (o uno que hereda) tiene acceso a la ruta web `path` ([:CAN_ACCESS] en Neo4j; coincidencia exacta, p. ej. /sucursal/pedidos). Una ruta sin registrar da false. Se consulta el grafo en cada llamada: sin Neo4j, SERVICE_UNAVAILABLE (service RBAC).
+  """
+  canAccessRoute(path: String!): Boolean!
+
   """Catálogo de roles con su herencia y permisos (users:manage)."""
   roles: [RoleInfo!]!
 

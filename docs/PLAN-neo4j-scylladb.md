@@ -39,8 +39,9 @@ Permisos efectivos = los del rol + los de todos los roles heredados (`[:INHERITS
 (:User {id})-[:HAS_ROLE]->(:Role {name})-[:INHERITS]->(:Role)
 (:Role)-[:HAS_PERMISSION]->(:Permission {name})
 (:User)-[:WORKS_AT]->(:Store {id})                 alcance por sucursal
-(:Role)-[:CAN_VIEW_MENU]->(:MenuItem)-[:NAVIGATES_TO]->(:Route {path})
-(:MenuItem)-[:HAS_CHILD]->(:MenuItem)
+(:Role)-[:CAN_ACCESS]->(:Route {path})             solo el rol más bajo autorizado
+(:Role)-[:CAN_VIEW_MENU]->(:MenuNode)-[:NAVIGATES_TO]->(:Route {path})
+(:MenuNode)-[:HAS_CHILD]->(:MenuNode)
 ```
 
 - **Alcance por sucursal:** STAFF / DELIVERY / MANAGER solo actúan sobre órdenes de las

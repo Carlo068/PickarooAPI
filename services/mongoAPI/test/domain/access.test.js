@@ -6,7 +6,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG,
+  ROLES, DEFAULT_ROLE, PERMISSIONS, PERMISSION_CATALOG, ROLE_CATALOG, MENU_CATALOG, ROUTE_CATALOG,
   isRole, hasPermission, inStoreScope, requiredOrderPermission, canChangeOrderStatus, canViewOrder, canSeeStatusActor,
   orderStatusDenial, acceptDeliveryDenial, releaseDeliveryDenial, reportLocationDenial, isAssignedDriver,
   storeItemDenial, managesStoreItems, seesStoreItems, categoryDenial, reportStoreScope,
@@ -152,6 +152,78 @@ describe('menú por rol', () => {
         }
       }
     }
+  });
+});
+
+// Equivalente a validarAccesoRuta: (u)-[:HAS_ROLE]->(r)-[:INHERITS*0..]->(eff)-[:CAN_ACCESS]->(rt).
+const routeByPath = path => ROUTE_CATALOG.find(r => r.path === path);
+const canAccess = (role, path) => {
+  const route = routeByPath(path);
+  if (!route) return false;
+  const roles = effectiveRoles(role);
+  return route.roles.some(r => roles.has(r));
+};
+const menuPaths = MENU_CATALOG.flatMap(p => [p, ...p.children]).filter(i => i.path);
+
+describe('rutas (CAN_ACCESS) por rol', () => {
+  test('estructura: rutas únicas que empiezan con / y roles válidos', () => {
+    const paths = ROUTE_CATALOG.map(r => r.path);
+    assert.equal(new Set(paths).size, paths.length);
+    for (const r of ROUTE_CATALOG) {
+      assert.match(r.path, /^\/[a-z0-9/-]*$/);
+      assert.ok(r.roles.length > 0, `${r.path} sin rol`);
+      for (const role of r.roles) assert.ok(ROLES.includes(role), `${r.path}: rol ${role}`);
+    }
+  });
+  test('toda ruta del menú está en el catálogo de rutas, y toda ruta del catálogo está en el menú', () => {
+    for (const item of menuPaths) assert.ok(routeByPath(item.path), `${item.id}: ${item.path} no está en ROUTE_CATALOG`);
+    assert.deepEqual(ROUTE_CATALOG.map(r => r.path).sort(), menuPaths.map(i => i.path).sort());
+  });
+  test('quien ve un elemento del menú puede entrar a su ruta, y nadie más (la ruta no deja pasar a un rol más bajo)', () => {
+    for (const item of menuPaths) {
+      for (const role of ROLES) {
+        const roles = effectiveRoles(role);
+        const sees = item.roles.some(r => roles.has(r));
+        assert.equal(canAccess(role, item.path), sees, `${role} → ${item.path}`);
+      }
+    }
+  });
+  test('cada ruta se enlaza solo con los roles más bajos: ningún rol de la lista hereda de otro de la lista', () => {
+    for (const r of ROUTE_CATALOG) {
+      for (const a of r.roles) for (const b of r.roles) {
+        if (a !== b) assert.ok(!effectiveRoles(a).has(b), `${r.path}: ${a} ya alcanza ${b} por herencia`);
+      }
+    }
+  });
+  test('rol más bajo de cada ruta', () => {
+    assert.deepEqual(Object.fromEntries(ROUTE_CATALOG.map(r => [r.path, r.roles])), {
+      '/catalogo': ['CUSTOMER'], '/carrito': ['CUSTOMER'], '/mis-pedidos': ['CUSTOMER'], '/mis-listas': ['CUSTOMER'],
+      '/sucursal/pedidos': ['STAFF'], '/sucursal/inventario': ['STAFF'],
+      '/reparto/entregas': ['DELIVERY', 'ADMIN'],
+      '/admin/catalogo': ['MANAGER'], '/admin/reportes': ['MANAGER'],
+      '/admin/sucursales': ['ADMIN'], '/admin/usuarios': ['ADMIN'], '/admin/auditoria': ['ADMIN'],
+    });
+  });
+  test('matriz rol × ruta', () => {
+    const reachable = role => ROUTE_CATALOG.map(r => r.path).filter(p => canAccess(role, p));
+    const CUSTOMER = ['/catalogo', '/carrito', '/mis-pedidos', '/mis-listas'];
+    const STAFF = ['/sucursal/pedidos', '/sucursal/inventario'];
+    const MANAGER = ['/admin/catalogo', '/admin/reportes'];
+    assert.deepEqual(reachable('CUSTOMER'), CUSTOMER);
+    assert.deepEqual(reachable('STAFF'), [...CUSTOMER, ...STAFF]);
+    assert.deepEqual(reachable('DELIVERY'), [...CUSTOMER, '/reparto/entregas']);
+    assert.deepEqual(reachable('MANAGER'), [...CUSTOMER, ...STAFF, ...MANAGER]);
+    assert.deepEqual(reachable('ADMIN'), ROUTE_CATALOG.map(r => r.path));
+  });
+  test('casos del enunciado', () => {
+    assert.equal(canAccess('CUSTOMER', '/sucursal/pedidos'), false);
+    assert.equal(canAccess('STAFF', '/catalogo'), true); // por herencia de CUSTOMER
+    assert.equal(canAccess('DELIVERY', '/reparto/entregas'), true);
+    assert.equal(canAccess('DELIVERY', '/catalogo'), true);
+    assert.equal(canAccess('DELIVERY', '/sucursal/pedidos'), false);
+    assert.equal(canAccess('MANAGER', '/reparto/entregas'), false);
+    for (const r of ROUTE_CATALOG) assert.equal(canAccess('ADMIN', r.path), true, r.path);
+    assert.equal(canAccess('ADMIN', '/no-existe'), false); // ruta sin registrar
   });
 });
 
