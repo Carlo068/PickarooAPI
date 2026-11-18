@@ -1,24 +1,28 @@
 // ============================================================
 // SCYLLADB — bitácora de auditoría inmutable
 //
-// Diseño por consulta (wide-column): cada evento se escribe en tres tablas,
+// Diseño por consulta (wide-column): cada evento se escribe en cuatro tablas,
 // una por cada pregunta que se le hace a la bitácora.
 //
 //   events_by_day     PK ((category, day))       "eventos de seguridad de hoy"
 //   events_by_actor   PK ((actor_id))            "qué hizo este usuario"
 //   events_by_target  PK ((target_type, target_id)) "historia de la orden X",
 //                                                   "historial de precios del producto Y"
+//   logs_eventos      PK ((fecha_dia, tipo_evento)) "eventos de un tipo en un día"
+//                                                   (la tabla que se consulta con cqlsh)
 //
-// Todas ordenan por occurred_at DESC: lo más reciente primero sin ordenar en
-// memoria. El event_id lo genera el productor, así que un mensaje reentregado
-// por RabbitMQ reescribe la misma fila (escrituras idempotentes).
+// Todas ordenan de lo más reciente a lo más antiguo, sin ordenar en memoria. El
+// event_id lo genera el productor, así que un mensaje reentregado por RabbitMQ
+// reescribe la misma fila (escrituras idempotentes); en logs_eventos el timeuuid
+// se deriva del eventId (ver eventTimeUuid) para conservar esa propiedad.
 // ============================================================
 
+import { createHash } from 'crypto';
 import cassandra from 'cassandra-driver';
 import { GraphQLError } from 'graphql';
 import { scyllaConfig } from './scylla-options.js';
 
-const { LocalDate } = cassandra.types;
+const { LocalDate, TimeUuid } = cassandra.types;
 
 const config = scyllaConfig();
 export const KEYSPACE = config.keyspace;
@@ -51,6 +55,25 @@ const TABLES = [
      ${COLUMNS},
      PRIMARY KEY ((target_type, target_id), occurred_at, event_id)
    ) WITH CLUSTERING ORDER BY (occurred_at DESC, event_id ASC)`,
+  // Query-First: "eventos de un tipo en un día". La partición (fecha_dia, tipo_evento) acota su
+  // tamaño (un tipo, un día) y dentro de ella el orden físico DESC deja lo más reciente primero.
+  `CREATE TABLE IF NOT EXISTS logs_eventos (
+     fecha_dia date,
+     tipo_evento text,
+     timestamp timestamp,
+     evento_id timeuuid,
+     category text,
+     actor_id text,
+     actor_role text,
+     target_type text,
+     target_id text,
+     success boolean,
+     reason text,
+     ip text,
+     user_agent text,
+     metadata text,
+     PRIMARY KEY ((fecha_dia, tipo_evento), timestamp, evento_id)
+   ) WITH CLUSTERING ORDER BY (timestamp DESC, evento_id DESC)`,
 ];
 
 let client = null;
@@ -84,7 +107,29 @@ export async function initScylla(onReady) {
 const INSERT_COLUMNS = 'occurred_at, event_id, type, category, actor_id, actor_role, target_type, target_id, success, reason, ip, user_agent, metadata';
 const INSERT_MARKS = '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?';
 
+const LOGS_EVENTOS_COLUMNS = 'fecha_dia, tipo_evento, timestamp, evento_id, category, actor_id, actor_role, target_type, target_id, success, reason, ip, user_agent, metadata';
+const LOGS_EVENTOS_MARKS = '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?';
+
+const utcDay = date => LocalDate.fromString(date.toISOString().slice(0, 10));
+
+// timeuuid determinista: la hora es la del evento; nodeId, clockId y ticks salen del sha1 del eventId.
+// Así un mensaje reentregado produce el mismo evento_id y reescribe la misma fila en vez de duplicarla.
+export function eventTimeUuid(eventId, occurredAt) {
+  const h = createHash('sha1').update(String(eventId)).digest();
+  return TimeUuid.fromDate(occurredAt, h.readUInt16BE(8) % 10000, h.subarray(0, 6), h.subarray(6, 8));
+}
+
+// Valores de la fila de logs_eventos, en el orden de LOGS_EVENTOS_COLUMNS. Función pura: se prueba sin ScyllaDB.
+export function buildLogsEventosParams(e) {
+  const occurredAt = new Date(e.occurredAt);
+  return [
+    utcDay(occurredAt), e.type, occurredAt, eventTimeUuid(e.eventId, occurredAt), e.category, e.actorId, e.actorRole,
+    e.targetType, e.targetId, e.success, e.reason, e.ip, e.userAgent, JSON.stringify(e.metadata ?? {}),
+  ];
+}
+
 // Escribe el evento en las tablas que le corresponden (batch con log: o todas o ninguna).
+// Todo va con prepare: true (sentencias preparadas): el servidor las analiza una sola vez.
 export async function saveEvent(e) {
   const occurredAt = new Date(e.occurredAt);
   const values = [
@@ -93,7 +138,10 @@ export async function saveEvent(e) {
   ];
   const queries = [{
     query: `INSERT INTO events_by_day (day, ${INSERT_COLUMNS}) VALUES (?, ${INSERT_MARKS})`,
-    params: [LocalDate.fromString(occurredAt.toISOString().slice(0, 10)), ...values], // día en UTC
+    params: [utcDay(occurredAt), ...values], // día en UTC
+  }, {
+    query: `INSERT INTO logs_eventos (${LOGS_EVENTOS_COLUMNS}) VALUES (${LOGS_EVENTOS_MARKS})`,
+    params: buildLogsEventosParams(e),
   }];
   // Sin usuario no hay partición útil (y crecería sin límite): solo va por día.
   if (e.actorId && e.actorId !== 'ANONYMOUS') {

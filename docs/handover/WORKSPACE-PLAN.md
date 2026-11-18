@@ -61,7 +61,7 @@ The Android skills stay in `Pickaroo/.claude/skills/` (`pic-task`, `android-test
 | **MongoDB** | Source of truth: `users`, `categories`, `products`, `packages`, `stores`, `orders`, `shopping_lists`. |
 | **Redis Stack** | JWT sessions (`session:<jti>`, 1 h TTL, logout revokes), cart, 15-min quotes, recent orders, read cache of products and users. |
 | **Neo4j** | RBAC: roles with inheritance, permissions, staff ↔ store (`WORKS_AT`), per-role navigation menu with web routes. |
-| **RabbitMQ → ScyllaDB** | Audit events (SECURITY, ADMIN, CATALOG, ORDER) in three query tables: by day, by actor, by target. |
+| **RabbitMQ → ScyllaDB** | Audit events (SECURITY, ADMIN, CATALOG, ORDER) in four query tables: by day, by actor, by target, and `logs_eventos` (event type per day, the table to inspect with cqlsh). Default keyspace `auditoria`. |
 
 **Roles:** `CUSTOMER` → `STAFF` (`orders:prepare`, `stock:manage`) and `DELIVERY` (`orders:deliver`) → `MANAGER` (+`catalog:manage`, `reports:view`) → `ADMIN` (+`stores:manage`, `users:manage`, `audit:view`, `scope:all_stores`). Staff only see orders of their own stores.
 

@@ -309,7 +309,7 @@ export function startStack(config, log = console.log) {
     const audit = launch('auditAPI', 'services/auditAPI/src/index.js', {
       SCYLLADB_CONTACT_POINTS: '127.0.0.1',
       SCYLLADB_PORT: '9042',
-      SCYLLADB_KEYSPACE: 'pickaroo_audit',
+      SCYLLADB_KEYSPACE: 'auditoria',
     });
     await Promise.all([
       waitForLine(api, /Seed OK/, 90_000),

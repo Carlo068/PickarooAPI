@@ -14,7 +14,7 @@ const DATACENTER_NAME = /^[A-Za-z0-9_.-]+$/;
 export function scyllaConfig(env = process.env) {
   const contactPoints = (env.SCYLLADB_CONTACT_POINTS || '127.0.0.1').split(',').map(s => s.trim()).filter(Boolean);
   const localDataCenter = env.SCYLLADB_DATACENTER || 'datacenter1';
-  const keyspace = env.SCYLLADB_KEYSPACE || 'pickaroo_audit';
+  const keyspace = env.SCYLLADB_KEYSPACE || 'auditoria';
 
   const base = { contactPoints, localDataCenter, protocolOptions: { port: parseInt(env.SCYLLADB_PORT) || 9042 } };
   // Clústeres alojados (p. ej. ScyllaDB Cloud): usuario/contraseña y TLS.

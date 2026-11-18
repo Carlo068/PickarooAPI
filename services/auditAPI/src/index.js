@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: [path.join(__dirname, '..', '.env'), path.join(__dirname, '..', '..', 'mongoAPI', '.env')] });
 
 const { initScylla, isScyllaReady, eventsByDay, eventsByActor, eventsByTarget } = await import('./scylla.js');
-const { startConsumer } = await import('./consumer.js');
+const { startConsumer } = await import('./worker-auditoria.js');
 const { authContext, connectRedis, requireAuditView } = await import('./auth.js');
 
 const typeDefs = parse(fs.readFileSync(path.join(__dirname, 'schema.graphql'), 'utf8'));
