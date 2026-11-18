@@ -50,6 +50,7 @@ import { RECENT_ORDERS, pushRecentOrder, getRecentOrderIds, setRecentOrders } fr
 import { initNeo4j, isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
 import { initEvents, emitEvent, diff, auditPlugin, CATEGORIES } from './infrastructure/events.js';
+import { userRegisteredEvent } from './infrastructure/security-events.js';
 import { runMigrations } from './infrastructure/migrations.js';
 import { createAuthContext, createAuthResolvers, requireAuth, requirePermission, requireSelfOrPermission, forbidden } from './auth.js';
 import {
@@ -1054,13 +1055,7 @@ const resolvers = {
         await rbac.ensureUser({ id: user._id, email: user.email, name: user.name }, role)
           .catch(err => console.warn('⚠️  Usuario sin nodo en Neo4j (se creará al iniciar sesión):', err.message));
       }
-      emitEvent({
-        type: 'USER_REGISTERED', category: CATEGORIES.ADMIN,
-        actorId: ctx.currentUser?.id ?? user._id, actorRole: ctx.currentUser?.role ?? role,
-        targetType: 'User', targetId: user._id,
-        reason: ctx.currentUser ? 'Alta hecha por un administrador' : 'Registro abierto',
-        metadata: { email: user.email, role },
-      }, ctx);
+      emitEvent(userRegisteredEvent({ user, role, admin: ctx.currentUser }), ctx);
       return cacheUser(user);
     },
     addUserAddress: async (_, { userId, address }, ctx) => {

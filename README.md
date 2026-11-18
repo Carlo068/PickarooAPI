@@ -33,7 +33,7 @@ flowchart LR
 | MongoDB | Almacenar las colecciones del negocio y ejecutar los pipelines analíticos. |
 | Redis Stack | Sesiones activas del JWT (con sus permisos), carrito, cotizaciones, la última ubicación del repartidor (`driver-location`) y caché de lectura (Redis OM) de productos y usuarios. |
 | Neo4j | Roles, herencia de roles, permisos, sucursales asignadas al personal y menú de navegación (RBAC). |
-| RabbitMQ | Cola durable `pickaroo.events` con los eventos de auditoría que publica mongoAPI. |
+| RabbitMQ | Cola durable `eventos-seguridad` con los eventos de auditoría y de seguridad que publica mongoAPI. |
 | auditAPI | Consumir la cola, escribir la bitácora en ScyllaDB y exponer sus consultas (permiso `audit:view`). |
 | ScyllaDB | Bitácora inmutable de seguridad, administración, catálogo y órdenes. |
 
@@ -858,7 +858,11 @@ Es un reporte de demanda para planear compras; el stock ya se descuenta al vende
 
 ## 9. Bitácora de auditoría: RabbitMQ → ScyllaDB
 
-mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `pickaroo.events` (`RABBITMQ_QUEUE`, mensajes `persistent`) y sigue. `services/auditAPI` consume la cola y es el único servicio que escribe y lee ScyllaDB. Si RabbitMQ no está disponible el evento se descarta con un aviso: una caída del broker nunca interrumpe una compra o un login.
+mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `eventos-seguridad` (`RABBITMQ_QUEUE`, mensajes `persistent`) y sigue. `services/auditAPI` consume la cola y es el único servicio que escribe y lee ScyllaDB. Si RabbitMQ no está disponible el evento se descarta con un aviso: una caída del broker nunca interrumpe una compra o un login, y el productor reconecta solo (ver "Telemetría de seguridad asíncrona", más abajo).
+
+> La cola anterior, `pickaroo.events`, se abandona: en un RabbitMQ de desarrollo que ya la tenga, los mensajes que guarde no los consume nadie. Si tiene mensajes pendientes, bórrala desde el panel (`http://localhost:15672/` → *Queues* → `pickaroo.events` → *Delete*). Para conservar el nombre anterior basta `RABBITMQ_QUEUE=pickaroo.events` en los dos servicios.
+>
+> **Si tu `services/mongoAPI/.env` o tu `services/auditAPI/.env` ya define `RABBITMQ_QUEUE=pickaroo.events`, borra o cambia esa línea**; mientras esté ahí, el cambio de nombre no tiene efecto (el `.env` manda sobre el valor por omisión). Al arrancar, mongoAPI registra `Cola "…" lista.` y auditAPI `Consumiendo la cola "…"`: comprueba que ambas muestren `eventos-seguridad`.
 
 ### Eventos
 
@@ -871,7 +875,7 @@ mongoAPI **nunca** escribe en ScyllaDB: publica cada evento en la cola durable `
 
 Los eventos de productos, paquetes, descuentos y stock (`CATALOG`) y los de órdenes `ORDER_CREATED`, `ORDER_STATUS_CHANGED`, `DELIVERY_ACCEPTED` y `DELIVERY_RELEASED` llevan la sucursal en `metadata.storeId`. `CATEGORY_CREATED` no la lleva (las categorías son globales) y `ORDER_REJECTED` tampoco (la compra no llegó a tener sucursal).
 
-`ACCESS_DENIED` y `ORDER_REJECTED` se registran en un solo lugar: un plugin de Apollo (`auditPlugin` en `infrastructure/events.js`) que revisa los errores de cada operación. Excepción: el `UNAUTHENTICATED` de `reportDriverLocation` no se registra (la app lo manda cada 3 s; ver sección 6, "Reparto: ubicación del repartidor"); su `FORBIDDEN` sí. Nunca se registran contraseñas ni tokens.
+`ACCESS_DENIED` y `ORDER_REJECTED` se registran en un solo lugar: un plugin de Apollo (`auditPlugin` en `infrastructure/events.js`) que revisa los errores de cada operación. Excepción: el `UNAUTHENTICATED` de `reportDriverLocation` no se registra (la app lo manda cada 3 s; ver sección 6, "Reparto: ubicación del repartidor"); su `FORBIDDEN` sí. Nunca se registran contraseñas, hashes ni tokens (ver "Qué lleva y qué no lleva cada evento").
 
 Sobre de cada mensaje:
 
@@ -903,9 +907,70 @@ Diseño por consulta: cada evento se escribe (batch con log) en las tablas que l
 
 - `day` es la fecha UTC del evento (`YYYY-MM-DD`).
 - `AuditEvent.actor` es la entidad `User` federada: el gateway la completa con el subgrafo `pickaroo` (nombre, correo…).
-- El consumidor hace `ack` solo después de escribir. Si la escritura falla, el mensaje vuelve a la cola tras 5 segundos. Si ScyllaDB no está listo al arrancar, auditAPI no consume y los eventos esperan en RabbitMQ.
+- El consumidor (prefetch 50, `ack` manual) hace `ack` solo después de escribir. Si la escritura falla, el mensaje vuelve a la cola (`nack` con reencolado) tras 5 segundos. Si ScyllaDB no está listo al arrancar, auditAPI no consume y los eventos esperan en RabbitMQ.
 - El `eventId` lo pone el productor, así que un mensaje reentregado reescribe la misma fila. Los mensajes del formato anterior (`{ event, payload }`) también se aceptan.
 - auditAPI valida el mismo JWT y la misma sesión de Redis que mongoAPI, y exige el permiso `audit:view` (solo ADMIN).
+
+### Telemetría de seguridad asíncrona (Bloque B: RabbitMQ)
+
+Esta sección relaciona el enunciado del Bloque B ("Telemetría de Seguridad Asíncrona con RabbitMQ") con el código. La API publica los eventos de seguridad en una cola y un worker aparte los consume; la petición del usuario nunca espera ni depende de RabbitMQ.
+
+| Enunciado | Implementación |
+|---|---|
+| Productor `rabbitmq.js` | `services/mongoAPI/src/infrastructure/rabbitmq.js`: conexión, `assertQueue` durable, publicación `persistent`, reconexión. `infrastructure/events.js` arma el evento (`emitEvent`) y llama a `publish`; `infrastructure/security-events.js` tiene las fábricas de los cuatro eventos |
+| Cola `eventos-seguridad` | Valor por omisión en productor y worker; `RABBITMQ_QUEUE` lo cambia en los dos (`services/auditAPI/src/queue.js` y `rabbitmq.js` comparten el mismo valor; `scripts/queue-name.test.js` lo comprueba) |
+| Eventos `LOGIN_FAILED`, `LOGIN_SUCCESS`, `USER_REGISTERED`, `ROLE_CHANGED` | Mismos nombres en el código: `login` (`auth.js`) emite `LOGIN_FAILED` y `LOGIN_SUCCESS`; `createUser` (`index.js`) emite `USER_REGISTERED`; `assignRole` (`auth.js`, cuando un administrador cambia el rol de un usuario) emite `ROLE_CHANGED`. Los dos últimos viajan con `category: "ADMIN"`; los de login, con `"SECURITY"`. Los demás eventos de la sección "Eventos" usan la misma cola |
+| Sin contraseñas ni tokens (CWE-532) | Ver "Qué lleva y qué no lleva cada evento" |
+| Worker con prefetch 50 y `ack`/`nack` manual | `services/auditAPI/src/consumer.js` (el servicio auditAPI): `prefetch(50)` (`RABBITMQ_PREFETCH`), `ack` tras escribir en ScyllaDB, `nack` con reencolado tras 5 s si la escritura falla; un mensaje que no es JSON válido se confirma y se descarta; un evento que falla 5 veces seguidas al guardarse (mismo `eventId`) se descarta con `nack` sin reencolar y una línea de error, para que un mensaje venenoso no se reintente para siempre. Si el canal o la conexión se cierran, el worker reconecta con un único bucle de reintento (cada 5 s). `RABBITMQ_PREFETCH` solo acepta enteros decimales de 1 a 65535; otro valor usa 50 y deja un aviso |
+| Log de cada evento en consola | El worker imprime una línea por evento (abajo) |
+| Fail-safe con el broker caído | Un login válido sigue funcionando y solo se registra un aviso (abajo) |
+
+#### Qué lleva y qué no lleva cada evento
+
+| Evento | Quién y cuándo | `actorId` / `actorRole` | `reason` | `metadata` |
+|---|---|---|---|---|
+| `LOGIN_FAILED` | `login` con correo inexistente, contraseña incorrecta o cuenta desactivada | el usuario (o `ANONYMOUS`) | texto fijo: `Correo no registrado`, `Contraseña incorrecta` o `Cuenta desactivada` | `{ email }` (el correo normalizado; si lo escrito no tiene `@`, se guarda `[invalid-email]` porque suele ser una contraseña escrita en el campo equivocado) |
+| `LOGIN_SUCCESS` | `login` correcto | el usuario y su rol | `Autenticación correcta` | `{ jti, familyId, permissions, stores }` (identificadores y conteos) |
+| `USER_REGISTERED` | `createUser`: registro abierto o alta por un administrador | quien lo hizo | `Registro abierto` o `Alta hecha por un administrador` | `{ email, role }` |
+| `ROLE_CHANGED` | `assignRole` | el administrador; objetivo: el usuario | `Rol X → Y` | `{ from, to }` |
+
+Todos llevan además `eventId`, `ip`, `userAgent`, `success` y `occurredAt` (ver el sobre de la sección "Eventos"). **Nunca** llevan la contraseña (ni la escrita ni su hash), el JWT ni el refresh token. Tres capas:
+
+1. Las fábricas de `security-events.js` no reciben esos datos: no hay por dónde colarlos. El `reason` de `LOGIN_FAILED` es un texto fijo, no repite lo que escribió el usuario.
+2. `emitEvent` trunca cada texto a 512 caracteres (`ip` y `userAgent`, a 256) antes de revisarlo y pasa `metadata` por `scrubMetadata`: borra, a cualquier profundidad, las claves que coincidan con `/pass(word)?|token|secret|hash|authorization|jwt|refresh/i` (excepto los identificadores `jti`, `familyId` y el conteo `refreshFamilies`) y tacha con `[REDACTED]` los valores con forma de JWT, de hash `scrypt$…` o de refresh token (también en `reason`).
+El login rechaza con `INVALID_CREDENTIALS`, sin consultar la base, un correo de más de 320 caracteres (también queda como `LOGIN_FAILED`, truncado).
+3. El worker no imprime `metadata`, `reason` ni `userAgent`.
+
+Línea del worker por cada evento (los campos van sin saltos de línea ni caracteres de control, con tope de 80 caracteres y sin marcas bidireccionales ni de ancho cero, para que un valor hostil no falsifique líneas del log):
+
+```
+📥 [SECURITY] LOGIN_FAILED actor=ANONYMOUS role=- success=false ip=::1 at=2026-11-17T18:00:00.000Z → ScyllaDB
+```
+
+#### Fail-safe y reconexión del productor
+
+- `initEvents()` no bloquea el arranque ni lanza: si RabbitMQ no responde, la API arranca y reintenta.
+- Si el broker se cae (o nunca estuvo), `publish` descarta el evento sin esperar y deja **un solo** aviso por caída (`⚠️  RabbitMQ no disponible…`), no uno por evento. La petición (login, compra…) no se retrasa ni falla.
+- La reconexión es automática con espera exponencial: 1 s, 2 s, 4 s… hasta 30 s; al reconectar vuelve a 1 s, se registra `🔁 RabbitMQ reconectado` y se arma de nuevo el aviso único para la siguiente caída. Mientras el broker no responda, el motivo de cada reintento fallido se repite como mucho una vez por minuto. Si el canal se llena (`sendToQueue` devuelve `false`) o el broker bloquea la conexión (`blocked`), los eventos también se omiten, con un solo aviso, hasta el `drain` / `unblocked`. Los eventos publicados durante la caída se pierden (no hay buffer): es telemetría, no una cola de negocio.
+
+#### Cómo comprobar cada fila de validación
+
+Requisitos: `docker compose up -d`, las dependencias instaladas y `SEED=true` en `services/mongoAPI/.env` la primera vez (usuarios de la sección 11). Panel de RabbitMQ: `http://localhost:15672/`, usuario `guest`, contraseña `guest` (las de `docker-compose.yml`). Las peticiones van al Gateway (`http://localhost:4000/`); abajo, con `curl`:
+
+```bash
+# Login con la contraseña equivocada
+curl -s http://localhost:4000/ -H "content-type: application/json" \
+  -d '{"query":"mutation($i: LoginInput!){ login(input:$i){ token } }","variables":{"i":{"email":"admin@carnyfrut.mx","password":"incorrecta-123"}}}'
+```
+
+1. **Credenciales incorrectas: error al cliente y `LOGIN_FAILED` en RabbitMQ.** Para ver el mensaje en la cola el worker (auditAPI) debe estar detenido; si no, lo consume al instante. El Gateway necesita a auditAPI para componer el esquema al arrancar, así que se levantan los tres en terminales separadas (`npm run dev:campamentos`, `npm run dev:auditoria`, `npm run dev:gateway`) y, cuando el Gateway ya responde, se detiene solo la terminal de auditAPI con Ctrl+C. Ejecutar el `curl` de arriba: responde con `extensions.code` `INVALID_CREDENTIALS` ("Credenciales inválidas.") y, en el panel, *Queues → eventos-seguridad* pasa a **Ready: 1**.
+2. **El JSON del mensaje no tiene contraseña.** En *Queues → eventos-seguridad → Get messages* (Ack mode: `Nack message requeue true`, Messages: 1) el cuerpo es el sobre con `"type":"LOGIN_FAILED"`, `"reason":"Contraseña incorrecta"` y `"metadata":{"email":"admin@carnyfrut.mx"}`; no existe ningún campo `password` y el texto `incorrecta-123` no aparece. Con `Nack message requeue true` el mensaje se queda en la cola.
+3. **Arrancar el worker: loguea cada evento y la cola baja a 0.** Con mensajes acumulados (repetir el paso 1 y hacer también un login válido, `admin@carnyfrut.mx` / `Admin1234`, para tener `LOGIN_SUCCESS`), arrancar el worker, que es el servicio auditAPI: `npm run dev:auditoria` (necesita ScyllaDB arriba). Imprime una línea `📥 [SECURITY] … → ScyllaDB` por evento y en el panel *Ready* y *Unacked* llegan a 0. Los eventos quedan en ScyllaDB: `auditEvents(category: SECURITY, day: …, type: "LOGIN_FAILED")` (permiso `audit:view`, ADMIN).
+4. **Broker detenido: un login válido sigue funcionando.** Con la API en marcha: `docker stop pickaroo-rabbitmq`. Hacer un login con credenciales válidas (`admin@carnyfrut.mx` / `Admin1234`): responde con el token normalmente y la consola de mongoAPI muestra un único `⚠️  RabbitMQ no disponible…` por caída (mientras tanto reintenta con espera creciente). Después `docker start pickaroo-rabbitmq`: en unos segundos aparece `🔁 RabbitMQ reconectado` y los eventos nuevos vuelven a llegar a la cola. Nunca usar `docker compose down -v`: borra los volúmenes con los datos.
+
+Para ver `USER_REGISTERED` (mutación `createUser`, registro abierto) y `ROLE_CHANGED` (`assignRole` con el token del administrador) basta ejecutarlas con la misma preparación.
+
+Pruebas unitarias (sin Docker): `services/mongoAPI/test/domain/rabbitmq.test.js` (cola por omisión y `RABBITMQ_QUEUE`, espera exponencial, un aviso por caída, reconexión), `security-events.test.js` (limpieza de secretos y cuatro eventos sin datos sensibles), `services/auditAPI/test/consumer.test.js` (línea de log, `ack`/`nack`, prefetch) y `scripts/queue-name.test.js`.
 
 ## 10. Configuración y ejecución local
 
@@ -934,7 +999,7 @@ Crear **`services/mongoAPI/.env`**:
 MONGODB_URI=mongodb://admin:CONTRASENA_DEL_COMPOSE@localhost:27017/pickaroodb?authSource=admin
 PORT_CAMPAMENTOS=4001
 RABBITMQ_URL=amqp://guest:guest@localhost:5672
-RABBITMQ_QUEUE=pickaroo.events
+RABBITMQ_QUEUE=eventos-seguridad
 REDIS_URL=redis://default:pickaroo123@localhost:6379
 JWT_SECRET=CAMBIAR_POR_UN_SECRETO_LARGO_Y_ALEATORIO
 JWT_TTL_SECONDS=3600
@@ -971,6 +1036,8 @@ SCYLLADB_CONTACT_POINTS=127.0.0.1
 SCYLLADB_PORT=9042
 SCYLLADB_KEYSPACE=pickaroo_audit
 RABBITMQ_URL=amqp://guest:guest@localhost:5672
+# RABBITMQ_QUEUE=eventos-seguridad  (por omisión; debe ser el mismo valor que en mongoAPI)
+# RABBITMQ_PREFETCH=50              (por omisión)
 ```
 
 Sustituir `CONTRASENA_DEL_COMPOSE` por el valor de `MONGO_INITDB_ROOT_PASSWORD` del YAML. Si contiene caracteres reservados de una URI, deben codificarse. El usuario y contraseña deben coincidir con los que inicializaron el volumen de MongoDB; editar el YAML no cambia automáticamente las credenciales de un volumen existente.
@@ -1052,7 +1119,7 @@ npm run test:integration
 
 Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, el modelo RBAC en Neo4j (restricciones, `MenuNode`, `CAN_ACCESS` de cada ruta, `canAccessRoute` y `myMenu` por rol, y que `scripts/init-rbac.cql` deja el mismo catálogo que `bootstrapRbac`), refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, reparto (entregas disponibles, aceptaciones simultáneas, una entrega activa por repartidor, liberar, la ruta del repartidor asignado), ubicación del repartidor (quién reporta y quién lee, validación, límite de 1 por segundo, TTL, un solo reloj con puntos guardados del futuro, borrado al entregar o cancelar, que la bitácora no se llene y la escritura atómica en Redis), bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
 
-- **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida, `REFRESH_TTL_SECONDS=10` (para probar el vencimiento), `REFRESH_REUSE_GRACE_SECONDS=2` (para probar lo que pasa después de la ventana), `DRIVER_LOCATION_TTL_SECONDS=120` (distinto del de 600 para comprobar que la clave usa el configurado) y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
+- **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida, `REFRESH_TTL_SECONDS=10` (para probar el vencimiento), `REFRESH_REUSE_GRACE_SECONDS=2` (para probar lo que pasa después de la ventana), `DRIVER_LOCATION_TTL_SECONDS=120` (distinto del de 600 para comprobar que la clave usa el configurado) y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `eventos-seguridad`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
 - **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
 - **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), los refresh tokens con sus marcas de usado, sus registros de gracia y sus familias, carritos, cotizaciones, ubicaciones del repartidor (`driver:loc:<orderId>`), pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos, rutas y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar, y la prueba del script lo aplica dos veces y termina con `bootstrapRbac`.
 - **Lo que no se limpia:** las filas de auditoría en ScyllaDB (la bitácora es inmutable) y los mensajes de RabbitMQ. El auditAPI del dev y el de pruebas consumen la misma cola y escriben en la misma ScyllaDB, así que cualquiera de los dos puede guardar un evento de la corrida; las pruebas de bitácora consultan hasta que aparece.

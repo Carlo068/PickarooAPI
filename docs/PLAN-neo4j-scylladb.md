@@ -10,7 +10,7 @@ persiste en ScyllaDB).
 Cliente ─► Gateway :4000 ─┬─► mongoAPI :4001 ──► MongoDB   (datos del negocio)
                           │        │  ├────────► Redis     (sesiones con permisos, caché, carrito)
                           │        │  ├────────► Neo4j     (roles, permisos, sucursales, menús)
-                          │        │  └─ eventos ─► RabbitMQ  cola "pickaroo.events"
+                          │        │  └─ eventos ─► RabbitMQ  cola "eventos-seguridad"
                           │        │                    │
                           └─► auditAPI :4003 ◄──────────┘ consume
                                    └────────► ScyllaDB  (bitácora inmutable)

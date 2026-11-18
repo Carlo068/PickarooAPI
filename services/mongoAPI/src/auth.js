@@ -44,6 +44,7 @@ import { isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
 import { rbacService } from './infrastructure/rbac.service.js';
 import { emitEvent, requestInfo, CATEGORIES } from './infrastructure/events.js';
+import { loginFailedEvent, loginSuccessEvent, roleChangedEvent, MAX_EMAIL_LENGTH } from './infrastructure/security-events.js';
 import { DEFAULT_ROLE, PERMISSIONS, hasPermission, isRole } from './domain/access.js';
 import { DomainError } from './domain/errors.js';
 import {
@@ -386,17 +387,18 @@ export const createAuthResolvers = redisClient => {
         if (!redisClient.isReady) throw sessionsUnavailable();
 
         const email = input.email.trim().toLowerCase();
+        // Un "correo" de más de 320 caracteres no puede existir: mismo error que cualquier credencial mala,
+        // sin buscarlo ni gastar scrypt (y sin que el texto hostil llegue a la bitácora completo).
+        if (email.length > MAX_EMAIL_LENGTH) {
+          emitEvent(loginFailedEvent({ user: null, valid: false, email }), ctx);
+          throw authError('Credenciales inválidas.', 'INVALID_CREDENTIALS');
+        }
         const user = await User.findOne({ email }).select('+passwordHash');
         const valid = verifyPassword(input.password, user?.passwordHash);
         // Mismo mensaje para correo inexistente, contraseña incorrecta o cuenta desactivada;
         // el motivo real queda en la bitácora.
         if (!user || !valid || !user.isActive) {
-          emitEvent({
-            type: 'LOGIN_FAILED', category: CATEGORIES.SECURITY, success: false,
-            actorId: user?._id ?? 'ANONYMOUS', actorRole: user?.role ?? null,
-            reason: !user ? 'Correo no registrado' : !valid ? 'Contraseña incorrecta' : 'Cuenta desactivada',
-            metadata: { email },
-          }, ctx);
+          emitEvent(loginFailedEvent({ user, valid, email }), ctx);
           throw authError('Credenciales inválidas.', 'INVALID_CREDENTIALS');
         }
 
@@ -416,11 +418,7 @@ export const createAuthResolvers = redisClient => {
         await refreshStore.addFamily(multi, { hash: hashRefreshToken(refreshToken), record, jti }).exec();
         console.log(`🔑 Sesión iniciada: ${sessionKey(jti)} rol=${access.role} (TTL ${SESSION_TTL_SECONDS}s)`);
 
-        emitEvent({
-          type: 'LOGIN_SUCCESS', category: CATEGORIES.SECURITY, actorId: userId, actorRole: access.role,
-          reason: access.degraded ? 'Sesión sin permisos (Neo4j no disponible)' : 'Autenticación correcta',
-          metadata: { jti, familyId: record.familyId, permissions: access.permissions.length, stores: access.storeIds.length },
-        }, ctx);
+        emitEvent(loginSuccessEvent({ userId, access, jti, familyId: record.familyId }), ctx);
 
         return authPayload(user, access, issued, refreshToken);
       },
@@ -510,10 +508,7 @@ export const createAuthResolvers = redisClient => {
         user.role = role;
         await user.save();
         await cacheUser(user);
-        return afterAccessChange(user, ctx, {
-          type: 'ROLE_CHANGED', category: CATEGORIES.ADMIN,
-          reason: `Rol ${previous ?? '—'} → ${role}`, metadata: { from: previous, to: role },
-        });
+        return afterAccessChange(user, ctx, roleChangedEvent({ previous, role }));
       },
 
       assignUserToStore: async (_, { userId, storeId }, ctx) => {
