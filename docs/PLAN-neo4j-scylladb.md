@@ -6,7 +6,12 @@ persiste en ScyllaDB).
 
 ## Arquitectura
 
-```
+![Diagrama de arquitectura del backend con el Gateway, las bases de datos y la cola de auditoría](diagramas/arquitectura.png)
+
+<details>
+<summary>Ver arquitectura en texto</summary>
+
+```text
 Cliente ─► Gateway :4000 ─┬─► mongoAPI :4001 ──► MongoDB   (datos del negocio)
                           │        │  ├────────► Redis     (sesiones con permisos, caché, carrito)
                           │        │  ├────────► Neo4j     (roles, permisos, sucursales, menús)
@@ -16,8 +21,122 @@ Cliente ─► Gateway :4000 ─┬─► mongoAPI :4001 ──► MongoDB   (da
                                    └────────► ScyllaDB  (bitácora inmutable)
 ```
 
+</details>
+
 - mongoAPI **nunca** escribe en ScyllaDB: publica eventos y sigue (fire-and-forget).
 - auditAPI es el único que escribe en ScyllaDB y expone las consultas de auditoría.
+
+## Diagrama de secuencia integral (UML)
+
+El flujo crítico del usuario termina en mongoAPI; la publicación de auditoría no espera a que el worker confirme la escritura. El worker procesa los mensajes por separado, con un máximo de 50 sin confirmar. Si RabbitMQ no está disponible, mongoAPI registra el aviso y continúa con la operación del usuario; ese evento no se conserva localmente.
+
+![Inicio de sesión con MongoDB, Neo4j y Redis](diagramas/uml-login.png)
+
+![Respuesta al cliente y persistencia de auditoría en paralelo mediante RabbitMQ y ScyllaDB](diagramas/uml-auditoria.png)
+
+![Menú dinámico y ajuste de inventario según los permisos y la sucursal del usuario](diagramas/uml-operaciones.png)
+
+<details>
+<summary>Ver la fuente Mermaid del diagrama integral</summary>
+
+```text
+sequenceDiagram
+    autonumber
+    actor Usuario
+    participant Cliente as Web / app / Apollo Sandbox
+    participant Gateway as Apollo Gateway
+    participant API as mongoAPI
+    participant Mongo as MongoDB
+    participant Neo as Neo4j
+    participant Redis
+    participant Rabbit as RabbitMQ
+    participant Worker as auditAPI worker
+    participant Scylla as ScyllaDB
+
+    Usuario->>Cliente: Envía credenciales
+    Cliente->>Gateway: mutation login
+    Gateway->>API: Reenvía login y contexto HTTP
+    API->>Mongo: Busca usuario y verifica contraseña
+    Mongo-->>API: Resultado de autenticación
+
+    alt Credenciales inválidas o cuenta inactiva
+        API->>API: Prepara INVALID_CREDENTIALS y LOGIN_FAILED
+    else Credenciales válidas
+        API->>Neo: Lee rol, permisos heredados y sucursales
+        Neo-->>API: Acceso efectivo
+        API->>Redis: Guarda sesión activa con jti y permisos
+        Redis-->>API: Sesión guardada
+        API->>API: Prepara token, access y LOGIN_SUCCESS
+    end
+
+    alt RabbitMQ conectado
+        API-)Rabbit: Encola LOGIN_FAILED o LOGIN_SUCCESS (persistente)
+    else RabbitMQ no disponible
+        API->>API: Registra aviso y continúa sin guardar el evento
+    end
+    Note over API,Rabbit: Fire-and-forget: la respuesta no espera al ACK del worker
+
+    opt Credenciales válidas
+        API->>Neo: Consulta menú visible para el rol
+        Neo-->>API: Nodos de menú autorizados
+    end
+
+    par Camino síncrono del usuario
+        API-->>Gateway: Devuelve error o sesión, access y menú
+        Gateway-->>Cliente: Respuesta GraphQL
+        Cliente-->>Usuario: Resultado del login
+    and Auditoría en segundo plano
+        opt Hay evento en la cola y ScyllaDB está listo
+            Rabbit-->>Worker: Entrega evento (prefetch máximo 50)
+            Worker->>Scylla: Escribe con sentencias preparadas
+            alt Escritura confirmada
+                Scylla-->>Worker: Persistencia confirmada
+                Worker->>Rabbit: ACK manual
+            else Falla la escritura
+                Scylla-->>Worker: Error de persistencia
+                Worker->>Rabbit: NACK y reencola para reintento
+            end
+        end
+    end
+
+    opt Llamadas posteriores con sesión válida
+        opt Consulta del menú dinámico
+            Cliente->>Gateway: query myMenu
+            Gateway->>API: Reenvía consulta y JWT
+            API->>API: Verifica firma y vigencia del JWT
+            API->>Redis: Comprueba sesión activa por jti
+            Redis-->>API: Sesión y usuario
+            API->>Neo: Obtiene menú por herencia de roles
+            Neo-->>API: Menú autorizado
+            API-->>Gateway: myMenu
+            Gateway-->>Cliente: Menú visible
+        end
+
+        opt Mutación protegida (ejemplo: setProductStock)
+            Cliente->>Gateway: mutation con JWT
+            Gateway->>API: Reenvía mutación
+            API->>API: Verifica firma y vigencia del JWT
+            API->>Redis: Comprueba sesión activa por jti
+            Redis-->>API: Sesión con permisos efectivos
+            API->>API: Resolver comprueba permiso y alcance
+            alt Sin permiso
+                API-)Rabbit: ACCESS_DENIED
+                API-->>Gateway: GraphQL FORBIDDEN
+                Gateway-->>Cliente: Error sin escritura en MongoDB
+            else Con permiso
+                API->>Mongo: Persiste el cambio
+                Mongo-->>API: Cambio confirmado
+                API-)Rabbit: STOCK_SET u otro evento de dominio
+                API-->>Gateway: Resultado de la mutación
+                Gateway-->>Cliente: Resultado
+            end
+        end
+    end
+```
+
+</details>
+
+El mismo camino de auditoría recibe `LOGIN_FAILED`, `LOGIN_SUCCESS`, `USER_REGISTERED` y `ROLE_CHANGED`; además, el plugin GraphQL registra los accesos denegados como `ACCESS_DENIED`. En todos los casos se filtran contraseñas, hashes y tokens completos antes de publicar.
 
 ## 1. Neo4j: roles y permisos (RBAC)
 
@@ -35,7 +154,12 @@ Permisos efectivos = los del rol + los de todos los roles heredados (`[:INHERITS
 
 ### Grafo
 
-```
+![Modelo de Neo4j con las relaciones de herencia, permisos, navegación y alcance por sucursal](diagramas/grafo-rbac.png)
+
+<details>
+<summary>Ver relaciones del grafo en texto</summary>
+
+```text
 (:User {id})-[:HAS_ROLE]->(:Role {name})-[:INHERITS]->(:Role)
 (:Role)-[:HAS_PERMISSION]->(:Permission {name})
 (:User)-[:WORKS_AT]->(:Store {id})                 alcance por sucursal
@@ -43,6 +167,8 @@ Permisos efectivos = los del rol + los de todos los roles heredados (`[:INHERITS
 (:Role)-[:CAN_VIEW_MENU]->(:MenuNode)-[:NAVIGATES_TO]->(:Route {path})
 (:MenuNode)-[:HAS_CHILD]->(:MenuNode)
 ```
+
+</details>
 
 - **Alcance por sucursal:** STAFF / DELIVERY / MANAGER solo actúan sobre órdenes de las
   sucursales con `WORKS_AT`. `scope:all_stores` (ADMIN) ve todas.
