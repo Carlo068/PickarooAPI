@@ -344,6 +344,8 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 
 La interfaz **Neo4j Browser** (`http://localhost:7474`, usuario `neo4j`) permite ver el grafo, por ejemplo con `MATCH (u:User)-[r]->(n) RETURN u, r, n`.
 
+Guion ensayado para demostrar en vivo el RBAC, la telemetría de seguridad en RabbitMQ y la bitácora en ScyllaDB: [`docs/DEFENSA-EN-VIVO.md`](docs/DEFENSA-EN-VIVO.md).
+
 ### Modelo RBAC en Neo4j
 
 Control de acceso basado en roles y navegación dinámica: el rol decide a qué rutas web se puede entrar (`CAN_ACCESS`) y qué botones y submenús se ven (`CAN_VIEW_MENU`); el árbol de menú está desacoplado de las rutas.
