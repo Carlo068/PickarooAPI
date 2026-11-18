@@ -8,9 +8,9 @@ describe('scyllaConfig', () => {
   test('por defecto: el ScyllaDB local de docker-compose (sin auth ni TLS)', () => {
     const c = scyllaConfig({});
     assert.deepEqual(c.clientOptions, { contactPoints: ['127.0.0.1'], localDataCenter: 'datacenter1', protocolOptions: { port: 9042 } });
-    assert.equal(c.keyspace, 'pickaroo_audit');
+    assert.equal(c.keyspace, 'auditoria');
     assert.equal(c.createKeyspace, true);
-    assert.equal(c.createKeyspaceCql, "CREATE KEYSPACE IF NOT EXISTS pickaroo_audit WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+    assert.equal(c.createKeyspaceCql, "CREATE KEYSPACE IF NOT EXISTS auditoria WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
   });
 
   test('puntos de contacto, puerto, datacenter y keyspace configurables', () => {

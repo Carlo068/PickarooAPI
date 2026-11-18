@@ -1,11 +1,11 @@
-// Worker de la cola (src/consumer.js y src/queue.js): línea de log sin inyección, prefetch por
+// Worker de la cola (src/worker-auditoria.js y src/queue.js): línea de log sin inyección, prefetch por
 // entorno y ack/nack manual. Sin RabbitMQ ni ScyllaDB: el canal y el guardado se simulan.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   logSafe, eventLogLine, handleMessage, normalize, safeAck, safeNack, createConsumer, MAX_SAVE_ATTEMPTS,
-} from '../src/consumer.js';
+} from '../src/worker-auditoria.js';
 import { queueName, prefetchCount, DEFAULT_PREFETCH, DEFAULT_QUEUE } from '../src/queue.js';
 
 describe('cola y prefetch', () => {

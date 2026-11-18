@@ -75,7 +75,7 @@ PickarooAPI/
     │       ├── index.js
     │       ├── schema.graphql
     │       ├── auth.js           JWT + sesión de Redis (permiso audit:view)
-    │       ├── consumer.js       consumidor de RabbitMQ
+    │       ├── worker-auditoria.js worker de RabbitMQ → ScyllaDB
     │       ├── scylla-options.js opciones de conexión a ScyllaDB desde el entorno
     │       └── scylla.js         keyspace, tablas y consultas CQL
     └── mongoAPI/
@@ -789,7 +789,7 @@ Mientras una orden DELIVERY está `IN_DELIVERY`, la app del repartidor reporta s
   3. Ante `INVALID_LOCATION`, descartar ese punto y seguir con el siguiente. Ante `SERVICE_UNAVAILABLE` o un fallo de red, seguir con el siguiente.
   4. **No encolar ni reenviar puntos viejos** tras una reconexión: el servidor pone la hora de recepción, así que un punto reenviado se guardaría como si fuera de ahora. Mandar siempre la posición actual.
 - **Bitácora:** un reporte no deja ningún evento. En particular, el `UNAUTHENTICATED` de `reportDriverLocation` no se registra como `ACCESS_DENIED`, a diferencia de las demás operaciones (`QUIET_UNAUTHENTICATED` en `infrastructure/events.js`): la app lo manda cada 3 s y una sesión vencida o una caída de Redis inundaría RabbitMQ y ScyllaDB. Su `FORBIDDEN` sí se registra. Limitación conocida: un token de acceso vencido o inválido sigue registrando `TOKEN_EXPIRED` o `TOKEN_INVALID` (`SECURITY`) por petición, porque eso ocurre al construir el contexto, antes de saber qué operación es; el cliente debe renovar la sesión en cuanto recibe `UNAUTHENTICATED` (punto 1) para que no se repita cada 3 s.
-- **Sin historial.** Se valoró publicar el punto como evento de la bitácora (RabbitMQ → ScyllaDB, como máximo uno cada 30 s por orden) y no se hizo: auditAPI escribe cada evento en `events_by_day` (por categoría y día), `events_by_actor` y `events_by_target`, de modo que un `DRIVER_LOCATION` cada 30 s llenaría el feed de la categoría `ORDER` que lee ADMIN y los conteos de `auditSummary`, y guardaría para siempre, en un registro inmutable y sin retención, el recorrido de cada repartidor. Un historial de ubicaciones necesita su propia tabla en ScyllaDB (`locations_by_order`, con TTL) y su ruta en auditAPI, y eso cambia auditAPI.
+- **Sin historial.** Se valoró publicar el punto como evento de la bitácora (RabbitMQ → ScyllaDB, como máximo uno cada 30 s por orden) y no se hizo: auditAPI escribe cada evento en `events_by_day` (por categoría y día), `events_by_actor`, `events_by_target` y `logs_eventos`, de modo que un `DRIVER_LOCATION` cada 30 s llenaría el feed de la categoría `ORDER` que lee ADMIN y los conteos de `auditSummary`, y guardaría para siempre, en un registro inmutable y sin retención, el recorrido de cada repartidor. Un historial de ubicaciones necesita su propia tabla en ScyllaDB (`locations_by_order`, con TTL) y su ruta en auditAPI, y eso cambia auditAPI.
 
 ### Inventario
 
@@ -895,21 +895,47 @@ Sobre de cada mensaje:
 }
 ```
 
-### Tablas en ScyllaDB (keyspace `pickaroo_audit`)
+### Tablas en ScyllaDB (keyspace `auditoria`)
 
-Diseño por consulta: cada evento se escribe (batch con log) en las tablas que le corresponden, ordenadas por `occurred_at DESC`.
+Diseño por consulta: cada evento se escribe (batch con log) en las tablas que le corresponden, ordenadas de lo más reciente a lo más antiguo.
 
 | Tabla | Clave de partición | Responde | Consulta GraphQL |
 |---|---|---|---|
 | `events_by_day` | `(category, day)` | "eventos de seguridad de hoy" | `auditEvents(category, day, type, limit)`, `auditSummary(day)` |
 | `events_by_actor` | `(actor_id)` | "qué hizo este usuario" (no se escribe para `ANONYMOUS`) | `auditByActor(actorId, limit)` |
 | `events_by_target` | `(target_type, target_id)` | "historia de la orden X", "historial de precios del producto Y" | `auditByTarget(targetType, targetId, limit)` |
+| `logs_eventos` | `(fecha_dia, tipo_evento)` | "eventos de un tipo en un día" (es la tabla que se revisa con `cqlsh`) | ninguna: no la lee la API, es la vista directa de la bitácora |
 
 - `day` es la fecha UTC del evento (`YYYY-MM-DD`).
 - `AuditEvent.actor` es la entidad `User` federada: el gateway la completa con el subgrafo `pickaroo` (nombre, correo…).
-- El consumidor (prefetch 50, `ack` manual) hace `ack` solo después de escribir. Si la escritura falla, el mensaje vuelve a la cola (`nack` con reencolado) tras 5 segundos. Si ScyllaDB no está listo al arrancar, auditAPI no consume y los eventos esperan en RabbitMQ.
+- El worker (`worker-auditoria.js`, prefetch 50, `ack` manual) hace `ack` solo después de escribir. Si la escritura falla, el mensaje vuelve a la cola (`nack` con reencolado) tras 5 segundos. Si ScyllaDB no está listo al arrancar, auditAPI no consume y los eventos esperan en RabbitMQ.
 - El `eventId` lo pone el productor, así que un mensaje reentregado reescribe la misma fila. Los mensajes del formato anterior (`{ event, payload }`) también se aceptan.
 - auditAPI valida el mismo JWT y la misma sesión de Redis que mongoAPI, y exige el permiso `audit:view` (solo ADMIN).
+
+#### `logs_eventos`: diseño Query-First
+
+La pregunta que manda es **"¿qué eventos de tipo X hubo el día Y?"** (por ejemplo, todos los `LOGIN_FAILED` de hoy). El modelo sale de ella:
+
+- **Clave de partición compuesta `((fecha_dia, tipo_evento))`.** Toda la respuesta vive en una sola partición, así que la consulta lee un único nodo y sin `ALLOW FILTERING`. Una partición solo guarda un tipo en un día: está acotada y no crece sin límite como lo haría una partición por tipo solo. Separar por tipo también reparte la escritura entre muchas particiones (un pico de `LOGIN_FAILED` no satura a las particiones de otros tipos).
+- **Clustering `(timestamp, evento_id)`.** `timestamp` ordena por hora; `evento_id` (`timeuuid`) desempata eventos del mismo instante, de modo que dos eventos con la misma marca de tiempo no se pisan.
+- **Orden físico `CLUSTERING ORDER BY (timestamp DESC, evento_id DESC)`.** Lo más reciente se lee primero y sin ordenar en memoria: el disco ya está en ese orden.
+- **Escritura idempotente.** `evento_id` es un `timeuuid` derivado del `eventId` del productor (la hora es la de `occurredAt`; el resto sale de su sha1). Un mensaje que RabbitMQ reentrega reescribe la misma fila en lugar de duplicarla.
+- Se escribe en el mismo batch con log que las otras tres tablas, con sentencias preparadas (`prepare: true`) y `ack` solo cuando ScyllaDB confirmó (`services/auditAPI/src/worker-auditoria.js`).
+
+Comandos para revisarla (ScyllaDB debe estar arriba y el worker haber guardado algún evento):
+
+```bash
+# Los últimos eventos guardados
+docker exec -it pickaroo-scylladb cqlsh -e "SELECT * FROM auditoria.logs_eventos LIMIT 20;"
+
+# Los LOGIN_FAILED de un día, del más reciente al más antiguo
+docker exec -it pickaroo-scylladb cqlsh -e "SELECT * FROM auditoria.logs_eventos WHERE fecha_dia = '2026-11-18' AND tipo_evento = 'LOGIN_FAILED';"
+
+# La definición (clave de partición, clustering y orden físico)
+docker exec -it pickaroo-scylladb cqlsh -e "DESCRIBE TABLE auditoria.logs_eventos;"
+```
+
+**Keyspace.** El keyspace por omisión es `auditoria` (`SCYLLADB_KEYSPACE` lo cambia). Versiones anteriores usaban `pickaroo_audit`; en las bases de desarrollo que ya existen ese keyspace queda abandonado: su historial sigue ahí, pero la API no lo ve hasta que se vuelva a poner `SCYLLADB_KEYSPACE=pickaroo_audit`. `auditoria` empieza vacío: `logs_eventos` y las otras tres tablas solo contienen los eventos guardados desde el cambio.
 
 ### Telemetría de seguridad asíncrona (Bloque B: RabbitMQ)
 
@@ -921,7 +947,7 @@ Esta sección relaciona el enunciado del Bloque B ("Telemetría de Seguridad As�
 | Cola `eventos-seguridad` | Valor por omisión en productor y worker; `RABBITMQ_QUEUE` lo cambia en los dos (`services/auditAPI/src/queue.js` y `rabbitmq.js` comparten el mismo valor; `scripts/queue-name.test.js` lo comprueba) |
 | Eventos `LOGIN_FAILED`, `LOGIN_SUCCESS`, `USER_REGISTERED`, `ROLE_CHANGED` | Mismos nombres en el código: `login` (`auth.js`) emite `LOGIN_FAILED` y `LOGIN_SUCCESS`; `createUser` (`index.js`) emite `USER_REGISTERED`; `assignRole` (`auth.js`, cuando un administrador cambia el rol de un usuario) emite `ROLE_CHANGED`. Los dos últimos viajan con `category: "ADMIN"`; los de login, con `"SECURITY"`. Los demás eventos de la sección "Eventos" usan la misma cola |
 | Sin contraseñas ni tokens (CWE-532) | Ver "Qué lleva y qué no lleva cada evento" |
-| Worker con prefetch 50 y `ack`/`nack` manual | `services/auditAPI/src/consumer.js` (el servicio auditAPI): `prefetch(50)` (`RABBITMQ_PREFETCH`), `ack` tras escribir en ScyllaDB, `nack` con reencolado tras 5 s si la escritura falla; un mensaje que no es JSON válido se confirma y se descarta; un evento que falla 5 veces seguidas al guardarse (mismo `eventId`) se descarta con `nack` sin reencolar y una línea de error, para que un mensaje venenoso no se reintente para siempre. Si el canal o la conexión se cierran, el worker reconecta con un único bucle de reintento (cada 5 s). `RABBITMQ_PREFETCH` solo acepta enteros decimales de 1 a 65535; otro valor usa 50 y deja un aviso |
+| Worker con prefetch 50 y `ack`/`nack` manual | `services/auditAPI/src/worker-auditoria.js` (el servicio auditAPI): `prefetch(50)` (`RABBITMQ_PREFETCH`), `ack` tras escribir en ScyllaDB, `nack` con reencolado tras 5 s si la escritura falla; un mensaje que no es JSON válido se confirma y se descarta; un evento que falla 5 veces seguidas al guardarse (mismo `eventId`) se descarta con `nack` sin reencolar y una línea de error, para que un mensaje venenoso no se reintente para siempre. Si el canal o la conexión se cierran, el worker reconecta con un único bucle de reintento (cada 5 s). `RABBITMQ_PREFETCH` solo acepta enteros decimales de 1 a 65535; otro valor usa 50 y deja un aviso |
 | Log de cada evento en consola | El worker imprime una línea por evento (abajo) |
 | Fail-safe con el broker caído | Un login válido sigue funcionando y solo se registra un aviso (abajo) |
 
@@ -970,7 +996,7 @@ curl -s http://localhost:4000/ -H "content-type: application/json" \
 
 Para ver `USER_REGISTERED` (mutación `createUser`, registro abierto) y `ROLE_CHANGED` (`assignRole` con el token del administrador) basta ejecutarlas con la misma preparación.
 
-Pruebas unitarias (sin Docker): `services/mongoAPI/test/domain/rabbitmq.test.js` (cola por omisión y `RABBITMQ_QUEUE`, espera exponencial, un aviso por caída, reconexión), `security-events.test.js` (limpieza de secretos y cuatro eventos sin datos sensibles), `services/auditAPI/test/consumer.test.js` (línea de log, `ack`/`nack`, prefetch) y `scripts/queue-name.test.js`.
+Pruebas unitarias (sin Docker): `services/mongoAPI/test/domain/rabbitmq.test.js` (cola por omisión y `RABBITMQ_QUEUE`, espera exponencial, un aviso por caída, reconexión), `security-events.test.js` (limpieza de secretos y cuatro eventos sin datos sensibles), `services/auditAPI/test/worker-auditoria.test.js` (línea de log, `ack`/`nack`, prefetch) y `scripts/queue-name.test.js`.
 
 ## 10. Configuración y ejecución local
 
@@ -1034,7 +1060,7 @@ auditAPI lee **`services/auditAPI/.env`** y, para lo que no defina, **`services/
 PORT_AUDITORIA=4003
 SCYLLADB_CONTACT_POINTS=127.0.0.1
 SCYLLADB_PORT=9042
-SCYLLADB_KEYSPACE=pickaroo_audit
+SCYLLADB_KEYSPACE=auditoria
 RABBITMQ_URL=amqp://guest:guest@localhost:5672
 # RABBITMQ_QUEUE=eventos-seguridad  (por omisión; debe ser el mismo valor que en mongoAPI)
 # RABBITMQ_PREFETCH=50              (por omisión)
@@ -1105,7 +1131,7 @@ Ejecuta las pruebas unitarias de configuración (`gateway/test/`, `services/audi
 | RedisInsight | `http://localhost:8001/` |
 | Neo4j Browser | `http://localhost:7474/` (usuario `neo4j`) |
 | Neo4j Bolt | `localhost:7687` |
-| ScyllaDB (CQL) | `localhost:9042`, keyspace `pickaroo_audit` |
+| ScyllaDB (CQL) | `localhost:9042`, keyspace `auditoria` |
 
 El Gateway intenta componer los subgrafos hasta 15 veces, con una espera de dos segundos entre fallos. mongoAPI y auditAPI deben estar disponibles dentro de ese periodo (auditAPI responde aunque ScyllaDB aún no esté listo).
 
@@ -1481,7 +1507,7 @@ El repositorio incluye `render.yaml` (Blueprint) con esto ya definido; también 
 | `SCYLLADB_DATACENTER` | centro de datos local, p. ej. `AWS_US_EAST_1` | Por omisión `datacenter1`. |
 | `SCYLLADB_SSL` | `true` | TLS verificando el certificado. `SCYLLADB_SSL_REJECT_UNAUTHORIZED=false` lo desactiva de forma explícita. |
 | `SCYLLADB_CREATE_KEYSPACE` | `false` | Omite `CREATE KEYSPACE` (el keyspace debe existir; las tablas sí se crean). Por omisión `true`. |
-| `SCYLLADB_KEYSPACE`, `SCYLLADB_REPLICATION_CLASS`, `SCYLLADB_REPLICATION_FACTOR` | `pickaroo_audit`, `SimpleStrategy`, `1` | Solo si el keyspace lo crea la API. Con `NetworkTopologyStrategy` replica en `SCYLLADB_DATACENTER`. |
+| `SCYLLADB_KEYSPACE`, `SCYLLADB_REPLICATION_CLASS`, `SCYLLADB_REPLICATION_FACTOR` | `auditoria`, `SimpleStrategy`, `1` | Solo si el keyspace lo crea la API. Con `NetworkTopologyStrategy` replica en `SCYLLADB_DATACENTER`. |
 | `SEED` | `true` solo en el primer despliegue; después `false` | Carga los datos de demostración (la sección 11 explica las cuentas). Es idempotente, pero no hace falta repetirlo. |
 | `SEED_ADMIN_PASSWORD`, `SEED_CUSTOMER_PASSWORD`, `SEED_MANAGER_PASSWORD`, `SEED_STAFF_PASSWORD`, `SEED_DELIVERY_PASSWORD`, `SEED_DELIVERY2_PASSWORD`, `SEED_HUERTA_MANAGER_PASSWORD`, `SEED_HUERTA_STAFF_PASSWORD` | una contraseña propia por cada una | **Obligatorias con `SEED=true` y `NODE_ENV=production`**: las contraseñas de demostración del README son públicas, así que en producción el seed no las usa. Si falta alguna, el seed se omite por completo (no crea ningún dato), registra un error con las variables que faltan y el servidor sigue arrancando; basta definirlas y redesplegar. |
 | `GATEWAY_COMPOSE_RETRIES` | opcional | Intentos de composición inicial del Gateway, uno cada 2 s. Por omisión 15 y, con `NODE_ENV=production`, 90 (~3 min, el arranque en frío de las bases alojadas). |

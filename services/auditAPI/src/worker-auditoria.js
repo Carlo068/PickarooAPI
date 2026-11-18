@@ -1,5 +1,18 @@
 // ============================================================
-// CONSUMIDOR DE RABBITMQ → ScyllaDB (worker de la cola "eventos-seguridad")
+// WORKER DE AUDITORÍA: RabbitMQ → ScyllaDB (cola "eventos-seguridad")
+//
+// Cómo cuida la entrega (checklist de la defensa):
+// - PREFETCH 50 (channel.prefetch, RABBITMQ_PREFETCH): RabbitMQ entrega como máximo 50 mensajes sin
+//   confirmar a la vez. Es contrapresión: si ScyllaDB va lento, el worker no se ahoga con miles de
+//   mensajes en memoria y el resto espera en la cola.
+// - SENTENCIAS PREPARADAS: saveEvent y las consultas usan { prepare: true }; ScyllaDB analiza cada
+//   CQL una sola vez y las siguientes escrituras solo mandan los valores.
+// - ACK SOLO TRAS LA CONFIRMACIÓN: el ack manual (sin noAck) se envía después de que saveEvent
+//   (batch con log, incluida la tabla logs_eventos) terminó bien. Si el proceso cae antes, el mensaje
+//   no confirmado vuelve a la cola y se reentrega; la escritura es idempotente, así que no duplica filas.
+// - NACK CON PAUSA: si ScyllaDB falla, nack con reencolado tras 5 s (sin bucle caliente).
+// - MENSAJE VENENOSO: un evento que falla 5 veces seguidas se descarta (nack sin reencolar) con una
+//   línea de error; un mensaje que no es JSON válido se confirma y se descarta.
 //
 // - Solo consume cuando ScyllaDB está listo: mientras tanto los eventos
 //   esperan en la cola durable "eventos-seguridad".

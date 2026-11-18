@@ -99,8 +99,9 @@ ip, userAgent, metadata, occurredAt }`
 | `events_by_day` | `(category, day)` | `occurred_at DESC, event_id` | "eventos de seguridad de hoy" |
 | `events_by_actor` | `(actor_id)` | `occurred_at DESC, event_id` | "qué hizo este usuario" |
 | `events_by_target` | `(target_type, target_id)` | `occurred_at DESC, event_id` | "historia de la orden X", "historial de precios del producto Y" |
+| `logs_eventos` | `(fecha_dia, tipo_evento)` | `timestamp DESC, evento_id DESC` | "eventos de un tipo en un día" (vista directa para `cqlsh`; `evento_id` es un timeuuid derivado del `eventId`) |
 
-- Cada evento se escribe en las tres tablas. `event_id` lo genera el productor, así que un
+- Cada evento se escribe (mismo batch con log) en las tablas que le corresponden; `logs_eventos` siempre. El keyspace por omisión es `auditoria`. `event_id` lo genera el productor, así que un
   mensaje reentregado reescribe la misma fila (idempotente).
 - El consumidor confirma (`ack`) solo después de escribir. Si ScyllaDB no responde, el
   mensaje vuelve a la cola; si ScyllaDB no está al arrancar, no consume hasta conectar
