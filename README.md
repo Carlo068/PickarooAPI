@@ -52,7 +52,9 @@ PickarooAPI/
 │   └── api.graphql               esquema para clientes (generado, no editar)
 ├── scripts/
 │   ├── package.json
-│   └── build-schema.js           npm run schema:build / schema:check
+│   ├── build-schema.js           npm run schema:build / schema:check
+│   ├── build-rbac-script.js      npm run rbac:script / rbac:check
+│   └── init-rbac.cql             catálogo RBAC para cypher-shell (generado, no editar)
 ├── test/
 │   └── integration/              npm run test:integration (contra el Compose)
 ├── docs/
@@ -82,14 +84,15 @@ PickarooAPI/
             ├── domain/
             │   ├── entities.js
             │   ├── errors.js     catálogo de códigos de error y DomainError
-            │   ├── access.js     roles, permisos, menús y reglas de acceso
+            │   ├── access.js     roles, permisos, rutas, menús y reglas de acceso
             │   ├── refresh-tokens.js  forma, hash y vencimiento de los refresh tokens
             │   ├── driver-location.js  coordenadas válidas, punto guardado y su vista (ubicación del repartidor)
             │   └── migrations.js decisiones puras de las migraciones de datos
             └── infrastructure/
                 ├── neo4j.js
                 ├── migrations.js migraciones de datos (MongoDB)
-                ├── rbac-graph.js consultas Cypher del RBAC
+                ├── rbac-graph.js catálogo RBAC en Neo4j (bootstrapRbac) y administración de roles
+                ├── rbac.service.js  validarAccesoRuta y obtenerMenuUsuario (consultas de lectura)
                 ├── events.js     productor de eventos de auditoría
                 ├── format-error.js  errores de dominio/Mongoose → extensions.code
                 ├── redis-om.js
@@ -280,8 +283,11 @@ Qué deben hacer los clientes (Android y dashboard):
 (:User {id})-[:HAS_ROLE]->(:Role)-[:INHERITS]->(:Role)
 (:Role)-[:HAS_PERMISSION]->(:Permission)
 (:User)-[:WORKS_AT]->(:Store {id})
-(:Role)-[:CAN_VIEW_MENU]->(:MenuItem)-[:NAVIGATES_TO]->(:Route)
+(:Role)-[:CAN_ACCESS]->(:Route)
+(:Role)-[:CAN_VIEW_MENU]->(:MenuNode)-[:NAVIGATES_TO]->(:Route)
 ```
+
+El modelo completo (restricciones, rutas, menú y el script `init-rbac.cql`) está en "Modelo RBAC en Neo4j", más abajo.
 
 | Rol | Hereda de | Para quién | Permisos propios |
 |---|---|---|---|
@@ -294,7 +300,7 @@ Qué deben hacer los clientes (Android y dashboard):
 Los permisos efectivos son los del rol más los de todos los roles que hereda (`[:INHERITS*0..]`). Los `id` de `User` y `Store` en Neo4j son los `_id` de MongoDB.
 
 - **Fuente de verdad:** Neo4j. `users.role` en MongoDB es un espejo: se actualiza con `assignRole` y se corrige solo en el login si difiere.
-- **Catálogo:** roles, permisos, herencia y menú se definen en `domain/access.js` y se crean/actualizan en Neo4j en cada arranque (y al reconectar).
+- **Catálogo:** roles, permisos, herencia, rutas y menú se definen en `domain/access.js` y se crean/actualizan en Neo4j en cada arranque (y al reconectar).
 - **Auto-reparación:** un usuario que aún no está en el grafo se crea en su primer login con el rol espejo de MongoDB.
 - **Alcance por sucursal:** el personal (`STAFF`, `DELIVERY`, `MANAGER`) solo ve y mueve órdenes de las sucursales con `WORKS_AT` (el repartidor, además, solo las disponibles para aceptar y las asignadas a él; ver sección 6, "Reparto"); `scope:all_stores` (ADMIN) ve todas. Lo mismo vale para el catálogo y el inventario: `catalog:manage` (alta y edición de productos y paquetes, descuentos, activar/desactivar) y `stock:manage` (`setProductStock`) solo aplican a artículos de una sucursal del alcance, y los reportes solo cubren esas sucursales. Fuera del alcance: `FORBIDDEN` con `reason: STORE_NOT_ASSIGNED` y `storeId`. La regla es `storeItemDenial` en `domain/access.js` (reportes: `reportStoreScope`).
 - **Categorías globales:** las comparten todas las sucursales, así que crearlas exige `catalog:manage` **y** `scope:all_stores` (solo ADMIN). A un MANAGER le falta el segundo: `FORBIDDEN`, `reason: PERMISSION_REQUIRED`, `permission: scope:all_stores`.
@@ -317,7 +323,7 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | Acceso | Operaciones |
 |---|---|
 | Público | `login`, `refreshToken`, `createUser` (registro; siempre `CUSTOMER`), `categories`, `category`, `products`, `product`, `packages`, `package`, `stores`, `store`, `quoteOrder` |
-| Sesión iniciada | `me`, `myAccess`, `myMenu`, `logout`, `logoutAllDevices`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
+| Sesión iniciada | `me`, `myAccess`, `myMenu`, `canAccessRoute`, `logout`, `logoutAllDevices`, `cart`, `addToCart`, `setCartItemQuantity`, `removeFromCart`, `clearCart`, `checkoutCart`, `recentOrders` |
 | Dueño o `users:manage` | `user`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress`, `createOrder`, `shoppingLists`, `shoppingList`, `createShoppingList`, `addItemToShoppingList`, `removeItemFromShoppingList`, `deleteShoppingList` |
 | Dueño o personal de la sucursal | `order`, `orderByNumber`, `orders` (cliente: las suyas; personal de mostrador: las de sus sucursales; repartidor: las disponibles para aceptar de sus sucursales y las asignadas a él), `cancelOrder`, `updateOrderStatus` (según la tabla anterior), `driverLocation` (quien puede ver la orden: su cliente, el personal de la sucursal, su repartidor asignado y ADMIN) |
 | `orders:deliver` (sucursales del alcance) | `availableDeliveries`, `acceptDelivery`, `myDeliveries`, `currentDelivery` |
@@ -332,6 +338,97 @@ Permisos por operación (errores `UNAUTHENTICATED` sin sesión y `FORBIDDEN` sin
 | `audit:view` | `auditEvents`, `auditByActor`, `auditByTarget`, `auditSummary` (subgrafo auditoria) |
 
 La interfaz **Neo4j Browser** (`http://localhost:7474`, usuario `neo4j`) permite ver el grafo, por ejemplo con `MATCH (u:User)-[r]->(n) RETURN u, r, n`.
+
+### Modelo RBAC en Neo4j
+
+Control de acceso basado en roles y navegación dinámica: el rol decide a qué rutas web se puede entrar (`CAN_ACCESS`) y qué botones y submenús se ven (`CAN_VIEW_MENU`); el árbol de menú está desacoplado de las rutas.
+
+```
+(:User {id}) -[:HAS_ROLE]-> (:Role {name, description})
+(:Role) -[:INHERITS*0..]-> (:Role)                  (superior)-[:INHERITS]->(inferior)
+(:Role) -[:CAN_ACCESS]-> (:Route {path})            solo el rol más bajo autorizado
+(:Role) -[:CAN_VIEW_MENU]-> (:MenuNode {id, title, order})
+(:MenuNode) -[:HAS_CHILD]-> (:MenuNode)             submenús
+(:MenuNode) -[:NAVIGATES_TO]-> (:Route)             acción del clic
+(:Role) -[:HAS_PERMISSION]-> (:Permission {name})   permisos de operación (orders:prepare, ...)
+(:User) -[:WORKS_AT]-> (:Store {id})                alcance por sucursal
+```
+
+`User` y `Store` usan los `_id` de MongoDB; la API crea el `User` en su primer login (o en el seed) y le da su rol con `HAS_ROLE`. El tipo GraphQL sigue llamándose `MenuItem` (contrato de los clientes); en Neo4j la etiqueta es `MenuNode`.
+
+**Restricciones de unicidad** (las crean `bootstrapRbac` al arrancar y `init-rbac.cql`):
+
+```cypher
+CREATE CONSTRAINT unique_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;
+CREATE CONSTRAINT unique_role_name IF NOT EXISTS FOR (r:Role) REQUIRE r.name IS UNIQUE;
+CREATE CONSTRAINT unique_route_path IF NOT EXISTS FOR (rt:Route) REQUIRE rt.path IS UNIQUE;
+CREATE CONSTRAINT unique_menu_id IF NOT EXISTS FOR (m:MenuNode) REQUIRE m.id IS UNIQUE;
+```
+
+Además `unique_permission_name` (`Permission.name`) y `unique_store_id` (`Store.id`).
+
+**Jerarquía de roles** (4 niveles; el superior obtiene los permisos, rutas y menús del inferior):
+
+| Nivel | Rol | `INHERITS` → |
+|---|---|---|
+| 4 | `ADMIN` | `MANAGER` |
+| 3 | `MANAGER` | `STAFF` |
+| 2 | `STAFF` | `CUSTOMER` |
+| 2 | `DELIVERY` | `CUSTOMER` |
+| 1 | `CUSTOMER` | — |
+
+**Rutas** (`ROUTE_CATALOG` en `domain/access.js`). Cada ruta se enlaza con `CAN_ACCESS` solo con el rol más bajo autorizado; los superiores entran por transitividad de `[:INHERITS*0..]`:
+
+| Ruta | Rol más bajo (`CAN_ACCESS`) | Entran también |
+|---|---|---|
+| `/catalogo`, `/carrito`, `/mis-pedidos`, `/mis-listas` | `CUSTOMER` | todos |
+| `/sucursal/pedidos`, `/sucursal/inventario` | `STAFF` | `MANAGER`, `ADMIN` |
+| `/admin/catalogo`, `/admin/reportes` | `MANAGER` | `ADMIN` |
+| `/admin/sucursales`, `/admin/usuarios`, `/admin/auditoria` | `ADMIN` | — |
+| `/reparto/entregas` | `DELIVERY` y `ADMIN` | — (`ADMIN` no hereda de `DELIVERY`, por eso lleva su propia arista) |
+
+Son las rutas del menú. Una prueba unitaria comprueba que toda ruta del menú está registrada, que quien ve un elemento del menú puede entrar a su ruta y nadie más, y que ningún rol de una ruta hereda de otro rol de la misma ruta. Las demás rutas del dashboard no se registran a propósito: `/` (escaparate) y `/login` son públicas, y `/app` (el armazón del panel y su inicio) solo exige sesión; ahí lo que decide es tener o no un token, no el rol. Una ruta sin registrar da `false` en `canAccessRoute`. La comparación es exacta: el cliente consulta la ruta base de la pantalla (`/sucursal/pedidos`, no `/sucursal/pedidos/<id>` ni con `/` final).
+
+**Aplicar el script.** `scripts/init-rbac.cql` es un script Cypher independiente e idempotente con, en orden: las restricciones (antes borra las de nombre anterior), la migración de los nodos `MenuItem`, los roles, la jerarquía `INHERITS`, los permisos con `HAS_PERMISSION`, las rutas con `CAN_ACCESS` y el árbol `MenuNode` con `HAS_CHILD`, `NAVIGATES_TO` y `CAN_VIEW_MENU`. No crea usuarios; trae un ejemplo comentado de cómo enlazar uno con `HAS_ROLE`. Con el Compose arriba, desde la raíz (la contraseña es la de `NEO4J_AUTH` en `docker-compose.yml`):
+
+```bash
+docker exec -i pickaroo-neo4j cypher-shell -u neo4j -p <password-de-docker-compose.yml> < scripts/init-rbac.cql
+```
+
+**El script no es atómico de punta a punta.** Las restricciones y la migración de `MenuItem` (secciones 1 y 2) son comandos de esquema: cypher-shell ejecuta cada uno en su propia transacción. El catálogo (secciones 3 a 7: roles, herencia, permisos, rutas y menú) va en una sola transacción, entre `:begin` y `:commit`, así una API conectada nunca ve rutas o menús a medias y, si un enunciado falla, ese bloque no se aplica. Aun así conviene ejecutarlo con la API detenida, porque entre las secciones 1 y 2 el grafo queda un momento sin las restricciones anteriores o sin el menú anterior. Los comentarios del script no llevan `;` ni comillas (el generador lo impide), así que ningún lector los toma como separador de enunciados.
+
+La API escribe el mismo catálogo al arrancar, así que el script sirve para preparar o revisar el grafo sin levantarla. El archivo se genera de los mismos catálogos y restricciones que usa el código: `npm run rbac:script` lo reescribe y `npm run rbac:check` falla si el archivo del repositorio está desactualizado (va dentro de `npm test`, junto a `schema:check`). Al cambiar `domain/access.js` se regenera y se agrega al mismo commit. Una prueba de integración aplica el script dos veces (respetando `:begin` y `:commit`) y comprueba que el catálogo queda idéntico al de `bootstrapRbac`; otra parte del estado anterior (restricciones con los nombres viejos y nodos `MenuItem`) y comprueba que `bootstrapRbac` lo migra.
+
+**Migración de `MenuItem` a `MenuNode`.** En cada arranque `bootstrapRbac` borra las restricciones con los nombres anteriores (`role_name`, `user_id`, `route_path`, `menu_id`, `permission_name`, `store_id`) antes de crear las nuevas (Neo4j no crea una restricción equivalente con otro nombre), borra los nodos `(:MenuItem)` con sus relaciones (eran datos de catálogo) y vuelve a crear el árbol como `MenuNode`. Es idempotente: la segunda vez no hay nada que borrar. Una API anterior a este cambio que comparta el mismo Neo4j devuelve el menú vacío hasta que se reinicia con el código nuevo.
+
+**Consultas** (`infrastructure/rbac.service.js`, `rbacService`). Las dos corren en una sesión de lectura y fallan cerrado: sin Neo4j, `SERVICE_UNAVAILABLE` (`service: RBAC`).
+
+- `validarAccesoRuta(userId, path)`: ¿el rol del usuario, o uno que hereda, tiene `CAN_ACCESS` a la ruta?
+
+  ```cypher
+  MATCH (u:User {id: $userId})-[:HAS_ROLE]->(r:Role)
+  MATCH (r)-[:INHERITS*0..]->(effectiveRole:Role)-[:CAN_ACCESS]->(rt:Route {path: $path})
+  RETURN count(rt) > 0 AS autorizado
+  ```
+
+- `obtenerMenuUsuario(userId)`: las raíces del menú que ve el rol (o un rol heredado) con sus hijos visibles, ordenados por `order`, y la ruta de cada uno. Es lo que devuelven `myMenu` y `login.menu`. Ejemplo para Neo4j Browser (los elementos que ve un rol):
+
+  ```cypher
+  MATCH (:Role {name: 'STAFF'})-[:INHERITS*0..]->(:Role)-[:CAN_VIEW_MENU]->(m:MenuNode)
+  OPTIONAL MATCH (m)-[:NAVIGATES_TO]->(rt:Route)
+  RETURN DISTINCT m.id, m.title, m.order, rt.path ORDER BY m.order
+  ```
+
+  ```graphql
+  query { myMenu { id title order path children { id title order path } } }
+  ```
+
+- `canAccessRoute(path: String!): Boolean!` (GraphQL, requiere sesión): `validarAccesoRuta` con el usuario de la sesión. Consulta el grafo en cada llamada, así que refleja un cambio de rol de inmediato. Sin sesión, `UNAUTHENTICATED`.
+
+  ```graphql
+  query { canAccessRoute(path: "/sucursal/pedidos") }
+  # STAFF: { "data": { "canAccessRoute": true } }; CUSTOMER: false; ruta sin registrar: false
+  ```
 
 ### Códigos de error y contrato de traducción
 
@@ -348,7 +445,7 @@ Los campos de `extensions` están en camelCase y los marcados con `?` son opcion
 | `INVALID_CREDENTIALS` | Correo o contraseña incorrectos, o cuenta desactivada (no se distingue a propósito). | — |
 | `INVALID_REFRESH_TOKEN` | El refresh token no existe, venció, fue revocado, es de una familia ya cerrada o su cuenta está desactivada (no se distingue a propósito); hay que iniciar sesión con la contraseña. | — |
 | `REFRESH_TOKEN_REUSED` | Se presentó un refresh token ya canjeado fuera de la ventana de gracia (posible robo): se revocó su familia completa (el token vigente y sus sesiones); hay que iniciar sesión con la contraseña. | — |
-| `SERVICE_UNAVAILABLE` | Un servicio de apoyo no responde (sesiones, carrito, roles, ubicación del repartidor o bitácora); conviene reintentar. | `service?` |
+| `SERVICE_UNAVAILABLE` | Un servicio de apoyo no responde (sesiones, carrito, roles, ubicación del repartidor o bitácora); conviene reintentar. `canAccessRoute` lo responde con `service: RBAC` si Neo4j no está disponible (falla cerrado: nunca `true` sin el grafo). | `service?` |
 
 **Validación y datos**
 
@@ -701,7 +798,7 @@ El SDL es la referencia completa de argumentos y tipos. Las operaciones se organ
 
 | Área | Queries | Mutations |
 |---|---|---|
-| Sesión | `me` | `login`, `logout` |
+| Sesión | `me`, `myAccess`, `myMenu`, `canAccessRoute` | `login`, `logout` |
 | Usuarios | `users`, `user` | `createUser`, `addUserAddress`, `setDefaultAddress`, `removeUserAddress` |
 | Categorías | `categories`, `category` | `createCategory` |
 | Productos | `products`, `product` | `createProduct`, `updateProduct`, `setProductActive`, `setProductStock` |
@@ -922,7 +1019,7 @@ Desde la raíz, sin levantar Docker:
 npm test
 ```
 
-Ejecuta las pruebas unitarias del dominio y del contrato de errores (`services/mongoAPI/test/`, con el ejecutor integrado de Node; incluye una guardia estática que revisa el código de ambos subgrafos) y `npm run schema:check`, de modo que un `schema/api.graphql` desactualizado también hace fallar el comando. Termina con código distinto de cero si algo falla.
+Ejecuta las pruebas unitarias del dominio y del contrato de errores (`services/mongoAPI/test/`, con el ejecutor integrado de Node; incluye una guardia estática que revisa el código de ambos subgrafos) `npm run schema:check` y `npm run rbac:check`, de modo que un `schema/api.graphql` o un `scripts/init-rbac.cql` desactualizados también hacen fallar el comando. Termina con código distinto de cero si algo falla.
 
 | Servicio | Dirección local |
 |---|---|
@@ -948,11 +1045,11 @@ Con el Compose arriba (`docker compose up -d`), desde la raíz:
 npm run test:integration
 ```
 
-Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, reparto (entregas disponibles, aceptaciones simultáneas, una entrega activa por repartidor, liberar, la ruta del repartidor asignado), ubicación del repartidor (quién reporta y quién lee, validación, límite de 1 por segundo, TTL, un solo reloj con puntos guardados del futuro, borrado al entregar o cancelar, que la bitácora no se llene y la escritura atómica en Redis), bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
+Prueban la API completa por HTTP, a través de un Gateway propio y con los usuarios del seed: inicio de sesión por rol, el modelo RBAC en Neo4j (restricciones, `MenuNode`, `CAN_ACCESS` de cada ruta, `canAccessRoute` y `myMenu` por rol, y que `scripts/init-rbac.cql` deja el mismo catálogo que `bootstrapRbac`), refresh tokens (rotación, ventana de gracia, reutilización, canjes simultáneos, vencimiento, cierre de sesión por dispositivo y en todos, revocación por cambios de acceso, TTL de cada clave en Redis), permisos por familia y por sucursal, catálogo, carrito y compra con cotización, ciclo de pedidos, reparto (entregas disponibles, aceptaciones simultáneas, una entrega activa por repartidor, liberar, la ruta del repartidor asignado), ubicación del repartidor (quién reporta y quién lee, validación, límite de 1 por segundo, TTL, un solo reloj con puntos guardados del futuro, borrado al entregar o cancelar, que la bitácora no se llene y la escritura atómica en Redis), bitácora, el marketplace (catálogo, carrito, compras, permisos y reportes por sucursal) y la migración de `storeId` (corre `migrate.js` dos veces contra `pickaroodb_it`). Están en `test/integration/` (fuera de `services/mongoAPI/test/`, así `npm test` sigue siendo rápido y sin Docker) y usan el ejecutor integrado de Node. Una corrida tarda alrededor de minuto y medio (la prueba de vencimiento del refresh token espera a que caduque).
 
 - **Qué arranca:** su propia copia de mongoAPI, auditAPI y el Gateway como procesos `node` (sin `--watch`) en los puertos 5001, 5003 y 5000, con la base `pickaroodb_it` sembrada (`SEED=true`), un `JWT_SECRET` nuevo en cada corrida, `REFRESH_TTL_SECONDS=10` (para probar el vencimiento), `REFRESH_REUSE_GRACE_SECONDS=2` (para probar lo que pasa después de la ventana), `DRIVER_LOCATION_TTL_SECONDS=120` (distinto del de 600 para comprobar que la clave usa el configurado) y la base lógica 1 de Redis (la 0 es la del dev). Neo4j, RabbitMQ (cola `pickaroo.events`) y ScyllaDB son los mismos contenedores. La configuración va en el entorno de cada proceso: no lee ni escribe archivos `.env`. La contraseña de MongoDB sale de `docker-compose.yml` (o de `IT_MONGO_PASSWORD`) y no se imprime. Espera el `Seed OK` y a que el Gateway responda; al terminar, también si una prueba falla o con Ctrl+C, detiene sus procesos. Los puertos se cambian con `IT_GATEWAY_PORT`, `IT_MONGOAPI_PORT` e `IT_AUDITAPI_PORT`.
 - **No toca los datos del dev:** puede correr con `npm run dev` levantado. Antes y después compara los documentos por colección de `pickaroodb`, las sucursales en Neo4j y que el Gateway de `:4000` responda; si algo cambió, la corrida falla (usar la app del dev mientras corre también lo marcaría).
-- **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), los refresh tokens con sus marcas de usado, sus registros de gracia y sus familias, carritos, cotizaciones, ubicaciones del repartidor (`driver:loc:<orderId>`), pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar.
+- **Limpieza:** borra de Neo4j los nodos `User` y `Store` con los ids de `pickaroodb_it`; de Redis, las sesiones (por `jti`), los refresh tokens con sus marcas de usado, sus registros de gracia y sus familias, carritos, cotizaciones, ubicaciones del repartidor (`driver:loc:<orderId>`), pedidos recientes y copias de caché de esos ids; y elimina `pickaroodb_it`. Si una corrida anterior quedó a medias, limpia sus restos al empezar. El catálogo RBAC de Neo4j (roles, permisos, rutas y menú) es compartido: el mongoAPI de pruebas lo vuelve a escribir igual al arrancar, y la prueba del script lo aplica dos veces y termina con `bootstrapRbac`.
 - **Lo que no se limpia:** las filas de auditoría en ScyllaDB (la bitácora es inmutable) y los mensajes de RabbitMQ. El auditAPI del dev y el de pruebas consumen la misma cola y escriben en la misma ScyllaDB, así que cualquiera de los dos puede guardar un evento de la corrida; las pruebas de bitácora consultan hasta que aparece.
 - **Sin Docker:** si un servicio del Compose no responde, las pruebas se omiten con un mensaje (`integration tests skipped: MongoDB not reachable on localhost:27017`) y el comando termina con código 0. Nunca arranca Docker ni contenedores.
 

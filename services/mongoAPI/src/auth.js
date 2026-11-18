@@ -42,6 +42,7 @@ import { verifyPassword } from './infrastructure/passwords.js';
 import { cacheUser, getUser } from './infrastructure/entity-cache.js';
 import { isNeo4jReady } from './infrastructure/neo4j.js';
 import * as rbac from './infrastructure/rbac-graph.js';
+import { rbacService } from './infrastructure/rbac.service.js';
 import { emitEvent, requestInfo, CATEGORIES } from './infrastructure/events.js';
 import { DEFAULT_ROLE, PERMISSIONS, hasPermission, isRole } from './domain/access.js';
 import { DomainError } from './domain/errors.js';
@@ -187,7 +188,7 @@ async function resolveAccess(user, ctx, unavailableReason = 'Neo4j no disponible
 async function safeMenu(userId) {
   if (!isNeo4jReady()) return [];
   try {
-    return await rbac.getMenu(userId);
+    return await rbacService.obtenerMenuUsuario(userId);
   } catch (err) {
     console.warn('⚠️  No se pudo leer el menú en Neo4j:', err.message);
     return [];
@@ -360,6 +361,10 @@ export const createAuthResolvers = redisClient => {
       },
 
       myMenu: (_, __, ctx) => safeMenu(requireAuth(ctx).id),
+
+      // Se consulta en Neo4j en cada llamada (no sale de la sesión): falla cerrado
+      // con SERVICE_UNAVAILABLE (RBAC). Una ruta sin registrar da false.
+      canAccessRoute: (_, { path }, ctx) => rbacService.validarAccesoRuta(requireAuth(ctx).id, path),
 
       roles: (_, __, ctx) => {
         requirePermission(ctx, PERMISSIONS.USERS_MANAGE);
