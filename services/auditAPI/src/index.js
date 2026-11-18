@@ -1,7 +1,7 @@
 // ============================================================
 // auditAPI — subgrafo de auditoría
 //
-// RabbitMQ ("pickaroo.events") ──► consumidor ──► ScyllaDB
+// RabbitMQ ("eventos-seguridad") ──► consumidor ──► ScyllaDB
 // GraphQL (vía gateway) ──► consultas de la bitácora (permiso audit:view)
 //
 // mongoAPI publica los eventos; este servicio es el único que escribe y lee

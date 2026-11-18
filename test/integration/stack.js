@@ -68,7 +68,7 @@ export function loadConfig() {
     redisDb: env.IT_REDIS_DB ? parseInt(env.IT_REDIS_DB, 10) : 1,
     neo4j: { uri: 'bolt://localhost:7687', user: 'neo4j', password: 'pickaroo123' }, // los del Compose
     rabbitUrl: 'amqp://guest:guest@localhost:5672',
-    queue: 'pickaroo.events',
+    queue: 'eventos-seguridad',
     logFile: path.join(os.tmpdir(), `pickaroo-it-${Date.now()}.log`),
     jtiFile: path.join(os.tmpdir(), `pickaroo-it-${Date.now()}.jti`),
   };

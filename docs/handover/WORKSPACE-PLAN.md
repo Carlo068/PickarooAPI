@@ -57,7 +57,7 @@ The Android skills stay in `Pickaroo/.claude/skills/` (`pic-task`, `android-test
 |---|---|
 | **Apollo Gateway** `:4000` | One GraphQL endpoint composing two subgraphs. Forwards the client's `Authorization`, IP and User-Agent. CORS is open (Apollo standalone default). |
 | **mongoAPI** `:4001` | All business logic: users, categories, products, packages (combos with no stock of their own), discounts, stores, cart, quotes, orders, shopping lists, sales reports. |
-| **auditAPI** `:4003` | Consumes RabbitMQ `pickaroo.events` and writes an immutable audit log to ScyllaDB. Queries need `audit:view` (ADMIN only). |
+| **auditAPI** `:4003` | Consumes RabbitMQ `eventos-seguridad` and writes an immutable audit log to ScyllaDB. Queries need `audit:view` (ADMIN only). |
 | **MongoDB** | Source of truth: `users`, `categories`, `products`, `packages`, `stores`, `orders`, `shopping_lists`. |
 | **Redis Stack** | JWT sessions (`session:<jti>`, 1 h TTL, logout revokes), cart, 15-min quotes, recent orders, read cache of products and users. |
 | **Neo4j** | RBAC: roles with inheritance, permissions, staff ↔ store (`WORKS_AT`), per-role navigation menu with web routes. |
